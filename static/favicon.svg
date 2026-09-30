@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>我的AI学习助手</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7.2" fill="url(#g)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="1.95"
+     stroke-linecap="round" stroke-linejoin="round"
+     transform="translate(2.6667 2.6667) scale(1.1111)">
+    <path d="M4 19V5.5A2.5 2.5 0 0 1 6.5 3H19a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-2H20"/>
+    <path d="M8 7h7"/>
+  </g>
+</svg>

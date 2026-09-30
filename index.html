@@ -1,0 +1,2207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#4f46e5">
+<title>我的AI学习助手</title>
+
+<!-- 站点图标：与顶栏 #i-book 同一枚（靛蓝渐变圆角方块 + 白书）。
+     SVG 优先，.ico 兜底老浏览器，apple-touch-icon 供 iOS 添加到主屏幕。 -->
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+<!-- Tailwind CSS (CDN) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  if (window.tailwind) {
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['-apple-system','BlinkMacSystemFont','"PingFang SC"','"Microsoft YaHei"','"Helvetica Neue"','sans-serif'] } } }
+    };
+  }
+</script>
+
+<!-- KaTeX：把 AI 输出的 LaTeX 公式真正渲染出来（电脑端复习体验的关键） -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<!-- Markdown 渲染 -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+<!-- SVG 净化：模型生成的 SVG 要注入进 DOM，必须过一遍过滤器（见 renderInlineSvg） -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
+
+<style>
+  /* ---- 兜底样式层：即使 Tailwind CDN 被墙/超时，App 依然完整可用 ---- */
+  * { box-sizing: border-box; }
+  [v-cloak] { display: none !important; }
+  body { margin: 0; background: #f1f5f9; color: #1e293b;
+         font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+         -webkit-font-smoothing: antialiased; }
+  .shell-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; box-shadow: 0 1px 3px rgba(15,23,42,.06); }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+         border: 0; border-radius: 10px; padding: 9px 14px; font-size: 14px; font-weight: 600;
+         cursor: pointer; transition: .15s; line-height: 1.2; }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: #4f46e5; color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #4338ca; }
+  .btn-ghost { background: #f1f5f9; color: #334155; }
+  .btn-ghost:hover:not(:disabled) { background: #e2e8f0; }
+  .btn-danger { background: #fee2e2; color: #b91c1c; }
+  /* 描边按钮。必须是独立的类：.btn 里写死了 border:0，而 Tailwind 的 .border
+     跟 .btn 单类名同权重，谁生效只看样式表顺序 —— 靠 border 工具类会时灵时不灵。 */
+  .btn-ai { background: #fff; color: #4f46e5; border: 1.5px solid #c7d2fe; }
+  .btn-ai:hover:not(:disabled) { background: #eef2ff; border-color: #818cf8; }
+  .chip { border-radius: 999px; padding: 6px 14px; font-size: 13px; font-weight: 600;
+          border: 1px solid #e2e8f0; background: #fff; color: #475569; cursor: pointer;
+          white-space: nowrap; transition: .15s; }
+  .chip.on { background: #4f46e5; border-color: #4f46e5; color: #fff; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  .rich { line-height: 1.85; font-size: 15px; word-break: break-word; }
+  .rich p { margin: .5em 0; }
+  .rich ul, .rich ol { padding-left: 1.4em; margin: .5em 0; }
+  .rich li { margin: .25em 0; list-style: inherit; }
+  .rich ul { list-style: disc; } .rich ol { list-style: decimal; }
+  .rich strong { color: #4338ca; font-weight: 700; }
+  .rich code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: .92em; }
+  .rich h1, .rich h2, .rich h3 { font-weight: 700; margin: .6em 0 .3em; }
+  .rich blockquote { border-left: 3px solid #c7d2fe; padding-left: .8em; color: #475569; margin: .5em 0; }
+  .rich table { border-collapse: collapse; margin: .6em 0; width: 100%; }
+  .rich th, .rich td { border: 1px solid #cbd5e1; padding: 3px 8px; font-size: .92em; word-break: break-word; }
+  /* AI 输出的代码块 / 长公式 / 宽表格默认不换行，会在面板里撑出**横向**滚动条
+     —— 面板右边就同时竖着一条、横着一条，看起来就是「两个滚动条」。
+     这里强制它们换行 / 自适应，从根上不给横向滚动条留机会。 */
+  .rich pre, .rich code { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
+  .rich img, .rich svg, .rich canvas, .rich iframe { max-width: 100%; }
+  .rich .katex-display { overflow-x: auto; overflow-y: hidden; }
+  .rich a { word-break: break-all; }
+  /* ============ 桌面端：页面本身永不滚动 ============
+     不用 Tailwind 的 h-screen，因为它是 `100vh`。vh 有一堆已知坑：
+       · 浏览器缩放不是 100% 时，100vh 会比可视区高 1px → 冒出一条页面滚动条
+       · 传统滚动条（占 ~15px）与 vh 的取整相互作用，也会多出滚动条
+     改成 html → body → #app 逐级 height:100%，高度由布局算出来，不依赖 vh。
+     配合 html/body 的 overflow:hidden，页面滚动条从根上不可能出现。
+     （实测：headless Chromium 用的是**悬浮滚动条**（占 0px），和真实浏览器的
+       传统滚动条行为不同，所以这个问题在我这边的自动化测试里复现不出来。） */
+  @media (min-width: 768px) {
+    html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+    #app { height: 100%; }
+  }
+
+  /* 细滚动条：面板各自的滚动条不该抢视线。默认那根粗灰杠是「两个滚动条很丑」
+     的元凶之一 —— 又宽又深，还紧贴着内容。 */
+  * { scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 5px;
+                              border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: #94a3b8; background-clip: content-box; }
+  /* 内联示意图（AI 用 SVG 画的几何/受力/电路图） */
+  .svg-fig { margin: 12px 0; text-align: center; }
+  .svg-fig > svg { max-width: 100%; height: auto; display: inline-block; }
+  .svg-fig figcaption { font-size: 12px; color: #64748b; margin-top: 5px; line-height: 1.5; }
+  .fade-enter-active, .fade-leave-active { transition: opacity .18s; }
+  .fade-enter-from, .fade-leave-to { opacity: 0; }
+  .spin { animation: sp 1s linear infinite; display: inline-block; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<!-- ===================== 图标 sprite =====================
+     全部是 24×24 线性图标，stroke 1.75、圆头圆角，颜色走 currentColor
+     （自动跟随文字色，所以浅底深底都正常）。
+     换成 SVG 是为了替掉原来那 22 个 emoji —— emoji 在苹果/安卓/Windows 上
+     长相完全不同，大小和视觉重量也不齐，跟界面里的线条字体不是一套语言。
+     用的时候：<svg class="w-4 h-4"><use href="#i-camera"/></svg>
+======================================================= -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-camera" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14.5 4h-5L7.5 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.5z"/><circle cx="12" cy="13" r="3.5"/>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.2-4.2"/>
+  </symbol>
+  <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/>
+  </symbol>
+  <symbol id="i-columns" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/>
+  </symbol>
+  <symbol id="i-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9.5" r="1.8"/><path d="m4 18 5-5 4 4 3-3 4 4"/>
+  </symbol>
+  <symbol id="i-eraser" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m8 20-4.4-4.4a1.5 1.5 0 0 1 0-2.1l8-8a1.5 1.5 0 0 1 2.1 0l5.3 5.3a1.5 1.5 0 0 1 0 2.1L13.4 20z"/><path d="M21 20H8"/><path d="m6 12 7 7"/>
+  </symbol>
+  <symbol id="i-pen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6"/><path d="M17.5 3.5a2.1 2.1 0 0 1 3 3L11 16l-4 1 1-4z"/>
+  </symbol>
+  <symbol id="i-message" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 19.5A9 9 0 1 0 4.2 15L3 21z"/>
+  </symbol>
+  <symbol id="i-bulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M9.5 18h5"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.5.9 1.2.9 1.9v.2h5.2v-.2c0-.7.3-1.4.9-1.9A6 6 0 0 0 12 3z"/>
+  </symbol>
+  <symbol id="i-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 19V5.5A2.5 2.5 0 0 1 6.5 3H19a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-2H20"/><path d="M8 7h7"/>
+  </symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>
+  </symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+  </symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="9"/><path d="M10 8.5 16 12l-6 3.5z"/>
+  </symbol>
+  <symbol id="i-cap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 5 2.5 9.2 12 13.4l9.5-4.2z"/><path d="M6 11v4.5c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5V11"/>
+  </symbol>
+  <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/><path d="m8 11 4 4 4-4"/><path d="M12 3v12"/>
+  </symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.3 3.9 2.4 17.4A2 2 0 0 0 4.1 20.5h15.8a2 2 0 0 0 1.7-3.1L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>
+  </symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3.5 13.7 9l5.5 1.7-5.5 1.7L12 18l-1.7-5.6L4.8 10.7 10.3 9z"/><path d="M18.5 4v3"/><path d="M17 5.5h3"/>
+  </symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 3 10.5 13.5"/><path d="M21 3l-6.8 18-3.7-7.5L3 9.8z"/>
+  </symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m6 9 6 6 6-6"/>
+  </symbol>
+</svg>
+
+<div id="app" v-cloak
+     class="md:overflow-hidden md:flex md:flex-col">
+
+  <!-- ======================= 顶部导航 + 科目滚动条 ======================= -->
+  <header class="sticky top-0 z-30 shrink-0 text-white shadow-lg" style="background:linear-gradient(90deg,#4f46e5,#7c3aed)">
+    <div class="max-w-[1600px] mx-auto px-3 sm:px-4 pt-3 pb-2 flex items-center gap-3">
+      <svg class="w-7 h-7 shrink-0" aria-hidden="true"><use href="#i-book"/></svg>
+      <div class="flex-1 min-w-0">
+        <h1 class="text-base sm:text-lg font-bold truncate">我的AI学习助手</h1>
+        <p class="text-[10px] sm:text-xs text-indigo-100 truncate">拍照上传 · AI 提炼考点 · 去红笔重做 · 变式举一反三</p>
+      </div>
+      <div class="text-right text-xs leading-tight shrink-0">
+        <div>共 <b class="text-base align-middle">{{ items.length }}</b> 道<span
+             v-if="selectedIds.length" class="text-amber-200"> · 已选 {{ selectedIds.length }}</span></div>
+        <div v-if="stats.week_asked"
+             :class="stats.week_asked >= 6 ? 'text-amber-200 font-semibold' : 'text-indigo-100/75'">
+          本周问 AI {{ stats.week_asked }} 次
+        </div>
+      </div>
+      <button @click="logout" title="退出登录"
+              class="shrink-0 text-xs px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 transition">
+        退出
+      </button>
+    </div>
+    <!-- 科目单选滚动条 -->
+    <div class="max-w-[1600px] mx-auto px-3 sm:px-4 pb-3 flex gap-2 overflow-x-auto no-scrollbar">
+      <button v-for="s in subjectTabs" :key="s"
+              @click="switchSubject(s)"
+              class="chip shrink-0"
+              :class="{ 'on': activeSubject === s }">
+        {{ s }}
+      </button>
+    </div>
+  </header>
+
+  <!-- AI 未配置提示 -->
+  <div v-if="aiReady === false" class="bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-4 py-2 text-center">
+    <svg class="w-4 h-4 inline -mt-0.5" aria-hidden="true"><use href="#i-alert"/></svg> 后端未配置 <code class="bg-amber-100 px-1 rounded">DEEPSEEK_API_KEY</code>：
+    原图与去红笔图可正常保存，但「考点识别 / 纯净题干 / 变式题 / 解析」不会生成。配置后重启即可。
+  </div>
+
+      <!-- 桌面端：main 撑满 header 以下的剩余高度（md:flex-1 + min-h-0 才能让子项滚动），
+         两栏 md:items-stretch 拉满，各自成为独立滚动面板。手机端仍是普通文档流。 -->
+    <main class="max-w-[1600px] w-full mx-auto p-3 sm:p-4 flex gap-4 items-start
+                 md:flex-1 md:min-h-0 md:items-stretch">
+
+    <!-- ======================= 左栏：上传 + 列表 ======================= -->
+    <!-- 左栏：列表天然就是个面板，桌面端自己滚。
+         原来这里是 md:sticky md:top-[104px] —— 列表一长，sticky 会把容器钉住，
+         底部永远滚不到（跟右栏之前那个 bug 同源）。 -->
+    <section class="w-full md:w-[370px] lg:w-[430px] shrink-0 space-y-3
+                    md:overflow-y-auto md:pr-1 md:pb-2">
+
+      <!-- 上传面板 -->
+      <div class="shell-card p-4">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-sm font-bold text-slate-700">上传题目</span>
+          <span class="text-xs text-slate-400">照片 / PDF / Word / 文本</span>
+        </div>
+
+        <!-- 只放一个按钮、一个 input。
+             之前分成「拍照」和「相册」两个，但 capture="environment" 在桌面端会被忽略、
+             在很多手机上也只是让系统弹一个含「拍照」的菜单 —— 两个按钮点开的是同一个对话框。
+             去掉 capture，交给系统原生选择器，它本来就会同时给出「拍照 / 相册」两个入口。 -->
+        <button class="btn btn-primary w-full py-4 text-base shadow-lg shadow-indigo-200"
+                :disabled="uploading" @click="triggerPick">
+          <svg class="w-5 h-5" aria-hidden="true"><use href="#i-camera"/></svg>
+          <span v-if="!uploading">拍照 / 选文件</span>
+          <span v-else><span class="spin">⏳</span> 处理中…</span>
+        </button>
+        <input ref="fileInput" type="file"
+               accept="image/*,.pdf,.doc,.docx,.txt,.md,application/pdf"
+               class="hidden" @change="onFileChange">
+
+        <p class="text-xs text-slate-400 mt-2 leading-relaxed">
+          <b class="text-slate-500">照片</b>：手机上点这个按钮，系统会让你选「拍照」或「从相册选」，
+          上传前自动压缩，原图完整保留手写与红笔批改。<br>
+          <b class="text-slate-500">文件</b>：也可以选 PDF / Word / 纯文本，
+          AI 会<b class="text-slate-500">逐页把整份卷子拆成一道一道的题</b>，
+          一题一条分别归档。<br>
+          科目和题型（错题 / 经典题）都由 AI 判断，认错了在详情页直接改。
+        </p>
+
+
+        <!-- 上传进度 -->
+        <transition name="fade">
+          <div v-if="uploading" class="mt-3">
+            <div class="h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div class="h-full bg-indigo-500 transition-all" :style="{ width: uploadPct + '%' }"></div>
+            </div>
+            <p class="text-xs text-slate-500 mt-1.5">{{ uploadMsg }}</p>
+          </div>
+        </transition>
+      </div>
+
+      <!-- 自由问答入口。只在手机端出现：桌面端右栏一直在，本来就能直接问。
+           没有这个按钮的话，手机上「不选错题也能问 AI」这条路根本走不到
+           —— 右栏是 fixed 全屏层，没选中错题时它是隐藏的。
+           单独一张卡而不是塞进上传面板：那是两件事，混在一起会被当成上传的一部分。 -->
+      <div class="shell-card p-3 md:hidden">
+        <button class="btn btn-ai w-full py-2.5 text-sm" @click="openGeneralChat">
+          <svg class="w-4 h-4" aria-hidden="true"><use href="#i-message"/></svg>
+          问 AI 学习问题
+        </button>
+        <p class="text-[11px] text-slate-400 mt-2 text-center">
+          不挂靠某道错题——七科知识点、解题方法、复习计划都能问
+        </p>
+      </div>
+
+      <!-- 搜索 + 排序 + 导出 -->
+      <div class="shell-card p-3 space-y-2">
+        <div class="relative">
+          <input v-model="search" @input="onSearchInput" type="search"
+                 placeholder="搜索考点、题干关键词…"
+                 class="w-full pl-9 pr-8 py-2 text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-indigo-500 outline-none">
+          <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" aria-hidden="true"><use href="#i-search"/></svg>
+          <button v-if="search" @click="search=''; loadList()" title="清除"
+                  class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 p-1 hover:text-slate-600" aria-label="清除"><svg class="w-4 h-4" aria-hidden="true"><use href="#i-x"/></svg></button>
+        </div>
+        <!-- 题型筛选：错题 / 经典题分开看。放在排序旁边而不是科目那排 ——
+             科目chips是横向滚动的，再塞一组会挤成一坨。 -->
+        <div class="flex gap-1.5">
+          <button v-for="t in kindTabs" :key="t.k"
+                  @click="switchKind(t.k)"
+                  class="flex-1 text-xs py-1.5 rounded-lg border transition font-semibold"
+                  :class="activeKind === t.k
+                    ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                    : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300'">
+            {{ t.label }}
+            <span v-if="countByKind(t.k) !== null" class="font-normal opacity-60">{{ countByKind(t.k) }}</span>
+          </button>
+        </div>
+        <div class="flex gap-2">
+          <select v-model="order" @change="loadList"
+                  class="flex-1 text-xs px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 outline-none">
+            <option value="time_desc">最新优先</option>
+            <option value="time_asc">最早优先</option>
+            <option value="subject">按科目归组</option>
+          </select>
+          <button class="btn btn-primary text-xs py-2 px-4" @click="openExport"><svg class="w-4 h-4" aria-hidden="true"><use href="#i-file"/></svg> 导出 PDF</button>
+        </div>
+      </div>
+
+      <!-- 选择工具条 -->
+      <div class="shell-card p-3 flex items-center gap-2 flex-wrap">
+        <label class="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none">
+          <input type="checkbox" class="w-4 h-4 accent-indigo-600" :checked="allSelected" @change="toggleAll">
+          全选本页（{{ items.length }}）
+        </label>
+        <div class="flex-1"></div>
+        <span v-if="selectedIds.length" class="text-xs text-indigo-600 font-semibold">已选 {{ selectedIds.length }} 道</span>
+        <button v-if="selectedIds.length" class="btn btn-ghost text-xs py-1.5 px-3" @click="selectedIds = []">清空选择</button>
+      </div>
+
+      <!-- 题目卡片流 -->
+      <div class="space-y-2.5">
+        <div v-if="loading" class="shell-card p-8 text-center text-slate-400 text-sm">
+          <span class="spin">⏳</span> 加载中…
+        </div>
+
+        <div v-else-if="!items.length" class="shell-card p-10 text-center">
+          <svg class="w-12 h-12 mx-auto mb-2 text-slate-300" aria-hidden="true"><use href="#i-book"/></svg>
+          <p class="text-slate-500 text-sm font-semibold">
+            {{ activeKind ? ('这里还没有' + kindMeta(activeKind).label) : '这里还没有题目' }}
+          </p>
+          <p class="text-slate-400 text-xs mt-1">
+            {{ activeKind ? '换个题型看看，或上传一道' : '点上面的「拍照 / 从相册选择」开始吧' }}
+          </p>
+        </div>
+
+        <article v-for="it in items" :key="it.id"
+                 @click="openDetail(it)"
+                 class="shell-card p-3 cursor-pointer transition hover:shadow-md hover:-translate-y-0.5"
+                 :class="current && current.id === it.id ? 'ring-2 ring-indigo-500' : ''">
+          <div class="flex gap-3">
+            <input type="checkbox" class="w-4 h-4 mt-1 accent-indigo-600 shrink-0"
+                   :checked="selectedIds.includes(it.id)"
+                   @click.stop="toggleSelect(it.id)">
+            <img :src="it.clean_url || it.orig_url" loading="lazy" alt="题目缩略图"
+                 class="w-14 h-14 object-cover rounded-xl border border-slate-200 bg-slate-50 shrink-0">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-1.5 mb-1 flex-wrap">
+                <span class="text-[10px] font-bold px-1.5 py-0.5 rounded" :class="kindMeta(it.kind).badge">
+                  {{ kindMeta(it.kind).label }}
+                </span>
+                <span class="text-[10px] font-bold px-1.5 py-0.5 rounded" :class="subjMeta(it.subject).cls">
+                  {{ it.subject }}
+                </span>
+                <span v-if="it.tag" class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 truncate max-w-[150px]">
+                  {{ it.tag }}
+                </span>
+                <span v-if="!it.ai_ok" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">AI 未完成</span>
+              </div>
+              <p class="text-sm text-slate-700 leading-snug line-clamp-2">{{ it.title || '（暂无摘要）' }}</p>
+              <p class="text-[10px] text-slate-400 mt-1">{{ (it.created_at || '').slice(0, 16) }}</p>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ============ 右栏：详情（手机端自动变成全屏浮层，电脑端为常驻右栏） ============ -->
+    <!-- 右栏 = 可滚动内容区 + 固定底栏（两行 flex 列）。
+           底部输入区**不在滚动容器里**，所以天然不跟着滚 —— 不再依赖 sticky。
+           之前用 sticky bottom-0 是错的：sticky 只能在包含块范围内上移，
+           而它位于详情最底部、包含块只有两百多像素高，最多挪一小段就卡住了。 -->
+      <section class="fixed inset-0 z-40 bg-slate-100
+                      md:static md:inset-auto md:z-auto md:bg-transparent md:flex-1 md:min-w-0
+                      flex flex-col"
+               :class="(current || mobileChat) ? 'flex' : 'hidden md:flex'">
+      <!-- 没选中错题时右栏只剩一个对话窗口，撑满 1100px 太宽、一行字读起来费劲，
+           所以给它收成一条可读宽度并居中。选中错题时要看「原图/纯净题」对照，必须全宽。 -->
+      <div ref="detailScroll" class="flex-1 min-h-0 overflow-y-auto md:pr-1 md:pb-2"
+           :class="current ? '' : 'md:w-full md:max-w-3xl md:mx-auto'">
+
+      <!-- 这里原来是 md:sticky md:top-[104px]。容器比视口还高时，sticky 会把它钉住，
+           底部（正好是聊天区）就永远滚不到 —— 去掉，改由外层 section 自己滚。 -->
+      <div class="space-y-3 pb-6 md:pb-4">
+
+       <!-- 自由问答态的返回条。**只在没选中错题时出现，且只在手机端**：
+            右栏在手机上是 fixed 全屏层，而带「返回」的那张详情头部卡属于
+            「选中了错题」的分支——没有这条，从「问 AI 学习问题」进来之后
+            就再也回不到错题列表了，人直接被关在里面。
+            桌面端右栏一直可见，不需要返回。 -->
+       <div v-if="!current"
+            class="sticky top-0 z-20 md:hidden flex items-center gap-2 px-3 py-2
+                   bg-slate-100">
+         <button class="btn btn-ghost px-3 py-1.5 text-xs shrink-0 bg-white border border-slate-200"
+                 @click="closeDetail">
+           <svg class="w-3.5 h-3.5" aria-hidden="true"><use href="#i-x"/></svg>
+           返回
+         </button>
+         <span class="text-sm font-bold text-slate-600 truncate">AI 学习问答</span>
+       </div>
+
+       <!-- 选中错题时才有的那几张卡。用 <template> 包住而不是再加一层 div：
+            space-y-3 靠的是「直接子元素」，包一层就会把间距吃掉。 -->
+       <template v-if="current">
+
+        <!-- 详情头部 -->
+        <div class="shell-card p-4">
+          <div class="flex items-start gap-2">
+            <!-- 关掉这道题。桌面端也必须能关——关了右栏就回到「自由问答」，
+                 否则在电脑上点开一道错题之后就再也回不到自由问答了
+                 （手机上关掉=回错题列表，所以叫「返回」；桌面上叫「关闭」）。
+                 md:order-last 让它在桌面端跑到右侧，符合「关闭按钮在右上」的直觉。 -->
+            <button class="btn btn-ghost px-3 py-1.5 text-xs shrink-0 md:order-last"
+                    @click="closeDetail" :title="current ? '关闭，回到 AI 自由问答' : ''">
+              <svg class="w-3.5 h-3.5" aria-hidden="true"><use href="#i-x"/></svg>
+              <span class="md:hidden">返回</span>
+              <span class="hidden md:inline">关闭</span>
+            </button>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <select :value="current.kind" @change="changeKind(current, $event.target.value)"
+                        title="AI 判错了可以改：这道题是错题还是经典好题"
+                        class="text-xs font-bold px-2 py-0.5 rounded border-0 outline-none cursor-pointer"
+                        :class="kindMeta(current.kind).badge">
+                  <option v-for="(m, k) in kindMetaMap" :key="k" :value="k">{{ m.label }}</option>
+                </select>
+                <select :value="current.subject" @change="changeSubject(current, $event.target.value)"
+                        title="AI 识别有误时可以改"
+                        class="text-xs font-bold px-2 py-0.5 rounded border-0 outline-none cursor-pointer"
+                        :class="subjMeta(current.subject).cls">
+                  <option v-for="s in subjectList" :key="s" :value="s">{{ s }}</option>
+                </select>
+                <h2 class="text-base sm:text-lg font-bold text-slate-800 break-all">
+                  {{ current.tag || kindMeta(current.kind).placeholder }}
+                </h2>
+              </div>
+              <p class="text-xs text-slate-400 mt-1">
+                录入时间 {{ current.created_at }} · 编号 #{{ current.id }}
+                <span v-if="current.source" class="ml-1">· 来自 {{ current.source }}</span>
+                <span v-if="!current.ai_ok" class="text-amber-600 ml-1">（AI 未完成：{{ current.ai_status }}）</span>
+              </p>
+            </div>
+            <button class="btn btn-danger px-3 py-1.5 text-xs" @click="removeItem(current)">删除</button>
+          </div>
+
+          <!-- 资源直达 -->
+          <div class="flex gap-2 mt-3 flex-wrap">
+            <a :href="biliLink(current)" target="_blank" rel="noopener"
+               class="btn text-xs py-1.5 px-3" style="background:#fb7299;color:#fff"><svg class="w-4 h-4" aria-hidden="true"><use href="#i-play"/></svg> B站·压轴技巧</a>
+            <a :href="smarteduLink(current)" target="_blank" rel="noopener"
+               class="btn text-xs py-1.5 px-3" style="background:#0e7490;color:#fff"><svg class="w-4 h-4" aria-hidden="true"><use href="#i-cap"/></svg> 智慧教育平台</a>
+            <button class="btn btn-ghost text-xs py-1.5 px-3" @click="copyText(current.clean_text)"><svg class="w-4 h-4" aria-hidden="true"><use href="#i-copy"/></svg> 复制纯净题干</button>
+          </div>
+          <p class="text-[10px] text-slate-400 mt-1.5">
+            搜索词：{{ current.subject }} {{ current.tag || '中考' }} 压轴 技巧
+          </p>
+        </div>
+
+        <!-- 版本A / 版本B 对照区 -->
+        <div class="shell-card overflow-hidden">
+          <div class="flex border-b border-slate-100">
+            <button v-for="t in viewTabs" :key="t.k"
+                    @click="view = t.k"
+                    class="flex-1 py-2.5 text-xs sm:text-sm font-bold transition flex items-center justify-center gap-1.5"
+                    :class="view === t.k ? 'text-indigo-600 bg-indigo-50/70 border-b-2 border-indigo-600' : 'text-slate-500 hover:bg-slate-50'">
+              <svg class="w-3.5 h-3.5 shrink-0" aria-hidden="true"><use :href="'#i-' + t.icon"/></svg>
+              <span class="truncate">{{ t.label }}</span>
+            </button>
+          </div>
+
+          <!-- 分屏对比（电脑端复习主场） -->
+          <div v-if="view === 'split'" class="p-3 grid grid-cols-2 gap-3">
+            <div>
+              <p class="text-xs font-bold text-slate-500 mb-1.5">
+                版本A · 原图{{ current.kind === 'classic' ? '（题目原貌）' : '（看错因、查卡点）' }}
+              </p>
+              <img v-if="current.orig_url" :src="current.orig_url" class="w-full rounded-xl border border-slate-200 bg-white cursor-zoom-in" @click="zoom(current.orig_url)">
+              <p v-else class="text-xs text-slate-400">无原图</p>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-slate-500 mb-1.5">版本B · 纯净题（考前重做）</p>
+              <img v-if="current.clean_url" :src="current.clean_url" class="w-full rounded-xl border border-slate-200 bg-white cursor-zoom-in" @click="zoom(current.clean_url)">
+              <p v-else class="text-xs text-slate-400">无图</p>
+            </div>
+          </div>
+
+          <!-- 单图展示 -->
+          <div v-else-if="view === 'orig' || view === 'cleantext'" class="p-3">
+            <template v-if="view === 'orig'">
+              <img v-if="current.orig_url" :src="current.orig_url" class="w-full max-h-[70vh] object-contain rounded-xl border border-slate-200 bg-white cursor-zoom-in" @click="zoom(current.orig_url)">
+              <p v-else class="text-xs text-slate-400 p-6 text-center">无原图</p>
+            </template>
+            <template v-else>
+              <div v-if="current.clean_text" class="rich px-1 py-2" v-rich="current.clean_text"></div>
+              <p v-else class="text-xs text-slate-400 p-6 text-center">AI 纯净题干未生成（检查 API Key 或重新上传）</p>
+            </template>
+          </div>
+
+          <!-- 去红笔图 -->
+          <div v-else class="p-3">
+            <img v-if="current.clean_url" :src="current.clean_url" class="w-full max-h-[70vh] object-contain rounded-xl border border-slate-200 bg-white cursor-zoom-in" @click="zoom(current.clean_url)">
+            <p v-else class="text-xs text-slate-400 p-6 text-center">无图</p>
+            <p class="text-xs text-slate-400 mt-2 leading-relaxed">
+              本图由本机 OpenCV 处理：已抹掉红笔批改、阴影与灰底，保留全部印刷体与图形。
+              黑笔手写痕迹无法用像素方法安全剥离（会连带削掉印刷体），请看「纯净重排」里的 AI 文字版。
+            </p>
+          </div>
+        </div>
+
+        <!-- 分析卡：这是核心 —— 错题看「错在哪」，经典题看「好在哪」。
+             同一个字段（analysis）、同一张卡，只有标题和空状态文案随题型变。
+             举一反三（做新题）是下一步的事，不该占着这个位置。 -->
+        <div v-if="current.analysis" class="shell-card overflow-hidden">
+          <button class="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-slate-50 transition"
+                  @click="openError = !openError">
+            <svg class="w-5 h-5 text-amber-500 shrink-0" aria-hidden="true"><use href="#i-bulb"/></svg>
+            <span class="flex-1 font-bold text-sm text-slate-800">{{ kindMeta(current.kind).analysisTitle }}</span>
+            <span class="text-xs text-slate-400">{{ openError ? '收起 ▲' : '展开 ▼' }}</span>
+          </button>
+          <div v-show="openError" class="px-4 py-3 border-t border-slate-100 rich"
+               v-rich="current.analysis"></div>
+        </div>
+        <div v-else-if="current.ai_ok" class="shell-card px-4 py-3 text-xs text-slate-400">
+          {{ kindMeta(current.kind).analysisEmpty }}
+        </div>
+
+        <!-- 举一反三：默认收起，而且**点了才生成** ——
+             上传时不再预生成，既不白花 token，也不抢注意力。 -->
+        <div class="shell-card overflow-hidden">
+          <button class="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-slate-50 transition"
+                  @click="openVariant = !openVariant">
+            <svg class="w-5 h-5 text-slate-400 shrink-0" aria-hidden="true"><use href="#i-pen"/></svg>
+            <span class="flex-1 font-bold text-sm text-slate-800">举一反三</span>
+            <span class="text-xs text-slate-400">{{ openVariant ? '收起 ▲' : '展开 ▼' }}</span>
+          </button>
+          <div v-show="openVariant" class="px-4 pb-4 border-t border-slate-100">
+            <template v-if="current.variant_q">
+              <div class="rich pt-3" v-rich="current.variant_q"></div>
+              <button class="btn btn-ghost text-xs mt-3" @click="openAnalysis = !openAnalysis">
+                <svg class="w-4 h-4" aria-hidden="true"><use href="#i-bulb"/></svg>
+                {{ openAnalysis ? '收起解析' : '展开详细解析' }}
+              </button>
+              <div v-show="openAnalysis" class="mt-2 rounded-xl bg-emerald-50 border border-emerald-100 p-3">
+                <div v-if="current.variant_a" class="rich" v-rich="current.variant_a"></div>
+                <p v-else class="text-xs text-slate-400">AI 解析未生成</p>
+              </div>
+            </template>
+            <div v-else class="pt-3">
+              <p class="text-xs text-slate-400 leading-relaxed mb-3">
+                {{ kindMeta(current.kind).variantHint }}
+              </p>
+              <button class="btn btn-primary text-xs" :disabled="variantLoading" @click="genVariant(current)">
+                <span v-if="variantLoading" class="spin">⏳</span>
+                <svg v-else class="w-4 h-4" aria-hidden="true"><use href="#i-sparkle"/></svg>
+                {{ variantLoading ? '生成中…（约 20~40 秒）' : '生成变式题' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 动画讲解：这是本应用的招牌能力，必须有一个**看得见的按钮**。
+             之前它只能被动等模型自己想起来画 —— 界面上没有任何地方说得出
+             「这题可以让 AI 画个会动的图讲给你看」，等于这个功能不存在。
+             动画本身仍然存在对话里（跟 AI 讨论那道卡的绿色卡片），
+             这里是个「集中入口 + 画廊」：列出这道题已生成的全部动画，并负责生成。 -->
+        <div class="shell-card overflow-hidden">
+          <button class="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-slate-50 transition"
+                  @click="openAnim = !openAnim">
+            <svg class="w-5 h-5 text-emerald-500 shrink-0" aria-hidden="true"><use href="#i-play"/></svg>
+            <span class="flex-1 font-bold text-sm text-slate-800">动画讲解</span>
+            <span v-if="chatAnims.length"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">{{ chatAnims.length }} 个</span>
+            <span class="text-xs text-slate-400">{{ openAnim ? '收起 ▲' : '展开 ▼' }}</span>
+          </button>
+
+          <div v-show="openAnim" class="px-4 pb-4 border-t border-slate-100">
+            <!-- 已生成的动画：点链接直接在浏览器打开，也可以在页面内预览 -->
+            <div v-for="(a, i) in chatAnims" :key="'a' + i" class="mt-3">
+              <div class="rounded-[14px] border border-emerald-200 bg-emerald-50/70 overflow-hidden">
+                <div class="flex items-center gap-2 px-3 py-2">
+                  <svg class="w-5 h-5 shrink-0 text-emerald-600" aria-hidden="true"><use href="#i-sparkle"/></svg>
+                  <span class="flex-1 text-sm font-semibold text-emerald-800 truncate">{{ a.title }}</span>
+                  <a :href="a.url" target="_blank" rel="noopener"
+                     class="btn text-xs py-1.5 px-3 shrink-0" style="background:#059669;color:#fff">打开动画 ↗</a>
+                </div>
+                <button v-if="animPreview !== a.url" @click="animPreview = a.url"
+                        class="w-full text-xs text-emerald-700/80 py-1 border-t border-emerald-200 hover:bg-emerald-100/60 transition">
+                  在页面内预览 ▾
+                </button>
+                <div v-else class="border-t border-emerald-200">
+                  <iframe :src="a.url" class="w-full bg-white block" style="height:340px"
+                          sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+                  <button @click="animPreview = ''"
+                          class="w-full text-xs text-emerald-700/80 py-1 hover:bg-emerald-100/60 transition">
+                    收起预览 ▴
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <p class="text-xs text-slate-400 leading-relaxed mt-3 mb-3">
+              {{ chatAnims.length
+                  ? '还想换个角度看？可以再让 AI 画一个 —— 比如换个解法、或者把某一步拆得更细。'
+                  : '让 AI 把这道题的解法画成「会动的图」：关键步骤一步步演示，能点「上一步 / 下一步」慢慢看，结论直接标在画面上。函数图像、几何动点、电路、受力分析、光路、化学实验装置这类题尤其好用。' }}
+            </p>
+            <button class="btn btn-primary text-xs" :disabled="animBusy" @click="genAnim">
+              <span v-if="animBusy" class="spin">⏳</span>
+              <svg v-else class="w-4 h-4" aria-hidden="true"><use href="#i-play"/></svg>
+              {{ animBusy ? '正在画…（通常 1~3 分钟，最多 10 分钟）'
+                          : (chatAnims.length ? '再画一个' : '生成动画讲解') }}
+            </button>
+          </div>
+        </div>
+       </template><!-- /选中错题时才有的卡片 -->
+
+        <!-- AI 对话框。刻意放在 <template v-if="current"> **外面**：
+             没选中错题时它照样在，就是一个全科自由问答窗口。
+             这样只需一份消息列表模板，不必维护两份（两份迟早会走样）。 -->
+        <!-- 注意：这里不能用 overflow-hidden —— 它会让内部 sticky 失效，
+             底部输入区就钉不住了。圆角改由首尾元素自己带。 -->
+        <div class="shell-card">
+          <button class="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-slate-50 transition rounded-t-[14px]"
+                  @click="toggleChat">
+            <svg class="w-5 h-5 text-slate-400" aria-hidden="true"><use href="#i-message"/></svg>
+            <span class="flex-1 font-bold text-sm text-slate-800">
+              {{ current ? '和 AI 讨论这道题' : '问 AI 学习问题' }}
+            </span>
+            <span v-if="chatMsgs.length"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-600">{{ chatMsgs.length }} 条</span>
+            <span class="text-xs text-slate-400">{{ chatOpen ? '收起 ▲' : '展开 ▼' }}</span>
+          </button>
+
+          <!-- 消息跟页面一起滚，**不**自建滚动容器 —— 否则「详情栏滚动 + 消息区滚动」
+               就是嵌套滚动，手机上两层滚动很难操作。输入区是右栏 flex 列的第二行，
+               不在滚动容器内，所以没有内部滚动也照样一直可见。 -->
+          <div v-show="chatOpen" class="border-t border-slate-100">
+            <div class="px-4 py-3 space-y-3 bg-slate-50/60">
+              <div v-if="!chatMsgs.length && !chatSending" class="text-center py-6">
+                <p v-if="current && !current.orig_url" class="text-xs text-slate-400 leading-relaxed">
+                  这道题来自文件，AI 手上只有题干文字，没有原图<br>
+                  想问哪一步、哪一问，尽量在提问里说清楚
+                </p>
+                <p v-else-if="current && current.kind === 'classic'" class="text-xs text-slate-400 leading-relaxed">
+                  AI 能看到这道题的原图，以及上面「好在哪里」的分析<br>
+                  想不通关键一步、或想知道这类题的通法，直接问它
+                </p>
+                <p v-else-if="current" class="text-xs text-slate-400 leading-relaxed">
+                  AI 能看到这道题的原图（含你当时的手写和老师的红笔批改）<br>
+                  它会先引导你自己想，不直接给答案；实在想不出来再点下面的橙色按钮
+                </p>
+                <p v-else class="text-xs text-slate-400 leading-relaxed">
+                  这里是<b class="text-slate-500">全科自由问答</b>——不挂靠任何一道错题。<br>
+                  七科的知识点、解题方法、复习计划、应试技巧都可以问。<br>
+                  <span class="text-slate-300">想讨论某道错题，点左边那道题就行了。</span>
+                </p>
+              </div>
+
+              <div v-for="(m, i) in chatMsgs" :key="i"
+                   class="flex" :class="m.role === 'user' ? 'justify-end' : 'justify-start'">
+                <!-- 用户气泡 -->
+                <div v-if="m.role === 'user'"
+                     class="max-w-[88%] rounded-[14px] rounded-br-sm px-3.5 py-2.5 text-sm bg-indigo-600 text-white whitespace-pre-wrap">
+                  {{ m.content }}
+                </div>
+
+                <!-- AI 回复：思考过程 + 正文 -->
+                <div v-else class="max-w-[92%] w-full space-y-1.5">
+                  <!-- 思考过程（流式时实时可见，收完后自动收成一行，可再展开） -->
+                  <div v-if="m.reasoning"
+                       class="rounded-[14px] border border-slate-200 bg-white/70 overflow-hidden">
+                    <button @click="m.showReasoning = !m.showReasoning"
+                            class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-50 transition">
+                      <svg class="w-3.5 h-3.5" :class="m.streaming ? 'spin' : ''" aria-hidden="true"><use href="#i-bulb"/></svg>
+                      <span class="flex-1 text-left">
+                        {{ m.streaming ? 'AI 正在思考…' : ('思考过程 · ' + m.reasoning.length + ' 字') }}
+                      </span>
+                      <span class="text-slate-400">{{ m.showReasoning ? '收起 ▲' : '展开 ▼' }}</span>
+                    </button>
+                    <!-- ⚠️ 流式期间这个盒子必须是**固定高度**。
+                         原来它按内容自适应：reasoningText() 给的是"最后 320 个字符"，
+                         字数固定但换行行数不固定 —— 中文在哪儿折行每次都不一样，
+                         盒子高度就在 3~10 行之间来回跳（实测 67px→203px→106px），
+                         于是整页内容高度跟着上下动，而自动滚动又钉着底部，
+                         表现就是**整个屏幕不停上下抖动**。
+                         固定高度 + 底部对齐（flex items-end）：高度恒定不动，
+                         超出的部分从上方裁掉，孩子始终看到的是"现在在想什么"。 -->
+                    <div v-show="m.showReasoning"
+                         class="px-3 py-2 text-xs leading-relaxed text-slate-500 whitespace-pre-wrap border-t border-slate-100"
+                         :class="m.streaming ? 'h-[96px] overflow-hidden flex items-end' : ''">
+                      <div class="w-full">{{ reasoningText(m) }}</div>
+                    </div>
+                  </div>
+
+                  <!-- 正文：流式期间走纯文本（快），收完后才做 Markdown + 公式渲染 -->
+                  <div class="rounded-[14px] rounded-bl-sm px-3.5 py-2.5 text-sm"
+                       :class="m.error ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                                       : 'bg-white border border-slate-200'">
+                    <div v-if="m.streaming && !m.content" class="text-slate-400 text-xs">
+                      <span class="spin">⏳</span> 正在看图…
+                    </div>
+                    <div v-else-if="m.streaming" class="whitespace-pre-wrap">{{ m.content }}<span
+                         class="inline-block w-[7px] h-[15px] bg-indigo-500 align-text-bottom ml-0.5 animate-pulse"></span></div>
+                    <!-- 空正文：只可能是「生成到一半被中断、连一个字都没来得及写」。
+                         后端会保留问题本身，这一侧给个交代，别留一个空白气泡。 -->
+                    <div v-if="!m.content" class="text-slate-400 text-xs">（这条没有生成内容，可以再问一次）</div>
+                    <div v-else class="rich" v-rich="m.content"></div>
+                  </div>
+
+                  <!-- AI 生成的可交互动画：点链接直接在浏览器打开 -->
+                  <div v-if="m.anim" class="rounded-[14px] border border-emerald-200 bg-emerald-50/70 overflow-hidden">
+                    <div class="flex items-center gap-2 px-3 py-2">
+                      <svg class="w-5 h-5 shrink-0 text-emerald-600" aria-hidden="true"><use href="#i-sparkle"/></svg>
+                      <span class="flex-1 text-sm font-semibold text-emerald-800 truncate">{{ m.anim.title }}</span>
+                      <a :href="m.anim.url" target="_blank" rel="noopener"
+                         class="btn text-xs py-1.5 px-3 shrink-0" style="background:#059669;color:#fff">打开动画 ↗</a>
+                    </div>
+                    <button v-if="!m.anim.show" @click="m.anim.show = true"
+                            class="w-full text-xs text-emerald-700/80 py-1 border-t border-emerald-200 hover:bg-emerald-100/60 transition">
+                      在页面内预览 ▾
+                    </button>
+                    <div v-else class="border-t border-emerald-200">
+                      <iframe :src="m.anim.url" class="w-full bg-white block" style="height:340px"
+                              sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+                      <button @click="m.anim.show = false"
+                              class="w-full text-xs text-emerald-700/80 py-1 hover:bg-emerald-100/60 transition">
+                        收起预览 ▴
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+
+          </div>
+        </div>
+      </div><!-- /滚动内容的 space-y-3 包裹层 -->
+
+      </div><!-- /滚动内容区 -->
+
+      <!-- 固定底栏：右栏 flex 列的第二行，不在滚动容器内 —— 内容怎么滚它都钉在底部。
+           条件是 chatOpen 而不是「选了错题」，因为自由问答（没选错题）也要能提问。 -->
+      <div v-if="chatOpen"
+           class="shrink-0 bg-white border-t border-slate-200 rounded-t-[14px] shadow-[0_-2px_10px_rgba(15,23,42,.05)]"
+           :class="current ? '' : 'md:w-full md:max-w-3xl md:mx-auto'">
+        <!-- 建议按钮：横向可滑，手机上不会挤成一坨 -->
+        <div class="px-3 pt-2.5 pb-1 flex gap-2 overflow-x-auto no-scrollbar">
+          <!-- 动画讲解常驻在第一位：它是招牌能力，不能混在会轮换的建议里被换走。
+               只在选中某道题时出现（自由问答没有"这道题"可画）。 -->
+          <button v-if="current" @click="genAnim" :disabled="chatSending"
+                  class="shrink-0 flex items-center gap-1 text-xs px-3 py-1.5 rounded-full border transition font-semibold"
+                  :class="animBusy
+                    ? 'border-slate-100 text-slate-300 cursor-not-allowed'
+                    : 'border-emerald-300 text-emerald-700 bg-emerald-50 hover:border-emerald-500'">
+            <span v-if="animBusy" class="spin">⏳</span>
+            <svg v-else class="w-3.5 h-3.5" aria-hidden="true"><use href="#i-play"/></svg>
+            动画讲解
+          </button>
+          <button v-for="c in suggestions" :key="c.q" @click="sendChat(c.q, c.mode)" :disabled="chatSending"
+                  class="shrink-0 text-xs px-3 py-1.5 rounded-full border transition"
+                  :class="chatSending
+                    ? 'border-slate-100 text-slate-300 cursor-not-allowed'
+                    : (c.mode === 'full'
+                        ? 'border-amber-200 text-amber-700 bg-amber-50 hover:border-amber-400'
+                        : 'border-slate-200 text-slate-600 bg-white hover:border-indigo-400 hover:text-indigo-600')">
+            {{ c.q }}
+          </button>
+        </div>
+
+        <div class="px-3 pb-3 pt-1 flex gap-2 items-end">
+          <textarea v-model="chatInput" rows="2" :disabled="chatSending"
+                    @keydown.enter.exact.prevent="sendChat()"
+                    placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"
+                    class="flex-1 text-sm px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-indigo-500 outline-none resize-none"></textarea>
+          <!-- AI 正在输出时，发送按钮就地变成「停止」——
+               模型偶尔会想很久或答偏，用户必须能自己掐断，
+               而不是只能刷新页面（刷新会连已生成的内容一起丢掉）。 -->
+          <button v-if="chatSending" class="btn px-4 py-2.5 text-sm shrink-0"
+                  style="background:#e11d48;color:#fff" @click="stopChat" title="停止生成">
+            <svg class="w-4 h-4" aria-hidden="true"><use href="#i-x"/></svg>
+            <span>停止</span>
+          </button>
+          <button v-else class="btn btn-primary px-4 py-2.5 text-sm shrink-0"
+                  :disabled="!chatInput.trim()" @click="sendChat()">
+            <svg class="w-4 h-4" aria-hidden="true"><use href="#i-send"/></svg>
+            <span>发送</span>
+          </button>
+        </div>
+        <div v-if="chatMsgs.length" class="px-3 pb-2 text-right">
+          <button class="text-xs text-slate-400 hover:text-rose-500" @click="clearChat">清空对话</button>
+        </div>
+
+        
+      </div>
+      </section>
+  </main>
+
+  <!-- ==================== 导出 PDF 弹窗 ==================== -->
+  <transition name="fade">
+    <div v-if="showExport"
+         class="fixed inset-0 z-50 bg-black/50 flex items-end sm:items-center justify-center"
+         @click.self="showExport = false">
+      <div class="bg-white w-full sm:max-w-lg sm:rounded-[14px] rounded-t-[14px] max-h-[92vh] overflow-y-auto">
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center sticky top-0 bg-white z-10">
+          <svg class="w-4 h-4" aria-hidden="true"><use href="#i-file"/></svg><h3 class="font-bold text-slate-800 flex-1">导出打印文档</h3>
+          <button @click="showExport = false" class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭"><svg class="w-5 h-5" aria-hidden="true"><use href="#i-x"/></svg></button>
+        </div>
+
+        <div class="p-5 space-y-5">
+          <!-- 范围 -->
+          <div>
+            <p class="text-xs font-bold text-slate-500 mb-2">① 导出范围</p>
+            <div class="space-y-2">
+              <label class="flex items-center gap-2.5 text-sm cursor-pointer">
+                <input type="radio" value="selected" v-model="exportOpts.scope" class="accent-indigo-600 w-4 h-4">
+                <span>勾选的题目</span>
+                <span class="text-xs text-slate-400">{{ countFor('selected') }} 道</span>
+              </label>
+              <label class="flex items-center gap-2.5 text-sm cursor-pointer">
+                <input type="radio" value="filter" v-model="exportOpts.scope" class="accent-indigo-600 w-4 h-4">
+                <span>当前筛选：
+                  {{ activeSubject === '全部' ? '全部科目' : activeSubject }}
+                  <template v-if="activeKind">· {{ kindMeta(activeKind).label }}</template>
+                </span>
+                <span class="text-xs text-slate-400">{{ countFor('filter') }} 道</span>
+              </label>
+              <label class="flex items-center gap-2.5 text-sm cursor-pointer">
+                <input type="radio" value="all" v-model="exportOpts.scope" class="accent-indigo-600 w-4 h-4">
+                <span>全部题目</span>
+                <span class="text-xs text-slate-400">{{ countFor('all') }} 道</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 内容 -->
+          <div>
+            <p class="text-xs font-bold text-slate-500 mb-2">② 打印什么</p>
+            <div class="grid grid-cols-1 gap-2">
+              <label v-for="c in contentModes" :key="c.v"
+                class="flex items-start gap-2.5 p-2.5 rounded-xl border cursor-pointer transition"
+                :class="exportOpts.content === c.v ? 'border-indigo-500 bg-indigo-50/60' : 'border-slate-200 hover:border-slate-300'">
+                <input type="radio" :value="c.v" v-model="exportOpts.content" class="accent-indigo-600 w-4 h-4 mt-0.5">
+                <span>
+                  <span class="flex items-center gap-1.5">
+                    <svg class="w-4 h-4 text-slate-400 shrink-0" aria-hidden="true"><use :href="'#i-' + c.icon"/></svg>
+                    <span class="text-sm font-semibold text-slate-700">{{ c.t }}</span>
+                  </span>
+                  <span class="block text-xs text-slate-400 mt-0.5">{{ c.d }}</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 版式 -->
+          <div>
+            <p class="text-xs font-bold text-slate-500 mb-2">③ 版式</p>
+            <div class="flex gap-2">
+              <label class="flex-1 p-2.5 rounded-xl border cursor-pointer text-center"
+                     :class="exportOpts.layout === 'roomy' ? 'border-indigo-500 bg-indigo-50/60' : 'border-slate-200'">
+                <input type="radio" value="roomy" v-model="exportOpts.layout" class="hidden">
+                <span class="text-sm font-semibold text-slate-700">宽松</span>
+                <span class="block text-xs text-slate-400 mt-0.5">每题一页，留足空间</span>
+              </label>
+              <label class="flex-1 p-2.5 rounded-xl border cursor-pointer text-center"
+                     :class="exportOpts.layout === 'compact' ? 'border-indigo-500 bg-indigo-50/60' : 'border-slate-200'">
+                <input type="radio" value="compact" v-model="exportOpts.layout" class="hidden">
+                <span class="text-sm font-semibold text-slate-700">紧凑</span>
+                <span class="block text-xs text-slate-400 mt-0.5">多题一页，省纸</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 附加 -->
+          <div>
+            <p class="text-xs font-bold text-slate-500 mb-2">④ 附加内容</p>
+            <label class="flex items-center gap-2.5 text-sm cursor-pointer py-1">
+              <input type="checkbox" v-model="exportOpts.with_variant" class="accent-indigo-600 w-4 h-4">
+              附上同考点变式题与解析
+            </label>
+            <label class="flex items-center gap-2.5 text-sm cursor-pointer py-1">
+              <input type="checkbox" v-model="exportOpts.with_answer_page" class="accent-indigo-600 w-4 h-4">
+              卷末附「原图答案页」（做完再对）
+            </label>
+          </div>
+
+          <!-- 排序与标题 -->
+          <div>
+            <p class="text-xs font-bold text-slate-500 mb-2">⑤ 排序与标题</p>
+            <div class="flex gap-2">
+              <select v-model="exportOpts.order"
+                      class="flex-1 text-sm px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 outline-none">
+                <option value="time_asc">按时间（旧 → 新）</option>
+                <option value="time_desc">按时间（新 → 旧）</option>
+                <option value="subject">按科目归组</option>
+              </select>
+              <input v-model="exportOpts.title" placeholder="页眉标题（可空）"
+                     class="flex-1 text-sm px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white outline-none">
+            </div>
+          </div>
+        </div>
+
+        <div class="px-5 py-4 border-t border-slate-100 flex items-center gap-3 sticky bottom-0 bg-white">
+          <span class="text-xs text-slate-500 flex-1">
+            将导出 <b class="text-indigo-600 text-base">{{ exportCount }}</b> 道题
+            <span v-if="exportOpts.content === 'redo' && exportOpts.layout === 'roomy'" class="text-slate-400">· 每题一页</span>
+          </span>
+          <button class="btn btn-ghost text-sm" @click="showExport = false">取消</button>
+          <button class="btn btn-primary text-sm px-5" :disabled="exporting || !exportCount" @click="doExport">
+            <span v-if="exporting" class="spin">⏳</span><svg v-else class="w-4 h-4" aria-hidden="true"><use href="#i-download"/></svg>
+            {{ exporting ? '生成中…' : '生成并下载' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </transition>
+
+  <!-- ============ 布局自检面板（访问 /#debug 打开）============
+       做成右下角悬浮小面板而不是全屏遮罩：这样你可以一边点错题、一边看数字
+       实时变化（每 1.2 秒重测）。全屏遮罩会把界面盖住，只能测到初始状态。 -->
+  <div v-if="debug" data-debug-panel
+       class="fixed z-[60] right-3 bottom-3 w-[min(92vw,520px)] max-h-[62vh] flex flex-col
+              bg-white rounded-[14px] shadow-2xl border border-slate-200 overflow-hidden">
+    <div class="flex items-center gap-2 px-3 py-2 border-b border-slate-100 shrink-0">
+      <svg class="w-4 h-4 text-slate-400" aria-hidden="true"><use href="#i-search"/></svg>
+      <span class="font-bold text-sm text-slate-800 flex-1">布局自检（实时）</span>
+      <button class="btn btn-ghost text-xs py-1 px-2" @click="copyText(debug)">复制</button>
+      <button class="btn btn-ghost text-xs py-1 px-2" @click="closeDebug">关闭</button>
+    </div>
+    <pre class="text-[11px] leading-relaxed whitespace-pre-wrap break-all bg-slate-50 p-3 overflow-y-auto text-slate-600 flex-1">{{ debug }}</pre>
+    <p class="px-3 py-2 text-[11px] text-slate-400 leading-relaxed border-t border-slate-100 shrink-0">
+      每 1.2 秒自动重测。请点开一道错题后再看——那才是真实状态。
+    </p>
+  </div>
+
+  <!-- 图片放大查看 -->
+  <transition name="fade">
+    <div v-if="zoomed" @click="zoomed = null"
+         class="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-3 cursor-zoom-out">
+      <img :src="zoomed" class="max-w-full max-h-full object-contain rounded-xl">
+      <p class="absolute bottom-5 text-white/70 text-xs">点击任意处关闭</p>
+    </div>
+  </transition>
+
+  <!-- 全局轻提示 -->
+  <transition name="fade">
+    <div v-if="toast" class="fixed left-1/2 -translate-x-1/2 bottom-6 z-50 px-4 py-2.5 rounded-xl text-sm font-semibold shadow-xl"
+         :class="toastType === 'error' ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white'">
+      {{ toast }}
+    </div>
+  </transition>
+
+</div>
+
+<!-- ======================= Vue 3 ======================= -->
+<script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.js"></script>
+<script>
+/* =========================================================================
+   若 CDN 全部不可用（完全离线），页面会显示这条提示，
+   但后端的 AI 能力不受影响 —— 离线时仍可通过 curl 直接调 /api/upload。
+   ========================================================================= */
+if (!window.Vue) {
+  document.getElementById('app').innerHTML =
+    '<div style="padding:40px;text-align:center;font-family:sans-serif">' +
+    '<h2>⚠️ 无法加载 Vue 3（CDN 不可达）</h2>' +
+    '<p style="color:#64748b">请检查本机网络，或把 CDN 换成本地文件后刷新。</p></div>';
+  throw new Error('Vue CDN blocked');
+}
+
+const SUBJECTS = ['语文', '数学', '英语', '物理', '化学', '历史', '道德与法治'];
+/* 「自由问答」线程的 id：没选中任何错题时，AI 对话走这条线程。
+   mistakes 表的自增 id 从 1 开始，0 永远空着，正好拿来当哨兵值。
+   必须和 main.py 的 GENERAL_CHAT_ID 保持一致。 */
+const GENERAL_ID = 0;
+
+/* 文件名 -> 文档类型。和 main.py 的 DOC_*_EXT 一一对应，改一边记得改另一边。
+   图片返回 ''，走原来那条「压缩 + 上传进度条」的老路。 */
+const DOC_EXT = {
+  pdf:  ['.pdf'],
+  word: ['.doc', '.docx', '.rtf', '.odt'],
+  text: ['.txt', '.md', '.markdown', '.text']
+};
+function docKindOf(name) {
+  const n = (name || '').toLowerCase();
+  for (const k in DOC_EXT) {
+    if (DOC_EXT[k].some(e => n.endsWith(e))) return k;
+  }
+  return '';
+}
+
+/* 题型。错题是主体，经典题是「好题收藏」——两者数据结构完全一样，
+   差别只在语义（analysis 字段什么意思、AI 用什么口径讲）和这一层标签。
+   值和 main.py 的 KINDS 一一对应，改一边记得改另一边。 */
+const KIND_META = {
+  mistake: {
+    label: '错题', badge: 'bg-rose-100 text-rose-700',
+    analysisTitle: '这道题错在哪',
+    analysisEmpty: 'AI 没能从这张照片上看出具体错因（可能是只拍了题干、没有手写或批改痕迹）。',
+    variantHint: '生成一道同考点、同难度的新题，重点针对你这次的错因 —— 换个情境再练一遍。',
+    placeholder: '中考错题'
+  },
+  classic: {
+    label: '经典题', badge: 'bg-amber-100 text-amber-700',
+    analysisTitle: '这道题好在哪里',
+    analysisEmpty: 'AI 没能提炼出这道题的妙处。',
+    variantHint: '生成一道同考点、同难度的新题 —— 保留这道题最妙的那个设计，数值情境全部换新。',
+    placeholder: '中考经典题'
+  }
+};
+const SUBJ_META = {
+  '语文':      { cls: 'bg-rose-100 text-rose-700' },
+  '数学':      { cls: 'bg-blue-100 text-blue-700' },
+  '英语':      { cls: 'bg-emerald-100 text-emerald-700' },
+  '物理':      { cls: 'bg-violet-100 text-violet-700' },
+  '化学':      { cls: 'bg-amber-100 text-amber-700' },
+  '历史':      { cls: 'bg-orange-100 text-orange-700' },
+  '道德与法治': { cls: 'bg-cyan-100 text-cyan-700' }
+};
+
+/* ================= Markdown + LaTeX 渲染管线 =================
+   顺序很关键，每一步都是踩坑踩出来的：
+
+   ① 给「没写 $ 分隔符」的公式自动补上
+      模型经常直接吐 I=\frac{U}{R}=0.2\text{A} 这种裸公式，而 KaTeX 只认分隔符，
+      不补的话公式原样显示成文本（用户实际遇到的就是这个）。
+
+   ② 把公式抽成占位符再跑 Markdown
+      否则 Markdown 会吃掉公式：$a*b*c$ 变成 $a<em>b</em>c$，
+      \begin{aligned} 里的 \\ 和 & 被改写成 <br> 和 &amp;。
+
+   ③ 跑 Markdown  →  ④ 还原公式  →  ⑤ 交给 KaTeX
+========================================================================= */
+
+// LaTeX 命令（用来判断一段文字到底是不是公式；普通中英文不会出现这些）
+/* 构建标记：面板和 console 里都会显示，方便确认浏览器跑的是哪一版代码
+   （缓存问题排查过好几次，有个版本号就不用猜了）。 */
+var APP_BUILD = '2026-09-29 16:19';
+console.log('AI学习助手 build:', APP_BUILD);
+
+var LATEX_CMD = new RegExp(
+  '\\\\(?:frac|dfrac|tfrac|sqrt|text|mathrm|mathbf|mathit|operatorname|' +
+  'times|div|pm|mp|cdot|ast|leq|geq|neq|approx|equiv|sim|propto|infty|' +
+  'Omega|omega|alpha|beta|gamma|delta|epsilon|varepsilon|theta|lambda|mu|' +
+  'nu|pi|rho|sigma|tau|phi|varphi|chi|psi|Delta|Gamma|Theta|Lambda|Sigma|' +
+  'Phi|Psi|sum|prod|int|oint|angle|triangle|parallel|perp|circ|because|' +
+  'therefore|overline|underline|vec|hat|bar|dot|ddot|left|right|begin|end|' +
+  'quad|qquad|sin|cos|tan|cot|sec|csc|log|ln|lg|max|min|lim|' +
+  'to|rightarrow|leftarrow|Rightarrow|Leftrightarrow|' +
+  'uparrow|downarrow|updownarrow|xrightarrow|xleftarrow|overset|underset|' +
+  'subset|supset|subseteq|supseteq|forall|exists|partial|nabla|' +
+  'binom|pmatrix|bmatrix|vmatrix|cases|array|aligned|gathered|' +
+  'approx|propto|simeq|cong|ll|gg|odot|otimes|oplus|' +
+  'deg|prime|ldots|cdots|vdots|ddots|displaystyle|limits)\\b'
+);
+// 化学式：必须有数字（下标），且至少两组「大写字母开头」的元素 ——
+// 这个约束把 NASA / OK / A4 这类普通文本挡在外面，见 test_render 的边界用例
+// 结构：至少两个「元素单元」，允许 Ca(OH)_2 这种带括号的写法；
+// 前面的 (?=...) 要求整串里必须有数字，否则 NASA / OK 也会被当成化学式。
+var CHEM_FORMULA = /^(?=[A-Za-z0-9_()·]*\d)(?:[A-Z][a-z]?\d*_?\d*|\([A-Za-z0-9_]*\)_?\d*){2,}$/;
+// 可以出现在公式里的字符（中文字符不在其中，所以中文会把公式段「切断」）
+var MATH_CHAR = /[A-Za-z0-9\s=+\-*/^_{}()\[\].,\\<>|]/;
+var MATH_PLACEHOLDER = /%%MATH(\d+)%%/g;
+
+/* 把一行里「不含中文的、带 LaTeX 命令的字符段」用 $ 包起来 */
+function wrapBareLatexInLine(line) {
+  if (line.indexOf('$') >= 0) return line;          // 已有分隔符，不重复包
+  if (/^\s*\|/.test(line)) return line;             // 表格行别动，包了会破坏表格
+  // 早退：既没有 LaTeX 命令，也没有「数字 + 下标符号」的特征，就当普通文字。
+  // 注意别写成「数字后面跟字母」——Ca(OH)_2 / KMnO_4 的数字在末尾，会被漏掉。
+  if (!LATEX_CMD.test(line) && !(/\d/.test(line) && /[_()]/.test(line))) return line;
+
+  // 行首的 Markdown 结构标记要原样保留：`- I=\frac{U}{R}` 里的 "- " 如果被
+  // 一起包进公式，列表就没了，公式里还会多出一个减号。
+  var prefix = '';
+  var mp = /^(\s*(?:[-*+]|\d+[.)])\s+|\s*#{1,6}\s+|\s*>\s*)/.exec(line);
+  var body = line;
+  if (mp) { prefix = mp[0]; body = line.slice(prefix.length); }
+
+  // 先把 \text{中文} / \mathrm{...} 这类「命令的中文参数」藏起来。
+  // 否则中文会把公式段切断，切出 $\frac{U_{\text{$总$}}}$ 这种嵌套坏结构
+  // ——\text{} 里放中文是完全合法的写法，尤其在物理/化学的单位和下标里。
+  // 占位符必须由「公式字符」组成，才不会被当成切断点。
+  var stash = [];
+  var masked = body.replace(
+    /\\(?:text|textrm|textit|mathrm|mathbf|mathit|operatorname|mbox)\s*\{[^{}]*\}/g,
+    function (m) { stash.push(m); return 'QzT' + (stash.length - 1) + 'TzQ'; }
+  );
+
+  var unmask = function (s) {
+    return s.replace(/QzT(\d+)TzQ/g, function (m, k) { return stash[+k]; });
+  };
+
+  var out = '', i = 0;
+  while (i < masked.length) {
+    if (!MATH_CHAR.test(masked[i])) { out += masked[i++]; continue; }
+    var j = i;
+    while (j < masked.length && MATH_CHAR.test(masked[j])) j++;
+    // 注意：必须在**还原后**的内容上判断是否含 LaTeX 命令。
+    // 在掩码串上判断会漏掉「命令正好被掩掉」的行，比如 =0.2\text{A}
+    // —— 掩码后变成 =0.2QzT0TzQ，看起来就不像公式了。
+    var raw = unmask(masked.slice(i, j));
+    var t = raw.trim();
+    // 是公式的两种情况：① 含 LaTeX 命令；② 长得像化学式（Na_2CO_3 / H_2SO_4）
+    var isMath = LATEX_CMD.test(raw) || CHEM_FORMULA.test(t);
+    if (isMath) {
+      var at = raw.indexOf(t);
+      var lead = raw.slice(0, at), trail = raw.slice(at + t.length);
+      // 整行只有这一段公式 -> 用块级 $$（居中显示）；嵌在句子里 -> 用行内 $
+      var whole = (out.trim() === '' && lead.trim() === '' && masked.slice(j).trim() === '');
+      var d = whole ? '$$' : '$';
+      out += lead + d + t + d + trail;
+    } else {
+      out += raw;
+    }
+    i = j;
+  }
+  return prefix + out;
+}
+
+var MATH_SPAN_RE = /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
+
+function autoWrapBareLatex(text) {
+  // ① 先把「已经带分隔符」的公式整段藏起来，避免重复包裹。
+  //    模型不只用 $...$，也常用 \(...\) 和 \[...\] 这套写法。早期版本只判断 $，
+  //    于是把 \(U=6\text{V}\) 又包了一层，产出 $\(U=6\text{V}\)$ 这种坏结构。
+  var stash = [];
+  var masked = String(text).replace(MATH_SPAN_RE, function (m) {
+    stash.push(m);
+    return '\u0001' + (stash.length - 1) + '\u0001';
+  });
+
+  // ② 逐行给「裸公式」补分隔符（\u0001 不是公式字符，会自然把片段切开）
+  var lines = masked.split('\n'), inFence = false, out = [];
+  lines.forEach(function (line, idx) {
+    if (/^\s*```/.test(line)) { inFence = !inFence; out.push(line); return; }
+    if (inFence) { out.push(line); return; }        // 代码块里的内容一律不动
+    var w = wrapBareLatexInLine(line);
+    out.push(w);
+    // 独立成行的公式块后面补空行：否则 marked 的 breaks 会把换行变成 <br>，
+    // 多行推导就渲染成「公式 <br> 公式」而不是干净的堆叠
+    var isBlock = /^\s*\$\$[\s\S]+\$\$\s*$/.test(w);
+    var next = lines[idx + 1];
+    if (isBlock && next !== undefined && next.trim() !== '') out.push('');
+  });
+
+  // ③ 还原
+  return out.join('\n').replace(/\u0001(\d+)\u0001/g, function (m, k) {
+    return stash[+k] === undefined ? m : stash[+k];
+  });
+}
+
+/* 把公式抽成占位符（含中括号/圆括号写法），跑完 Markdown 再还原 */
+function protectMath(text) {
+  var store = [];
+  var re = /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
+  var out = String(text).replace(re, function (m) {
+    store.push(m);
+    return '%%MATH' + (store.length - 1) + '%%';
+  });
+  return { text: out, store: store };
+}
+
+function restoreMath(html, store) {
+  return html.replace(MATH_PLACEHOLDER, function (m, i) {
+    var v = store[+i];
+    return (v === undefined) ? m : v;
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
+  });
+}
+
+function decodeEntities(s) {
+  return String(s).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, function (m, e) {
+    if (e.charAt(0) === '#') {
+      var n = (e.charAt(1) === 'x' || e.charAt(1) === 'X')
+        ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      return isNaN(n) ? m : String.fromCharCode(n);
+    }
+    var map = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+    return map[e] !== undefined ? map[e] : m;
+  });
+}
+
+/* ---------- 把 ```svg 代码块渲染成内联示意图 ----------
+   模型不能直接产出图片文件，但它可以用 SVG 画图。这里把围栏里的 SVG 直接画进
+   回答里（几何图形、受力分析、电路、光路都能这么画）。
+
+   安全：这段 SVG 是模型生成的，要注入进 DOM。走 DOMPurify 的 svg 配置过滤，
+   并且**拿不到净化器就绝不注入**（宁可显示源码，也不能把未过滤的 SVG 塞进页面）。
+   —— 它的输入里包含用户上传的试卷图片，存在提示注入的可能。            */
+function renderInlineSvg(html) {
+  if (!html || html.indexOf('language-svg') < 0) return html;
+  if (!window.DOMPurify || typeof window.DOMPurify.sanitize !== 'function') return html;
+
+  var re = /<pre><code[^>]*class="[^"]*language-svg[^"]*"[^>]*>([\s\S]*?)<\/code><\/pre>/g;
+  return html.replace(re, function (whole, code) {
+    var raw = decodeEntities(code).trim();
+    if (!/^<svg[\s>]/i.test(raw)) return whole;
+    var clean;
+    try {
+      clean = window.DOMPurify.sanitize(raw, {
+        USE_PROFILES: { svg: true, svgFilters: true },
+        FORBID_TAGS: ['script', 'style', 'foreignObject', 'animate', 'animateTransform', 'set'],
+        FORBID_ATTR: ['onload', 'onclick', 'onerror', 'onmouseover']
+      });
+    } catch (e) { return whole; }
+    if (!/^<svg[\s>]/i.test(clean)) return whole;
+
+    // 把 <title> 提出来当图注，并给 svg 补上无障碍属性
+    var t = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(clean);
+    var caption = t ? t[1].trim() : '';
+    clean = clean.replace(/<svg/i, '<svg role="img"' +
+      (caption ? ' aria-label="' + escapeHtml(caption) + '"' : ''));
+    return '<figure class="svg-fig">' + clean +
+           (caption ? '<figcaption>' + escapeHtml(caption) + '</figcaption>' : '') +
+           '</figure>';
+  });
+}
+
+function mdToHtml(text) {
+  if (!text) return '';
+  var prepared = protectMath(autoWrapBareLatex(text));
+  var html;
+  if (window.marked && typeof window.marked.parse === 'function') {
+    try { html = window.marked.parse(prepared.text, { breaks: true, gfm: true }); }
+    catch (e) { html = '<p>' + escapeHtml(prepared.text).replace(/\n/g, '<br>') + '</p>'; }
+  } else {
+    html = '<p>' + escapeHtml(prepared.text).replace(/\n/g, '<br>') + '</p>';
+  }
+  return renderInlineSvg(restoreMath(html, prepared.store));
+}
+function paintRich(el, text) {
+  el.innerHTML = mdToHtml(text);
+  if (window.renderMathInElement) {
+    try {
+      window.renderMathInElement(el, {
+        delimiters: [
+          { left: '$$', right: '$$', display: true },
+          { left: '\\[', right: '\\]', display: true },
+          { left: '$', right: '$', display: false },
+          { left: '\\(', right: '\\)', display: false }
+        ],
+        throwOnError: false, ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+      });
+    } catch (e) { /* 公式渲染失败不影响文字阅读 */ }
+  }
+}
+
+const { createApp } = Vue;
+
+const app = createApp({
+  data() {
+    return {
+      items: [],
+      loading: true,
+      activeSubject: '全部',
+      current: null,
+      selectedIds: [],
+      uploading: false,
+      authExpired: false,
+      uploadPct: 0,
+      uploadMsg: '',
+      exporting: false,
+      /* 归档科目由 AI 从图片识别（后端看 tag 前缀），认得不对可以在详情页改。
+         上传前不再需要用户手选，所以这里只有一份可选列表给「改科目」用。 */
+      subjectList: ['语文', '数学', '英语', '物理', '化学', '历史', '道德与法治'],
+      /* 整理：搜索 + 排序 + 题型筛选 */
+      search: '',
+      /* '' = 全部题型。错题和经典题在同一个列表里，靠这个筛。 */
+      activeKind: '',
+      order: 'time_desc',
+      searchTimer: null,
+      stats: { total: 0, by_subject: {} },
+      /* 导出弹窗 */
+      showExport: false,
+      exportOpts: {
+        scope: 'selected', content: 'redo', layout: 'roomy',
+        with_variant: false, with_answer_page: false, order: 'time_asc', title: ''
+      },
+      /* 布局自检面板：访问 /#debug 打开。开发环境的 headless Chromium 用悬浮滚动条
+         （占 0px），和真实浏览器的传统滚动条行为不同，有些滚动条问题只能靠你在
+         自己的浏览器里看这个面板的数字。 */
+      debug: null,
+      /* AI 答疑（默认展开，点标题可收起） */
+      chatOpen: true,
+      chatMsgs: [],
+      chatInput: '',
+      chatSending: false,
+      /* 手机端：没选中错题时右栏默认是隐藏的（它是 fixed inset-0 的全屏层）。
+         这个开关让它能单独被「问 AI 学习问题」这个入口拉起来。桌面端用不到。 */
+      mobileChat: false,
+      /* 建议按钮：开聊前给「怎么问」，聊起来后给「追问什么」——
+         初三孩子最难的往往不是不会做，而是不知道该问什么 */
+      quickAsks: [
+        { q: '这道题该从哪下手？', mode: 'guide' },
+        { q: '给我一点提示',       mode: 'guide' },
+        { q: '我卡在这一步了',     mode: 'guide' },
+        { q: '我实在想不出来',     mode: 'full'  }
+      ],
+      followUps: [
+        { q: '再提示我一点',       mode: 'guide' },
+        { q: '这题考哪个知识点？', mode: 'guide' },
+        { q: '我的思路对吗？',     mode: 'guide' },
+        { q: '我实在想不出来',     mode: 'full'  }
+      ],
+      /* 自由问答（没选中错题）的建议按钮。跟错题答疑的口径不同：
+         这里大多是知识性/方法性问题，默认直接讲解（full）；
+         guide 只在孩子明确要「自己想一想」时用。 */
+      generalAsks: [
+        { q: '怎么安排每天的复习时间？', mode: 'full'  },
+        { q: '考试总粗心丢分怎么办？',   mode: 'full'  },
+        { q: '帮我梳理一下这周该补什么', mode: 'full'  },
+        { q: '别直接说答案，引导我想',   mode: 'guide' }
+      ],
+      generalFollowUps: [
+        { q: '再讲细一点',           mode: 'full'  },
+        { q: '举个例子',             mode: 'full'  },
+        { q: '出两道题考考我',       mode: 'full'  },
+        { q: '别直接说答案，引导我想', mode: 'guide' }
+      ],
+      contentModes: [
+        { v: 'redo',  icon: 'pen',     t: '重做卷',     d: '纯净题 + 作答区，给孩子重新做' },
+        { v: 'orig',  icon: 'image',   t: '原图复习卷', d: '原始照片，含当时手写与红笔批改，看错因' },
+        { v: 'clean', icon: 'eraser',  t: '去红笔卷',   d: '去掉红笔批改的题面' },
+        { v: 'both',  icon: 'columns', t: '对照卷',     d: '上半页原图、下半页重做题' }
+      ],
+      aiReady: null,
+      view: 'split',
+      /* 错因分析和举一反三都默认收起：先让孩子自己看原图、试着重做，
+         实在想不通再展开看「错在哪」。一进来就给答案，就等于替他想完了。 */
+      openError: false,
+      openVariant: false,
+      /* 动画讲解卡：默认收起，跟错因/举一反三一个口径 —— 先让孩子自己试。
+         animPreview 存"当前在页面内预览哪个动画的 url"，空串=没有预览。 */
+      openAnim: false,
+      animPreview: '',
+      /* 只在「生成动画」这条路径上为真。不能复用 chatSending ——
+         那个对任何一条消息都为真，普通提问时按钮会显示成「正在画…」。 */
+      animBusy: false,
+      variantLoading: false,
+      openAnalysis: false,
+      zoomed: null,
+      toast: '',
+      toastType: 'ok',
+      toastTimer: null,
+      viewTabs: [
+        { k: 'split',     icon: 'columns', label: '分屏对比' },
+        { k: 'orig',      icon: 'image',   label: '版本A·原图' },
+        { k: 'clean',     icon: 'eraser',  label: '版本B·去红笔' },
+        { k: 'cleantext', icon: 'sparkle', label: '版本B·纯净重排' }
+      ]
+    };
+  },
+
+  computed: {
+    subjectTabs() { return ['全部'].concat(SUBJECTS); },
+    allSelected() {
+      return this.items.length > 0 && this.items.every(i => this.selectedIds.includes(i.id));
+    },
+    /* 导出弹窗里实时显示「将导出 N 道」 */
+    exportCount() { return this.countFor(this.exportOpts.scope); },
+    /* 当前对话线程的 id。选中错题就是那道题，没选中就是 0 号「自由问答」线程
+       —— 与后端 GENERAL_CHAT_ID 一一对应（见 main.py）。 */
+    threadId() { return this.current ? this.current.id : GENERAL_ID; },
+    /* 给模板用的题型表（模板只能访问组件实例上的属性，拿不到模块作用域的 KIND_META） */
+    kindMetaMap() { return KIND_META; },
+    /* 这道题已经生成过的全部动画。数据源就是对话记录 —— 动画本来就存在消息里，
+       不另开一张表，省得两处状态对不上。 */
+    chatAnims() {
+      return this.chatMsgs.filter(m => m.anim && m.anim.url)
+                           .map(m => ({ title: m.anim.title, url: m.anim.url }));
+    },
+    kindTabs() { return [{ k: '', label: '全部题型' }].concat(
+      Object.keys(KIND_META).map(k => ({ k, label: KIND_META[k].label }))); },
+    /* 建议按钮随对话阶段切换：还没聊过 → 教他「怎么问」；聊过了 → 给「追问什么」。
+       自由问答用的是另一套（见 generalAsks / generalFollowUps）。 */
+    suggestions() {
+      if (!this.current) return this.chatMsgs.length ? this.generalFollowUps : this.generalAsks;
+      return this.chatMsgs.length ? this.followUps : this.quickAsks;
+    }
+  },
+
+  watch: {
+    /* 选中/取消选中错题 = 切换对话线程。
+       不重载的话，右栏会拿上一道题的消息去渲染新线程，看着像串台。
+       只在「线程身份」变了时才重载：列表刷新（搜索/排序）会把 current 换成
+       同 id 的新对象，那种情况不该把正在看的对话冲掉。 */
+    current(it, old) {
+      const nid = it ? it.id : GENERAL_ID;
+      if (nid === (old ? old.id : GENERAL_ID)) return;
+      this.chatMsgs = [];
+      this.chatInput = '';
+      // 上一条线程的流式状态跟我们没关系了，别让它把新线程的输入框一直禁用着
+      this.chatSending = false;
+      this.loadChat(nid);
+    }
+  },
+
+  methods: {
+    subjMeta(s) { return SUBJ_META[s] || { cls: 'bg-slate-100 text-slate-600' }; },
+    kindMeta(k) { return KIND_META[k] || KIND_META.mistake; },
+
+    /* 会话过期统一处理：跳登录页，并抑制随后的错误弹窗 */
+    guard(r) {
+      if (r && r.status === 401) {
+        this.authExpired = true;
+        location.href = '/login';
+        throw new Error('登录已过期');
+      }
+      return r;
+    },
+
+    async logout() {
+      if (!confirm('确定退出登录吗？下次需要重新输入口令。')) return;
+      try { await fetch('/api/logout', { method: 'POST' }); } catch (e) { /* 忽略 */ }
+      location.href = '/login';
+    },
+
+    notify(msg, type = 'ok') {
+      if (this.authExpired) return;          // 已跳登录页，不再弹错
+      this.toast = msg;
+      this.toastType = type;
+      clearTimeout(this.toastTimer);
+      this.toastTimer = setTimeout(() => { this.toast = ''; }, type === 'error' ? 5200 : 2600);
+    },
+
+    /* ---------------- 数据加载 ---------------- */
+    async loadHealth() {
+      try {
+        const r = await fetch('/api/health');
+        if (r.status === 401) { location.href = '/login'; return; }
+        const d = await r.json();
+        this.aiReady = !!d.ai_ready;
+      } catch (e) { this.aiReady = null; }
+    },
+
+    async loadStats() {
+      try {
+        const r = await fetch('/api/stats');
+        if (r.status === 401) { location.href = '/login'; return; }
+        this.stats = await r.json();
+      } catch (e) { /* 统计失败不影响主流程 */ }
+    },
+
+    /* 搜索输入防抖，避免每敲一个字就打一次接口 */
+    onSearchInput() {
+      clearTimeout(this.searchTimer);
+      this.searchTimer = setTimeout(() => this.loadList(), 300);
+    },
+
+    async loadList() {
+      this.loading = true;
+      try {
+        const p = new URLSearchParams();
+        if (this.activeSubject !== '全部') p.set('subject', this.activeSubject);
+        if (this.activeKind) p.set('kind', this.activeKind);
+        if (this.search.trim()) p.set('q', this.search.trim());
+        p.set('order', this.order);
+        const r = this.guard(await fetch('/api/mistakes?' + p.toString()));
+        const d = await r.json();
+        this.items = d.items || [];
+        // 清理已不在列表中的勾选
+        const ids = new Set(this.items.map(i => i.id));
+        this.selectedIds = this.selectedIds.filter(id => ids.has(id));
+        if (this.current) {
+          const fresh = this.items.find(i => i.id === this.current.id);
+          this.current = fresh || null;
+        }
+      } catch (e) {
+        this.notify('列表加载失败：' + e.message, 'error');
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    switchSubject(s) {
+      this.activeSubject = s;
+      if (this.current && s !== '全部' && this.current.subject !== s) this.current = null;
+      this.loadList();
+    },
+
+    /* 切题型筛选。跟切科目一样：当前打开的题要是不在新筛选里，就关掉它 ——
+       否则右边显示着一道列表里已经看不到的题，人会以为筛选坏了。 */
+    switchKind(k) {
+      this.activeKind = k;
+      if (this.current && k && this.current.kind !== k) this.current = null;
+      this.loadList();
+    },
+
+    /* 题型按钮上的计数。**必须跟着科目筛选走** —— 只读全库的 by_kind 的话，
+       筛了「语文」之后按钮上还挂着全库的数字，看着就像筛选没生效。
+       还没拉到 stats 时回 null，模板据此不显示数字（显示 0 会误导）。 */
+    countByKind(k) {
+      const st = this.stats;
+      if (!st || !st.by_kind) return null;
+      if (this.activeSubject === '全部') {
+        return k ? (st.by_kind[k] || 0) : (st.total || 0);
+      }
+      const d = (st.by_subject_kind || {})[this.activeSubject] || {};
+      return k ? (d[k] || 0) : Object.values(d).reduce((a, b) => a + b, 0);
+    },
+
+    openDetail(it) {
+      this.current = it;
+      this.mobileChat = false;      // 进入某道题 = 退出「自由问答」全屏态
+      this.openError = false;
+      this.openVariant = false;
+      this.openAnalysis = false;
+      this.view = window.innerWidth >= 768 ? 'split' : 'clean';
+      this.chatOpen = true;
+      // 历史对话不在这里加载：watch: current 统一负责「换线程就重载」，
+      // 两处都写会把同一份历史拉两次。
+    },
+
+    /* 返回列表。手机上必须把 mobileChat 一起清掉，否则右栏是全屏层，
+       光把 current 置空它还在，人就被困在里面了。 */
+    closeDetail() {
+      this.current = null;
+      this.mobileChat = false;
+    },
+
+    /* 手机端的「问 AI 学习问题」入口。桌面端右栏一直在，用不到这个。 */
+    openGeneralChat() {
+      this.chatOpen = true;
+      this.mobileChat = true;
+      if (this.current) {
+        this.current = null;        // watch: current 会接着去加载自由问答的历史
+      } else {
+        this.chatMsgs = [];
+        this.loadChat(GENERAL_ID);
+      }
+      this.$nextTick(() => this.scrollChat(true));
+    },
+
+    toggleSelect(id) {
+      const i = this.selectedIds.indexOf(id);
+      if (i >= 0) this.selectedIds.splice(i, 1);
+      else this.selectedIds.push(id);
+    },
+
+    toggleAll() {
+      if (this.allSelected) this.selectedIds = [];
+      else this.selectedIds = this.items.map(i => i.id);
+    },
+
+    /* ---------------- 上传 ---------------- */
+    triggerPick() {
+      const el = this.$refs.fileInput;
+      if (!el) return;
+      el.value = '';          // 清空，否则连续选同一张图不会触发 change
+      el.click();
+    },
+
+    /* 文档上传：用 fetch 读 SSE 流。不能用 XHR —— XHR 拿不到流式响应，
+       一整份卷子几分钟不吭声，用户会以为卡死了。
+       代价是拿不到上传进度（只能显示"正在上传"），文档一般几 MB，可以接受。 */
+    async uploadDocument(file) {
+      this.uploading = true;
+      this.uploadPct = 0;
+      this.uploadMsg = '正在上传 ' + file.name + '…';
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('subject', this.activeSubject === '全部' ? '数学' : this.activeSubject);
+      let created = 0, ok = false;
+      try {
+        const r = await fetch('/api/upload_doc', { method: 'POST', body: fd });
+        if (r.status === 401) { this.authExpired = true; location.href = '/login'; return; }
+        if (!r.ok) {
+          let msg = 'HTTP ' + r.status;
+          try { const j = await r.json(); msg = j.detail || msg; } catch (e) {}
+          throw new Error(msg);
+        }
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        const failures = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split('\n\n');
+          buf = parts.pop();
+          for (const part of parts) {
+            const line = part.trim();
+            if (!line.startsWith('data:')) continue;
+            let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+            if (ev.type === 'start') {
+              this.uploadPct = 5;
+              this.uploadMsg = '共 ' + ev.total_pages + ' 页，开始逐页拆题…';
+            } else if (ev.type === 'page') {
+              // 页内进度按已完成页数估算，找不到题目也不会卡在 0
+              this.uploadPct = Math.min(90, 5 + Math.round((ev.page - 1) / ev.total * 85));
+              this.uploadMsg = '正在分析第 ' + ev.page + '/' + ev.total + ' 页…'
+                             + (created ? ('已入库 ' + created + ' 道') : '');
+            } else if (ev.type === 'item') {
+              created = ev.count;
+              this.uploadMsg = '正在分析第 ' + ev.page + ' 页…已入库 ' + created + ' 道';
+            } else if (ev.type === 'page_empty') {
+              this.uploadMsg = '第 ' + ev.page + ' 页没有题目，跳过';
+            } else if (ev.type === 'page_error') {
+              failures.push('第 ' + ev.page + ' 页：' + ev.message.replace(/\s+/g, ' ').slice(0, 60));
+            } else if (ev.type === 'error') {
+              throw new Error(ev.message);
+            } else if (ev.type === 'done') {
+              ok = true;
+              this.uploadPct = 100;
+              const n = (ev.created || []).length;
+              if (n) {
+                this.notify('已从《' + file.name + '》拆出 ' + n + ' 道题');
+              } else {
+                this.notify('这份文件里没有识别到题目' +
+                            (failures.length ? ('（' + failures[0] + '）') : ''), 'error');
+              }
+              if (failures.length) {
+                this.notify('有 ' + failures.length + ' 页没处理成功：' + failures[0], 'error');
+              }
+            }
+          }
+        }
+      } catch (err) {
+        this.notify('文档处理失败：' + err.message, 'error');
+      } finally {
+        this.uploading = false;
+        this.uploadPct = 0;
+        this.uploadMsg = '';
+        await this.loadList();
+        await this.loadStats();
+        // 全部是新题，直接跳到刚入库的最后一道，省得用户再去列表里翻
+        if (ok && created && this.items.length) this.openDetail(this.items[0]);
+      }
+    },
+
+    async onFileChange(e) {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      // 文档（PDF/Word/文本）走另一条链路：它们要逐页拆题，可能要几分钟，
+      // 必须能实时看到进度。图片那条路保持不变（有上传进度条，手机上更友好）。
+      if (docKindOf(file.name)) return this.uploadDocument(file);
+
+      this.uploading = true;
+      this.uploadPct = 0;
+      this.uploadMsg = '正在压缩图片…';
+      try {
+        const blob = await this.compress(file);
+        this.uploadMsg = '正在上传（' + (blob.size / 1024 / 1024).toFixed(1) + ' MB）…';
+        const res = await this.doUpload(blob);
+        await this.loadList();
+        const it = this.items.find(x => x.id === res.item.id) || res.item;
+        this.openDetail(it);
+        if (res.subject_fixed_from) {
+          // 用户在「全部」筛选下上传时科目会默认成某一种，AI 认出来后会纠正归档
+          this.notify(`科目已自动纠正：你选的是「${res.subject_fixed_from}」，`
+                      + `AI 从图上认出是「${res.item.subject}」`);
+        } else if (res.item.ai_ok) {
+          this.notify('AI 解析完成：' + (res.item.tag || '已生成考点'));
+        } else {
+          this.notify('图片已保存，但 AI 未完成：' + (res.item.ai_status || '未知原因'), 'error');
+        }
+      } catch (err) {
+        this.notify('上传失败：' + err.message, 'error');
+      } finally {
+        this.uploading = false;
+        this.uploadPct = 0;
+        this.uploadMsg = '';
+      }
+    },
+
+    /* 手机原图 5~12MB，先等比压到 2000px / JPEG，局域网秒传，也省 AI token */
+    async compress(file, maxEdge = 2000, quality = 0.86) {
+      const bmp = await this.loadBitmap(file);
+      const w0 = bmp.width, h0 = bmp.height;
+      const scale = Math.min(1, maxEdge / Math.max(w0, h0));
+      const w = Math.max(1, Math.round(w0 * scale));
+      const h = Math.max(1, Math.round(h0 * scale));
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(bmp, 0, 0, w, h);
+      if (bmp.close) bmp.close();
+      return await new Promise((resolve, reject) => {
+        cv.toBlob(b => b ? resolve(b) : reject(new Error('图片压缩失败')), 'image/jpeg', quality);
+      });
+    },
+
+    loadBitmap(file) {
+      if (window.createImageBitmap) {
+        return createImageBitmap(file, { imageOrientation: 'from-image' })
+          .catch(() => createImageBitmap(file));   // 旧浏览器不支持该选项时降级
+      }
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('无法读取该图片'));
+        img.src = URL.createObjectURL(file);
+      });
+    },
+
+    /* 用 XHR 拿真实上传进度；服务器端 AI 解析阶段用「AI 解析中」提示 */
+    doUpload(blob) {
+      return new Promise((resolve, reject) => {
+        const fd = new FormData();
+        fd.append('file', blob, 'photo.jpg');
+        // 只是个提示：后端以 AI 从 tag 认出的科目为准（认错可在详情页改）
+        fd.append('subject', this.activeSubject === '全部' ? '数学' : this.activeSubject);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/upload');
+        xhr.timeout = 180000;
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            this.uploadPct = Math.round(ev.loaded / ev.total * 92);
+          }
+        };
+        xhr.upload.onload = () => {
+          this.uploadPct = 95;
+          this.uploadMsg = 'AI 正在识别考点、擦除手写、生成变式题…（约 10~30 秒）';
+        };
+        xhr.onload = () => {
+          this.uploadPct = 100;
+          if (xhr.status === 401) {
+            this.authExpired = true;
+            location.href = '/login';
+            reject(new Error('登录已过期'));
+            return;
+          }
+          let data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+          if (xhr.status >= 200 && xhr.status < 300 && data && data.item) resolve(data);
+          else reject(new Error((data && (data.detail || data.message)) || ('HTTP ' + xhr.status)));
+        };
+        xhr.onerror = () => reject(new Error('网络错误，请确认手机与电脑在同一 WiFi'));
+        xhr.ontimeout = () => reject(new Error('请求超时（AI 处理较慢，可稍后在列表中查看结果）'));
+        xhr.send(fd);
+      });
+    },
+
+    /* ---------------- 导出 PDF ---------------- */
+    countFor(scope) {
+      if (scope === 'selected') return this.selectedIds.length;
+      if (scope === 'filter') {
+        // 有了「科目×题型」交叉计数，这里能给准确值，不再是上界
+        return this.countByKind(this.activeKind) || 0;
+      }
+      return this.stats.total || 0;
+    },
+
+    openExport() {
+      // 有勾选就默认导出勾选的；没勾选就用当前筛选范围
+      this.exportOpts.scope = this.selectedIds.length
+        ? 'selected'
+        : (this.activeSubject === '全部' ? 'all' : 'filter');
+      this.showExport = true;
+      this.loadStats();
+    },
+
+    async doExport() {
+      const o = this.exportOpts;
+      const count = this.exportCount;
+      if (!count) {
+        this.notify(o.scope === 'selected' ? '请先勾选要导出的错题' : '没有符合条件的错题', 'error');
+        return;
+      }
+      this.exporting = true;
+      try {
+        const r = this.guard(await fetch('/api/export_pdf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ids: this.selectedIds,
+            scope: o.scope,
+            subject: this.activeSubject,
+            kind: this.activeKind,
+            content: o.content, layout: o.layout,
+            with_variant: o.with_variant, with_answer_page: o.with_answer_page,
+            order: o.order, title: o.title
+          })
+        }));
+        if (!r.ok) {
+          let msg = 'HTTP ' + r.status;
+          try { const j = await r.json(); msg = j.detail || msg; } catch (e) {}
+          throw new Error(msg);
+        }
+        const blob = await r.blob();
+        let fname = 'cuoti.pdf';
+        const cd = r.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename="?([^"]+)"?/);
+        if (m) fname = m[1];
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        this.showExport = false;
+        this.notify('已生成 ' + count + ' 道题的 PDF（'
+                    + (blob.size / 1024 / 1024).toFixed(1) + ' MB）：' + fname);
+      } catch (e) {
+        this.notify('导出失败：' + e.message, 'error');
+      } finally {
+        this.exporting = false;
+      }
+    },
+
+    /* ---------------- AI 答疑 ---------------- */
+    async toggleChat() {
+      this.chatOpen = !this.chatOpen;
+      if (this.chatOpen) await this.loadChat(this.threadId);
+    },
+
+    async loadChat(id) {
+      try {
+        const r = this.guard(await fetch('/api/chat/' + id));
+        const d = await r.json();
+        // 期间用户已切到别的线程：丢弃这次响应，否则会把新线程的对话覆盖掉
+        if (this.threadId !== id) return;
+        // 把服务端存的 anim_url/anim_title 归一成前端用的 anim 对象
+        this.chatMsgs = (d.messages || []).map(m => Object.assign({}, m, {
+          anim: m.anim_url ? { title: m.anim_title || '可视化动画', url: m.anim_url, show: false } : null
+        }));
+      } catch (e) {
+        if (this.threadId !== id) return;
+        this.chatMsgs = [];
+      }
+      this.$nextTick(() => this.scrollChat(true));
+    },
+
+    /* 消息现在跟页面共用同一个滚动区，所以滚的是详情栏本身。
+       仍然只在用户本来就贴着底部时才自动滚，免得他往上翻看时被拽回去。 */
+    /* 思考过程显示什么。
+       原来是给盒子设 max-h-44 + overflow-y-auto，结果思考内容动辄三千多字，
+       那个盒子就自带了第二根滚动条，跟右栏的并排在一起 —— 屏幕上同时出现 3 根。
+       改成：流式期间只看**尾部**（最后 320 字，正好是"现在在想什么"），
+       收完展开时显示全文、随页面滚，全程不再有内部滚动条。 */
+    reasoningText(m) {
+      const t = m.reasoning || '';
+      if (!m.streaming) return t;
+      return t.length > 320 ? '…' + t.slice(-320) : t;
+    },
+
+    /* 把「实际会产生滚动条的元素」全部列出来 —— 这是排查滚动问题唯一可靠的办法：
+       靠读代码猜是猜不出来的，必须量 scrollHeight vs clientHeight。 */
+    runLayoutCheck() {
+      var de = document.documentElement, b = document.body, L = [];
+      var probe = document.createElement('div');
+      probe.style.cssText = 'position:absolute;top:-9999px;width:100px;overflow:scroll';
+      document.body.appendChild(probe);
+      var sbw = probe.offsetWidth - probe.clientWidth;
+      probe.remove();
+
+      L.push('构建 ' + APP_BUILD);
+      L.push('视口 ' + window.innerWidth + ' x ' + window.innerHeight +
+             '   DPR ' + window.devicePixelRatio);
+      L.push('滚动条占宽 ' + sbw + 'px' + (sbw === 0 ? '（悬浮式）' : '（传统式）'));
+      // 注意：html 的 scrollHeight 会把「滚动容器内部被裁剪的内容」也算进来，
+      // 所以它非 0 不等于页面真的能滚。判断能不能滚要看 overflow 是不是 hidden。
+      var oy = getComputedStyle(de).overflowY;
+      var canScroll = (de.scrollHeight - de.clientHeight > 1) &&
+                      oy !== 'hidden' && oy !== 'clip';
+      L.push('页面可否滚动: ' + (canScroll ? '是 ⚠️ 会出现浏览器滚动条' : '否 ✅（看不见滚动条）'));
+      L.push('  内容超出量: 纵向 ' + (de.scrollHeight - de.clientHeight) +
+             'px  横向 ' + (de.scrollWidth - de.clientWidth) + 'px  （含被裁剪的，仅供参考）');
+      L.push('  html ' + de.scrollHeight + '/' + de.clientHeight +
+             '   body ' + b.scrollHeight + '/' + b.clientHeight);
+      L.push('');
+      L.push('会产生滚动条的元素:');
+      var n = 0;
+      Array.prototype.forEach.call(document.querySelectorAll('*'), function (el) {
+        // 排除自检面板自己，否则它那个 overflow-auto 会被自己算进去
+        if (el.closest('[data-debug-panel]')) return;
+        var cs = getComputedStyle(el);
+        if (['auto', 'scroll', 'overlay'].indexOf(cs.overflowY) < 0) return;
+        if (el.scrollHeight <= el.clientHeight + 1) return;
+        var r = el.getBoundingClientRect();
+        var cls = (typeof el.className === 'string' ? el.className : '')
+                    .trim().split(/\s+/).slice(0, 2).join('.');
+        n++;
+        L.push(n + '. ' + el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+               (cls ? '.' + cls : ''));
+        L.push('   位置 left=' + Math.round(r.left) + ' top=' + Math.round(r.top) +
+               '   尺寸 ' + Math.round(r.width) + 'x' + Math.round(r.height));
+        L.push('   内容高 ' + el.scrollHeight + ' / 可视高 ' + el.clientHeight);
+      });
+      if (!n) L.push('  （没有）');
+      return L.join('\n');
+    },
+
+    /* 打开后每 1.2 秒重测一次：页面刚加载时错题列表还没拉回来，
+       只测一次的话永远得到「没有滚动条」这个假结果。 */
+    /* 按需生成变式题。上传时不再预生成，所以老数据里可能是空的。 */
+    async genVariant(it) {
+      if (!it || this.variantLoading) return;
+      this.variantLoading = true;
+      try {
+        const r = this.guard(await fetch('/api/variant/' + it.id, { method: 'POST' }));
+        let d = null;
+        try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        const patch = { variant_q: d.variant_q, variant_a: d.variant_a };
+        const idx = this.items.findIndex(x => x.id === it.id);
+        if (idx >= 0) Object.assign(this.items[idx], patch);
+        if (this.current && this.current.id === it.id) Object.assign(this.current, patch);
+        this.openAnalysis = false;
+        this.notify(d.cached ? '这道题已经生成过了' : '变式题已生成');
+      } catch (e) {
+        this.notify('生成失败：' + e.message, 'error');
+      } finally {
+        this.variantLoading = false;
+      }
+    },
+
+    /* 改归档科目。上传时科目是 AI 从图上识别的（见 main.py 的 subject_fixed_from），
+       这条路径是给「AI 认错了」兜底用的。 */
+    async changeSubject(it, subject) {
+      await this._patchItem(it, { subject }, it ? it.subject : '', subject);
+    },
+
+    /* 改题型（错题 / 经典题）。改完 analysis 的含义也跟着变：
+       同一段文字，标签从「这道题错在哪」变成「这道题好在哪里」。 */
+    async changeKind(it, kind) {
+      await this._patchItem(it, { kind }, it ? this.kindMeta(it.kind).label : '',
+                            this.kindMeta(kind).label);
+    },
+
+    async _patchItem(it, patch, oldLabel, newLabel) {
+      const field = Object.keys(patch)[0];
+      if (!it || !patch[field] || patch[field] === it[field]) return;
+      try {
+        const r = this.guard(await fetch('/api/mistakes/' + it.id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch)
+        }));
+        if (!r.ok) {
+          let msg = 'HTTP ' + r.status;
+          try { const j = await r.json(); msg = j.detail || msg; } catch (e) {}
+          throw new Error(msg);
+        }
+        this.notify('已从「' + oldLabel + '」改到「' + newLabel + '」');
+        await this.loadList();
+        await this.loadStats();
+      } catch (e) {
+        this.notify('修改失败：' + e.message, 'error');
+        await this.loadList();   // 拉回真实状态，别让下拉停在一个没保存的值上
+      }
+    },
+
+    toggleDebug() {
+      this.debug = this.debug ? null : this.runLayoutCheck();
+      if (this._dbgTimer) { clearInterval(this._dbgTimer); this._dbgTimer = null; }
+      if (this.debug) {
+        this._dbgTimer = setInterval(function () { this.debug = this.runLayoutCheck(); }.bind(this), 1200);
+      }
+    },
+
+    closeDebug() {
+      this.debug = null;
+      if (this._dbgTimer) { clearInterval(this._dbgTimer); this._dbgTimer = null; }
+    },
+
+    scrollChat(force) {
+      const el = this.$refs.detailScroll;
+      if (!el) return;
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+      if (force || nearBottom) el.scrollTop = el.scrollHeight;
+    },
+
+    /* 让 AI 用可交互动画讲这道题。
+       刻意走对话链路而不是新开一个接口：动画本来就是对话的产物（模型输出
+       ```html-anim 围栏 → 后端落盘成静态页 → 回传 URL），新开接口等于把这套
+       重新实现一遍，还得再想一个地方存它。
+
+       mode 用 full 而不是默认的 guide：动画天生就是"把解法演示出来"，
+       引导模式明令不许给最终结果，两者凑一起模型只会左右为难。 */
+    async genAnim() {
+      if (this.chatSending) return;
+      this.openAnim = true;
+      this.chatOpen = true;              // 动画落在对话里，把对话展开让孩子看到
+      this.animPreview = '';
+      const animBefore = this.chatAnims.length;
+      this.animBusy = true;
+      try {
+        await this.sendChat(
+          '请用可交互的动画把这道题的解法演示出来：关键步骤一步步画，'
+          + '能点「上一步 / 下一步」慢慢看，最后把关键结论直接标在画面上。',
+          'full', true);          // ← 声明"这轮是生成动画"：后端据此放宽时限、不限制思考
+        // 模型有时只讲不画。这种情况必须明说，否则孩子会以为是按钮坏了。
+        if (this.chatAnims.length === animBefore && !this.authExpired) {
+          this.notify('AI 这次只讲了思路、没画成动画。再点一次，或把要求说得更具体'
+                      + '（比如「用动画演示抛物线怎么画出来」）', 'error');
+        }
+      } finally {
+        this.animBusy = false;
+      }
+    },
+
+    async sendChat(preset, mode, wantAnim) {
+      const text = (typeof preset === 'string' ? preset : this.chatInput).trim();
+      if (!text || this.chatSending) return;
+      // 点建议按钮时用它自带的 mode；手打的字按场景取默认值：
+      //   错题答疑 → guide（先反问、只给一层提示，让孩子多一步主动选择，这是核心设计）
+      //   自由问答 → full（学生问的是知识性问题，反问他没有意义）
+      const msgMode = (mode === 'full' || mode === 'guide')
+        ? mode
+        : (this.current ? 'guide' : 'full');
+      this.chatSending = true;
+      this.chatInput = '';
+      this.chatMsgs.push({ role: 'user', content: text, created_at: '' });
+
+      // 立即插入一条空的 assistant 消息，边收边填。
+      // ⚠️ 必须取回 push 之后的**响应式代理**再写：
+      //    Vue 3 的 reactive 数组里存的是原始对象，直接改 const ai 上的属性会绕过
+      //    set 拦截器，不触发重渲染 —— 表现就是「流式全程不刷新，最后猛地一下全出来」。
+      this.chatMsgs.push({
+        role: 'assistant', content: '', reasoning: '',
+        streaming: true, showReasoning: true, error: false
+      });
+      const ai = this.chatMsgs[this.chatMsgs.length - 1];
+      ai.anim = null;
+      this.$nextTick(() => this.scrollChat(true));
+
+      this._chatAbort = new AbortController();
+      try {
+        const r = await fetch('/api/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: this.threadId, message: text, mode: msgMode,
+                                 want_anim: !!wantAnim }),
+          signal: this._chatAbort.signal
+        });
+        if (r.status === 401) { this.authExpired = true; location.href = '/login'; return; }
+        if (!r.ok) {
+          let msg = 'HTTP ' + r.status;
+          try { const j = await r.json(); msg = j.detail || msg; } catch (e) {}
+          throw new Error(msg);
+        }
+
+        // 节流：收到的片段先攒在普通变量里，约 70ms 才写回响应式数据一次。
+        // 服务端已合并过，这里再兜一层，保证手机上也不会被高频重渲染拖卡。
+        let pendC = '', pendR = '', timer = null;
+        const flushNow = () => {
+          if (timer) { clearTimeout(timer); timer = null; }
+          if (pendR) { ai.reasoning += pendR; pendR = ''; }
+          if (pendC) { ai.content += pendC; pendC = ''; }
+          this.scrollChat();
+        };
+        const schedule = () => {
+          if (!timer) timer = setTimeout(() => { timer = null; flushNow(); }, 70);
+        };
+
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            // SSE 以空行分隔事件；最后一段可能不完整，留到下一轮
+            const parts = buf.split('\n\n');
+            buf = parts.pop();
+            for (const p of parts) {
+              const line = p.trim();
+              if (!line.startsWith('data:')) continue;
+              let ev;
+              try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+
+              if (ev.type === 'reasoning') {
+                pendR += ev.text; schedule();
+              } else if (ev.type === 'delta') {
+                pendC += ev.text; schedule();
+              } else if (ev.type === 'anim') {
+                // AI 生成的交互动画：源码已被服务端拦下，这里只拿到标题和链接
+                ai.anim = { title: ev.title, url: ev.url };
+              } else if (ev.type === 'error') {
+                throw new Error(ev.message);
+              } else if (ev.type === 'done') {
+                flushNow();
+                // 正文收完：关掉流式标记，思考过程收起成一行摘要
+                ai.streaming = false;
+                ai.showReasoning = false;
+              }
+            }
+          }
+        } finally {
+          flushNow();
+        }
+        ai.streaming = false;
+      } catch (e) {
+        ai.streaming = false;
+        ai.showReasoning = false;
+        // 「用户主动停止」不是错误：后端收到断开会把已生成的部分照常落库，
+        // 所以这里只补一句说明，不标红、不弹错误提示。
+        if (e && e.name === 'AbortError') {
+          ai.content = (ai.content ? ai.content + '\n\n' : '') + '（已停止生成）';
+        } else if (!this.authExpired) {
+          ai.error = true;
+          ai.content = (ai.content ? ai.content + '\n\n' : '') + '出错了：' + e.message;
+        }
+      } finally {
+        this._chatAbort = null;
+        this.chatSending = false;
+        this.$nextTick(() => this.scrollChat(true));
+      }
+    },
+
+    /* 手动掐断正在生成的回答。断开连接后后端会走 GeneratorExit，
+       把已经生成的部分照样存进对话，不会白烧。 */
+    /* 当前流式请求的 AbortController。跟 _dbgTimer 一样挂在实例上而不放进 data()
+       —— Vue 3 不代理 _ 开头的 data 属性，放进去会告警。 */
+    stopChat() {
+      if (this._chatAbort) this._chatAbort.abort();
+    },
+
+    async clearChat() {
+      if (!this.chatMsgs.length) return;
+      if (!confirm('清空' + (this.current ? '这道题' : '自由问答') + '的对话记录？')) return;
+      try {
+        await fetch('/api/chat/' + this.threadId, { method: 'DELETE' });
+        this.chatMsgs = [];
+      } catch (e) { this.notify('清空失败：' + e.message, 'error'); }
+    },
+
+    /* ---------------- 其他 ---------------- */
+    async removeItem(it) {
+      if (!confirm('确定删除这道错题吗？原图与纯净图会一并删除，不可恢复。')) return;
+      try {
+        const r = this.guard(await fetch('/api/mistakes/' + it.id, { method: 'DELETE' }));
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        this.selectedIds = this.selectedIds.filter(i => i !== it.id);
+        this.current = null;
+        await this.loadList();
+        this.notify('已删除');
+      } catch (e) {
+        this.notify('删除失败：' + e.message, 'error');
+      }
+    },
+
+    biliLink(it) {
+      return 'https://search.bilibili.com/all?keyword=' +
+        encodeURIComponent(((it.subject || '') + ' ' + (it.tag || '') + ' 中考 压轴 技巧').trim());
+    },
+    smarteduLink(it) {
+      return 'https://basic.smartedu.cn/search?keyword=' +
+        encodeURIComponent(((it.subject || '') + ' ' + (it.tag || '')).trim());
+    },
+
+    async copyText(t) {
+      if (!t) return this.notify('没有可复制的纯净题干', 'error');
+      try {
+        await navigator.clipboard.writeText(t);
+        this.notify('已复制纯净题干');
+      } catch (e) {
+        // 非 HTTPS 的局域网环境下 clipboard API 可能被禁用，用 textarea 兜底
+        const ta = document.createElement('textarea');
+        ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); this.notify('已复制纯净题干'); }
+        catch (e2) { this.notify('复制失败，请长按图片或手动选择文字', 'error'); }
+        ta.remove();
+      }
+    },
+
+    zoom(url) { this.zoomed = url; }
+  },
+
+  mounted() {
+    if (location.hash === '#debug') {
+      this.debug = this.runLayoutCheck();
+      this._dbgTimer = setInterval(function () {
+        this.debug = this.runLayoutCheck();
+      }.bind(this), 1200);
+    }
+    this.loadHealth();
+    this.loadList();
+    this.loadStats();
+    // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
+    // 否则昨天聊到一半的问题今天打开是空的。
+    this.loadChat(GENERAL_ID);
+  }
+});
+
+/* v-rich：渲染 Markdown + LaTeX，并在内容变化时重新排版公式 */
+app.directive('rich', {
+  mounted(el, binding) { paintRich(el, binding.value); },
+  updated(el, binding) { if (binding.value !== binding.oldValue) paintRich(el, binding.value); }
+});
+
+app.mount('#app');
+</script>
+</body>
+</html>
