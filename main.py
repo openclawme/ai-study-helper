@@ -3568,6 +3568,24 @@ def stats():
 
 
 # ---------------------------- 路由：题目图片（按归属鉴权）--------------------
+def thumb_path(mid: int) -> str:
+    return os.path.join(THUMB_DIR, f"thumb_{mid}.jpg")
+
+
+def drop_thumb(mid: int) -> None:
+    """
+    删掉这道题的缩略图缓存。
+
+    删题时必须跟着删：SQLite 的 rowid 会**复用**（删掉最大 id 再新增，
+    新题会拿到同一个 id），留下的旧缩略图就会挂到新题上 —— 列表里出现
+    一道根本不存在的题目，而且是孩子别的作业的照片。
+    """
+    try:
+        os.remove(thumb_path(mid))
+    except OSError:
+        pass
+
+
 def ensure_thumb(mid: int, src_abs: str) -> str:
     """
     按需生成缩略图并落盘，返回文件路径（失败返回空串）。
@@ -3575,21 +3593,36 @@ def ensure_thumb(mid: int, src_abs: str) -> str:
     为什么不在上传时就生成：老数据没有缩略图，补一遍要写迁移脚本。
     按需生成 + 落盘，第一次访问算一次，之后都是直接读文件 —— 两边的活都省了。
     """
-    dst = os.path.join(THUMB_DIR, f"thumb_{mid}.jpg")
+    dst = thumb_path(mid)
     if os.path.exists(dst):
-        return dst
+        try:
+            # 光判断「文件在不在」不够：reclean_all()（python3 main.py --reclean）
+            # 是**原地覆盖** clean 图的 —— 路径没变、内容变了。
+            # 那样列表会一直显示旧图，而点进去的详情页已经是新的。
+            if os.stat(dst).st_mtime >= os.stat(src_abs).st_mtime:
+                return dst
+        except OSError:
+            pass          # 原图没了就往下走，让下面的 open 去报错并退回大图
     try:
         with Image.open(src_abs) as im:
             im = im.convert("RGB")
             im.thumbnail((THUMB_EDGE, THUMB_EDGE), Image.LANCZOS)
             buf = io.BytesIO()
             im.save(buf, "JPEG", quality=82, optimize=True)
+        # 目录**必须在这里兜一次**，不能只靠启动时那次 makedirs：
+        # 目录被删掉（清理脚本、手工 rm、磁盘操作）之后，写文件会失败，
+        # 而下面的 except 会把失败吞掉、退回大图 —— 表现是「列表又变慢了」，
+        # 但接口照常返回 200，从日志上完全看不出来。
+        os.makedirs(THUMB_DIR, exist_ok=True)
         tmp = dst + ".tmp"
         with open(tmp, "wb") as f:
             f.write(buf.getvalue())
         os.replace(tmp, dst)          # 原子替换：并发请求不会读到写了一半的文件
         return dst
-    except Exception:
+    except Exception as e:
+        # 退回大图是**对的**（宁可慢也别让卡片开天窗），但不能一声不吭：
+        # 目录被删掉那回就是这么藏住的 —— 接口照常 200，唯一的现象是「又变慢了」。
+        print(f"⚠️ 缩略图生成失败 #{mid}：{type(e).__name__}: {e}")
         return ""
 
 
@@ -3940,6 +3973,7 @@ def delete_mistake(mid: int):
                         os.remove(p)
                     except OSError:
                         pass
+        drop_thumb(mid)
         conn.execute("DELETE FROM mistakes WHERE id = ?", (mid,))
     return {"ok": True, "deleted": mid}
 
@@ -4334,6 +4368,9 @@ def reclean_all() -> None:
         print(f"  #{r['id']}  {'✅ 已重新生成' if good else '❌ ' + msg}")
         if good:
             ok += 1
+            # 列表缩略图是另存的一份，必须跟着失效 —— 否则详情页已经是新图，
+            # 列表中那个 56px 的小图还是旧的（浏览器那边还缓存了一天）。
+            drop_thumb(r["id"])
             if not r["clean_path"]:
                 with closing(get_conn()) as conn, conn:
                     conn.execute("UPDATE mistakes SET clean_path=? WHERE id=?", (dst_rel, r["id"]))
