@@ -2021,6 +2021,9 @@ LOGIN_PAGE = """<!DOCTYPE html>
       inviteField=document.getElementById('invite-field'),resetLink=document.getElementById('reset-link'),
       tabLogin=document.getElementById('tab-login'),tabReg=document.getElementById('tab-reg'),
       mode='login';
+  // 邮件服务是否可用。**初始按可用算**，拿到服务端答复才降级 ——
+  // 反过来（默认不可用）会让接口偶发失败时把注册永久锁死。
+  var mailReady = true;
 
   function show(el, on){ el.style.display = on ? '' : 'none'; }
   function err(msg){ e.textContent=msg; e.style.display='block'; }
@@ -2033,14 +2036,23 @@ LOGIN_PAGE = """<!DOCTYPE html>
     var isReset = (m==='reset');
     tabLogin.className = isReg ? '' : 'on';
     tabReg.className   = isReg ? 'on' : '';
-    tabLogin.disabled = tabReg.disabled = isReset;
+    // disabled 统一在下面按权威状态算一次，这里不要重复赋值 ——
+    // 原来这行会先把注册解禁，虽然紧接着又被覆盖回去，但「同一状态写两处」
+    // 正是上一个 bug（点一下登录就把注册解锁）的温床。
 
     show(emailField, isReg || isReset);
     show(codeField, m==='verify');
     show(inviteField, m==='register' && inviteField.dataset.needed==='1');
-    show(resetLink, m==='login');
+    // 「忘记密码」和「注册」都依赖邮件服务，没配就都不给进
+    show(resetLink, m==='login' && mailReady);
     p.setAttribute('autocomplete', isReg ? 'new-password' : 'current-password');
     u.disabled = (m==='verify' || isReset);   // 这两个阶段用户名/邮箱已经定了
+    // ⚠️ 这两个 disabled 必须**每次都从权威状态算**，不能在别处各写各的。
+    // 原来写的是 tabLogin.disabled = tabReg.disabled = isReset，
+    // 于是点一下「登录」就把异步取回的 mailReady 状态覆盖掉、把注册重新解禁 ——
+    // 表现为「默认点不动注册，点一下登录才能点」，而且能一路填到提交才撞 503。
+    tabLogin.disabled = isReset || m === 'verify';
+    tabReg.disabled = isReset || !mailReady;
 
     var text = {login:'进入', register:'发送验证码', verify:'验证并进入', reset:'发送验证码'}[m];
     b.textContent = text;
@@ -2050,12 +2062,17 @@ LOGIN_PAGE = """<!DOCTYPE html>
       verify:  '验证码已发到你的邮箱',
       reset:   '输入注册时的邮箱，我们把验证码发过去'
     }[m];
-    tip.innerHTML = {
-      login:   '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。',
-      register:'用户名注册后不能改。<br>密码至少 6 位。',
-      verify:  '收不到？看看垃圾邮件，或点下面的链接重新发送。',
-      reset:   '这个邮箱有没有注册过，我们都会给出同样的提示。'
-    }[m];
+    // 邮件没配好时，说明必须在**每一次**渲染里都带上 ——
+    // 之前是在 fetch 回调里直接改 tip.innerHTML，用户一点「登录」就被这里
+    // 覆盖掉，于是「为什么注册点不动」变得没有任何解释。
+    tip.innerHTML = !mailReady
+      ? '服务器还没有配置邮件服务，暂时无法注册或找回密码。<br>已有账号仍可正常登录。'
+      : {
+        login:   '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。',
+        register:'用户名注册后不能改。<br>密码至少 6 位。',
+        verify:  '收不到？看看垃圾邮件，或点下面的链接重新发送。',
+        reset:   '这个邮箱有没有注册过，我们都会给出同样的提示。'
+      }[m];
     e.style.display='none';
   }
 
@@ -2074,9 +2091,8 @@ LOGIN_PAGE = """<!DOCTYPE html>
       // 而禁用的按钮连 onclick 都不触发，用户看到的是「点了没反应」，极难排查。
       // 判等 false 而不是取反，是这里唯一安全写法。
       if(d2 && d2.mail_ready === false){
-        tabReg.disabled = true;
-        document.getElementById('forgot').style.display='none';
-        tip.innerHTML = '服务器还没有配置邮件服务，暂时无法注册或找回密码。<br>已有账号仍可正常登录。';
+        mailReady = false;
+        setMode(mode);   // 只改状态，渲染全交给 setMode —— 回调里一个字都不碰 DOM
       }
     }).catch(function(){});
   }).catch(function(){});
