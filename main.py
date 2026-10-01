@@ -42,6 +42,7 @@ import tempfile
 import time
 import urllib.request
 from contextlib import asynccontextmanager, closing
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -178,9 +179,9 @@ def get_conn() -> sqlite3.Connection:
     # 检查两张表（而不是一张）：这样从旧版本升级上来、缺 chats 表时也能自动补建
     n = conn.execute(
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' "
-        "AND name IN ('mistakes','chats')"
+        "AND name IN ('mistakes','chats','users')"
     ).fetchone()["n"]
-    if n < 2:
+    if n < 3:
         _create_schema(conn)
     else:
         # 老库补列 / 改列。CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，只能手动 ALTER。
@@ -215,6 +216,11 @@ def get_conn() -> sqlite3.Connection:
             # 老数据：全部按「今天就该复习」处理 —— 它们从没被复习过，本来就该先过一遍。
             conn.execute("UPDATE mistakes SET review_due_at=? WHERE review_due_at=''",
                          (datetime.now().strftime("%Y-%m-%d"),))
+        if "user_id" not in cols:
+            # 老库里的题还没有归属。留 0，等第一个注册的账号来认领
+            # （见 /api/register）—— 直接猜一个用户塞进去反而更糟。
+            conn.execute("ALTER TABLE mistakes ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_owner ON mistakes(user_id, id)")
         if "source" not in cols:
             # 来自哪里：照片 / 《期中卷》第 3 页 / 文本文件。
             # 一份 PDF 拆出来的多道题会共用同一张页面图，没有这列就说不清为什么
@@ -228,6 +234,18 @@ def get_conn() -> sqlite3.Connection:
 
 
 def _create_schema(conn: sqlite3.Connection) -> None:
+    # 账号。口令用 pbkdf2 + **每个用户独立的随机盐**存，
+    # 不是全局盐 —— 全局盐会让「相同口令 → 相同哈希」，而且换密钥等于所有人密码失效。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            username   TEXT    NOT NULL UNIQUE,
+            pw_hash    TEXT    NOT NULL,            -- pbkdf2_sha256$轮数$盐$哈希
+            created_at TEXT    NOT NULL
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS mistakes (
@@ -243,6 +261,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             kind        TEXT    NOT NULL DEFAULT 'mistake', -- mistake 错题 / classic 经典题
             analysis    TEXT    NOT NULL DEFAULT '',-- 核心字段：错题=错因，经典题=好在哪
             source      TEXT    NOT NULL DEFAULT '',-- 来源：照片 / 《期中卷》第 3 页 / 文本文件
+            user_id     INTEGER NOT NULL DEFAULT 0, -- 归属账号；0 = 还没认领的老数据
             ai_status   TEXT    NOT NULL DEFAULT '',-- ok / no_key / error:xxx
             created_at  TEXT    NOT NULL
         )
@@ -250,6 +269,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_subject ON mistakes(subject)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON mistakes(created_at DESC)")
+    # 每个请求都要按 user_id 过滤，这个索引是必须的
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_owner ON mistakes(user_id, id)")
     # 与 AI 的对话记录（按错题隔离，持久化，关了浏览器也还在）
     conn.execute(
         """
@@ -261,16 +282,29 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT    NOT NULL,
             anim_url   TEXT    NOT NULL DEFAULT '',  -- AI 生成的可交互动画
             anim_title TEXT    NOT NULL DEFAULT '',
-            mode       TEXT    NOT NULL DEFAULT ''   -- guide / full：这次是引导还是直接给讲解
+            mode       TEXT    NOT NULL DEFAULT '',  -- guide / full：这次是引导还是直接给讲解
+            -- 归属。**自由问答线程也必须有它**：那条线程用 mistake_id=0 当哨兵，
+            -- 没有 user_id 的话所有用户的自由问答会撞在同一批行里。
+            user_id    INTEGER NOT NULL DEFAULT 0
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_mid ON chats(mistake_id, id)")
+    # ⚠️ 别在这里建 idx_chat_owner —— 此时 user_id 这一列可能还不存在
+    # （老库要先走下面的 ALTER）。建索引必须排在补列之后，见本函数末尾。
     # 轻量迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，老库要手动 ALTER
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(chats)")}
     for col in ("anim_url", "anim_title", "mode"):
         if col not in existing:
             conn.execute(f"ALTER TABLE chats ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    if "user_id" not in existing:
+        conn.execute("ALTER TABLE chats ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+        # 老对话的归属跟着它所属的错题走；自由问答（mistake_id=0）留 0，
+        # 和错题一样等第一个注册的账号认领。
+        conn.execute("UPDATE chats SET user_id = "
+                     "COALESCE((SELECT m.user_id FROM mistakes m WHERE m.id = chats.mistake_id), 0)")
+    # 列一定存在了，现在才能建索引
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_owner ON chats(user_id, id)")
     conn.commit()
 
 
@@ -310,8 +344,10 @@ def _ai_fail(status: str) -> Dict[str, Any]:
 def row_to_item(row: sqlite3.Row) -> Dict[str, Any]:
     """DB 行 -> 前端 JSON（附带可直接使用的静态资源 URL）。"""
     d = dict(row)
-    d["orig_url"] = f"/static/{d['orig_path']}" if d.get("orig_path") else ""
-    d["clean_url"] = f"/static/{d['clean_path']}" if d.get("clean_path") else ""
+    # 走按归属鉴权的路由，不再直接暴露 /static 路径（见 serve_media 的说明）
+    mid = d.get("id")
+    d["orig_url"] = f"/media/origin/{mid}" if d.get("orig_path") else ""
+    d["clean_url"] = f"/media/clean/{mid}" if d.get("clean_path") else ""
     d["ai_ok"] = str(d.get("ai_status", "")).startswith("ok")
     d["kind"] = norm_kind(d.get("kind"))
     d["kind_label"] = KINDS[d["kind"]]
@@ -977,13 +1013,15 @@ def _persist_item(*, raw_image: Optional[bytes], ai: Dict[str, Any],
     with closing(get_conn()) as conn, conn:
         cur = conn.execute(
             "INSERT INTO mistakes (subject, tag, title, orig_path, clean_path, clean_text,"
-            " variant_q, variant_a, ai_status, kind, analysis, source, created_at, review_due_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " variant_q, variant_a, ai_status, kind, analysis, source, created_at, review_due_at,"
+            " user_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (subject, "", "", "", "", "", "", "", "processing",
              ai.get("kind", "mistake"), "", source,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
              # 刚录入的题先放一天，明天进复习队列
-             (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")),
+             (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+             current_uid()),
         )
         new_id = int(cur.lastrowid)
 
@@ -1333,7 +1371,10 @@ def fetch_for_export(req: ExportReq) -> List[Dict[str, Any]]:
         "subject":   "ORDER BY subject, id",
     }.get(req.order, "ORDER BY created_at ASC, id ASC")
 
-    conds, args = [], []
+    # ⚠️ 归属过滤无条件加上，且**不参与 scope 分支**。
+    # 之前这里没有它：构造一个 scope="selected" 带上别人的 id，
+    # 就能把别人的错题导出成 PDF 拿走 —— 多用户下这是最直白的数据泄露。
+    conds, args = ["user_id = ?"], [current_uid()]
     if req.scope == "filter":
         # 「当前筛选」= 左边列表正在显示的那些条件，所以要跟列表用同一套筛选，
         # 否则用户筛出「经典题」再点导出，印出来的却混着错题。
@@ -1348,7 +1389,7 @@ def fetch_for_export(req: ExportReq) -> List[Dict[str, Any]]:
             return []
         conds.append(f"id IN ({','.join('?' * len(req.ids))})")
         args += list(req.ids)
-    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    where = "WHERE " + " AND ".join(conds)
 
     with closing(get_conn()) as conn:
         rows = conn.execute(f"SELECT * FROM mistakes {where} {order_sql}", args).fetchall()
@@ -1616,12 +1657,15 @@ SESSION_COOKIE = "cuoti_session"
 SESSION_TTL = 14 * 24 * 3600          # 14 天免登录；手机端不用天天输口令
 SECRET_FILE = os.path.join(BASE_DIR, ".session_secret")
 PASSWORD_FILE = os.path.join(BASE_DIR, "password.txt")
+# 邀请码：留空 = 开放注册。设成任意字符串后，注册必须填对才放行。
+# 这个应用在公网 IP 上、DeepSeek key 是计费的 —— 万一被扫描器盯上批量注册，
+# 想收紧时把下面这行改成 SIGNUP_CODE = os.getenv("SIGNUP_CODE", "你的邀请码") 重启即可。
+SIGNUP_CODE = os.getenv("SIGNUP_CODE", "").strip()
 LOGIN_MAX_FAIL = 8                    # 单 IP 窗口内允许的失败次数
 LOGIN_WINDOW = 600                    # 限流窗口（秒）
 PBKDF2_ROUNDS = 120_000               # 每次校验约 50ms，本身就是一道暴力破解门槛
 
 _secret: bytes = b""
-_pw_hash: bytes = b""
 _login_fails: Dict[str, list] = {}
 _login_lock = threading.Lock()
 
@@ -1640,49 +1684,73 @@ def _load_secret() -> bytes:
     return data
 
 
-def _hash_pw(pw: str) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), _secret[:16], PBKDF2_ROUNDS)
+def hash_password(pw: str, salt: Optional[bytes] = None) -> str:
+    """
+    口令哈希：pbkdf2_sha256 + **每用户独立随机盐**。
+
+    为什么不能用全局盐（改之前就是）：相同口令会得到相同哈希，彩虹表一次命中一片；
+    而且换会话密钥等于所有人密码同时失效。盐必须跟用户走、存在用户行里。
+    """
+    salt = salt or secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt.hex()}${dk.hex()}"
 
 
-def check_password(pw: str) -> bool:
-    return bool(pw) and hmac.compare_digest(_hash_pw(pw), _pw_hash)
-
-
-def resolve_password() -> str:
-    """口令来源：环境变量 APP_PASSWORD > ./password.txt > 自动生成并落盘。"""
-    pw = (os.getenv("APP_PASSWORD") or "").strip()
-    if pw:
-        return pw
-    if os.path.exists(PASSWORD_FILE):
-        with open(PASSWORD_FILE, encoding="utf-8") as f:
-            pw = f.read().strip()
-        if pw:
-            return pw
-    # 去掉 0/o/1/l/i 等易混字符，方便手机上输
-    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
-    pw = "".join(secrets.choice(alphabet) for _ in range(12))
-    with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
-        f.write(pw + "\n")
-    os.chmod(PASSWORD_FILE, 0o600)
-    return pw
-
-
-def make_token() -> str:
-    exp = str(int(time.time()) + SESSION_TTL)
-    sig = hmac.new(_secret, exp.encode(), hashlib.sha256).hexdigest()
-    return f"{exp}.{sig}"
-
-
-def verify_token(tok: Optional[str]) -> bool:
-    if not tok or "." not in tok:
+def verify_password(pw: str, stored: str) -> bool:
+    """校验口令。格式不对、字段缺失一律当作失败，绝不抛异常。"""
+    try:
+        algo, rounds_s, salt_hex, hash_hex = (stored or "").split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                                 bytes.fromhex(salt_hex), int(rounds_s))
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    except Exception:
         return False
-    exp_s, sig = tok.rsplit(".", 1)
+
+
+# ── 会话 ────────────────────────────────────────────────────────────────────
+# 令牌形如 {uid}.{过期时间戳}.{签名}，签名覆盖 uid 和过期时间。
+# ⚠️ uid 必须在签名**里面**：只签过期时间的话，谁都能把 uid 改成别人的
+#    从而直接读到对方的错题和照片。
+_uid: ContextVar[int] = ContextVar("uid", default=0)
+
+
+def make_token(uid: int) -> str:
+    exp = str(int(time.time()) + SESSION_TTL)
+    payload = f"{uid}.{exp}"
+    sig = hmac.new(_secret, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def verify_token(tok: Optional[str]) -> Optional[int]:
+    """校验通过返回 user_id，否则返回 None。"""
+    if not tok:
+        return None
+    parts = tok.split(".")
+    if len(parts) != 3:
+        return None
+    uid_s, exp_s, sig = parts
     try:
         if int(exp_s) < time.time():
-            return False
+            return None
+        uid = int(uid_s)
     except ValueError:
-        return False
-    return hmac.compare_digest(sig, hmac.new(_secret, exp_s.encode(), hashlib.sha256).hexdigest())
+        return None
+    want = hmac.new(_secret, f"{uid_s}.{exp_s}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, want):
+        return None
+    return uid
+
+
+def current_uid() -> int:
+    """
+    当前请求的 user_id。由 auth_guard 中间件写入，同步/异步 endpoint 都读得到
+    （实测 ContextVar 在 FastAPI 的线程池里能正确传递）。
+
+    ⚠️ 所有涉及数据的查询都必须用它做过滤。漏掉一处 = 那个接口能读到别人的数据。
+    """
+    return _uid.get()
 
 
 def _client_ip(request) -> str:
@@ -1727,16 +1795,25 @@ LOGIN_PAGE = """<!DOCTYPE html>
   h1{font-size:19px;text-align:center;margin:14px 0 4px;color:#1e293b}
   p.sub{text-align:center;color:#94a3b8;font-size:12px;margin:0 0 22px}
   label{display:block;font-size:13px;color:#475569;font-weight:600;margin-bottom:6px}
-  input{width:100%;padding:13px 14px;font-size:17px;border:1.5px solid #e2e8f0;border-radius:11px;
-        outline:none;transition:.15s;background:#f8fafc;letter-spacing:.5px}
+  input{width:100%;padding:13px 14px;font-size:16px;border:1.5px solid #e2e8f0;border-radius:11px;
+        outline:none;transition:.15s;background:#f8fafc}
   input:focus{border-color:#4f46e5;background:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-  button{width:100%;margin-top:18px;padding:14px;font-size:16px;font-weight:700;color:#fff;
+  .field{margin-bottom:14px}
+  button{width:100%;margin-top:6px;padding:14px;font-size:16px;font-weight:700;color:#fff;
          background:#4f46e5;border:0;border-radius:11px;cursor:pointer;transition:.15s}
   button:hover{background:#4338ca} button:active{transform:scale(.985)}
   button:disabled{opacity:.6;cursor:not-allowed}
   .err{margin-top:14px;padding:11px;border-radius:10px;background:#fee2e2;color:#b91c1c;
        font-size:13px;text-align:center;display:none}
   .tip{margin-top:20px;font-size:11.5px;color:#94a3b8;line-height:1.7;text-align:center}
+  /* 登录 / 注册切换。做成页内切换而不是两个页面：注册完直接就是登录态，
+     来回跳页面反而多一次输入。 */
+  .tabs{display:flex;gap:6px;background:#f1f5f9;border-radius:11px;padding:4px;margin-bottom:20px}
+  .tabs button{margin:0;padding:9px;font-size:14px;background:transparent;color:#64748b;
+               border-radius:8px;font-weight:600}
+  .tabs button.on{background:#fff;color:#4f46e5;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .tabs button:hover{background:transparent}
+  .tabs button.on:hover{background:#fff}
 </style></head><body>
 <form class="card" id="f">
   <div class="logo"><!-- 与 favicon / 顶栏 #i-book 同一枚图标 -->
@@ -1754,28 +1831,85 @@ LOGIN_PAGE = """<!DOCTYPE html>
     </svg>
   </div>
   <h1>我的AI学习助手</h1>
-  <p class="sub">请先输入访问口令</p>
-  <label for="p">访问口令</label>
-  <input id="p" type="password" autocomplete="current-password" autofocus
-         inputmode="latin" autocapitalize="off" autocorrect="off" placeholder="请输入口令">
+  <p class="sub" id="sub">登录后看到的是你自己的错题</p>
+
+  <div class="tabs">
+    <button type="button" id="tab-login" class="on">登录</button>
+    <button type="button" id="tab-reg" >注册</button>
+  </div>
+
+  <div class="field">
+    <label for="u">用户名</label>
+    <input id="u" type="text" autocomplete="username" autofocus
+           inputmode="latin" autocapitalize="off" autocorrect="off" spellcheck="false"
+           placeholder="3~20 位字母、数字、_ 或 -">
+  </div>
+  <div class="field">
+    <label for="p">密码</label>
+    <input id="p" type="password" autocomplete="current-password"
+           inputmode="latin" autocapitalize="off" autocorrect="off" placeholder="请输入密码">
+  </div>
+  <div class="field" id="invite-field" style="display:none">
+    <label for="iv">邀请码</label>
+    <input id="iv" type="text" inputmode="latin" autocapitalize="off" autocorrect="off"
+           placeholder="管理员提供的邀请码">
+  </div>
+
   <button type="submit" id="b">进入</button>
   <div class="err" id="e"></div>
-  <div class="tip">口令在服务器首次启动时打印，<br>也保存在 <code>password.txt</code>。</div>
+  <div class="tip" id="tip">
+    每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。
+  </div>
 </form>
 <script>
-  var f=document.getElementById('f'),p=document.getElementById('p'),
-      b=document.getElementById('b'),e=document.getElementById('e');
+  var f=document.getElementById('f'),u=document.getElementById('u'),p=document.getElementById('p'),
+      iv=document.getElementById('iv'),b=document.getElementById('b'),e=document.getElementById('e'),
+      tip=document.getElementById('tip'),sub=document.getElementById('sub'),
+      inviteField=document.getElementById('invite-field'),
+      tabLogin=document.getElementById('tab-login'),tabReg=document.getElementById('tab-reg'),
+      mode='login';
+
+  function setMode(m){
+    mode=m;
+    var reg=(m==='register');
+    tabLogin.className = reg ? '' : 'on';
+    tabReg.className   = reg ? 'on' : '';
+    b.textContent = reg ? '注册并进入' : '进入';
+    sub.textContent = reg ? '注册后你会得到自己的错题库' : '登录后看到的是你自己的错题';
+    p.setAttribute('autocomplete', reg ? 'new-password' : 'current-password');
+    inviteField.style.display = 'none';   // 邀请码栏由服务端配置决定，见下方探测
+    tip.innerHTML = reg
+      ? '用户名注册后不能改。<br>密码至少 6 位，忘了只能让管理员重置。'
+      : '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。';
+    e.style.display='none';
+  }
+  tabLogin.onclick=function(){ setMode('login'); };
+  tabReg.onclick=function(){ setMode('register'); };
+
+  // 服务端配了邀请码才显示那一栏 —— 不配就不给用户一个填了也没用的框
+  fetch('/api/signup_policy').then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.invite_required){ inviteField.dataset.needed='1'; }
+  }).catch(function(){});
+
   f.addEventListener('submit',async function(ev){
-    ev.preventDefault(); e.style.display='none'; b.disabled=true; b.textContent='验证中…';
+    ev.preventDefault(); e.style.display='none'; b.disabled=true;
+    var label = mode==='register' ? '注册中…' : '验证中…';
+    b.textContent=label;
     try{
-      var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-                                      body:JSON.stringify({password:p.value})});
+      var body = { username: u.value.trim(), password: p.value };
+      if(mode==='register'){
+        if(inviteField.dataset.needed==='1') body.invite = iv.value.trim();
+        if(inviteField.dataset.needed!=='1' && iv.value.trim()) body.invite = iv.value.trim();
+      }
+      var r=await fetch(mode==='register' ? '/api/register' : '/api/login',{
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
       if(r.ok){ location.href='/'; return; }
       var d=null; try{ d=await r.json(); }catch(_){}
-      e.textContent=(d&&d.detail)||('登录失败（HTTP '+r.status+'）'); e.style.display='block';
+      e.textContent=(d&&d.detail)||('失败（HTTP '+r.status+'）'); e.style.display='block';
     }catch(err){ e.textContent='网络错误：'+err.message; e.style.display='block'; }
-    b.disabled=false; b.textContent='进入';
+    b.disabled=false; b.textContent = mode==='register' ? '注册并进入' : '进入';
   });
+  setMode('login');
 </script></body></html>"""
 
 
@@ -2423,11 +2557,11 @@ async def lifespan(app: FastAPI):
     os.makedirs(CLEAN_DIR, exist_ok=True)
     init_db()
 
-    # 初始化认证：签名密钥 + 口令哈希
-    global _secret, _pw_hash
+    # 初始化会话签名密钥。口令不再有全局的 —— 每个账号存自己的哈希。
+    global _secret
     _secret = _load_secret()
-    _plain_pw = resolve_password()
-    _pw_hash = _hash_pw(_plain_pw)
+    with closing(get_conn()) as _c:
+        _users = _c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
 
     ip = get_lan_ip()
     lines = [
@@ -2440,9 +2574,11 @@ async def lifespan(app: FastAPI):
         f"  数据库   ：{DB_PATH}",
         f"  AI 模型  ：{MODEL_NAME}  @  {BASE_URL}",
         "",
-        "  ── 访问认证（已启用）─────────────────────────────",
-        "  访问口令 ：  " + _plain_pw,
-        f"  口令文件 ：  {PASSWORD_FILE}   (权限 600，可自行修改后重启)",
+        "  ── 账号 ─────────────────────────────────────────",
+        f"  已有账号 ：  {_users} 个",
+        ("  首次使用 ：  打开网页点「注册」建第一个账号" if _users == 0
+         else ("  注册门槛 ：  需要邀请码（SIGNUP_CODE）" if SIGNUP_CODE
+               else "  注册门槛 ：  开放注册（设 SIGNUP_CODE 可加邀请码）")),
         f"  免登录期 ：  {SESSION_TTL // 86400} 天",
         "  公网访问 ：  需在阿里云安全组放行 TCP 8000",
         "=" * 66,
@@ -2474,12 +2610,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="我的AI学习助手", version="1.0.0", lifespan=lifespan)
 # 说明：前端与后端同源部署，不需要 CORS。公网服务上开 allow_origins=["*"]
 # 只会白白扩大攻击面（配合 Cookie 认证还可能被跨站利用），故不启用。
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# ⚠️ 这里原本是 app.mount("/static", StaticFiles(...))。
+# 多用户下**必须**去掉：StaticFiles 只校验「登录了没」，不校验「这文件是不是你的」，
+# 而文件名是 original_{id}.jpg —— id 连续自增，登录用户换个数字就能拿到别人的照片。
+# 改成下面按归属鉴权的 /media/{kind}/{mid} 路由。
 
 # 免登录路径：登录页、登录接口，以及站点图标。
 # 图标必须放行 —— 浏览器请求 favicon 时不带任何上下文，若被 302 到 /login，
 # 标签页/收藏夹/添加到主屏幕都会拿到一张 HTML 当图片，图标直接空白。
-PUBLIC_PATHS = {"/login", "/api/login",
+# /api/signup_policy 也必须在里面：登录页要在**登录之前**调它，
+# 才知道要不要显示邀请码输入框。漏了它，配了邀请码也不会出现那个框。
+PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/signup_policy",
                 "/favicon.ico", "/favicon.svg", "/favicon-192.png",
                 "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"}
 
@@ -2493,7 +2634,11 @@ async def auth_guard(request: Request, call_next):
     path = request.url.path
     if path in PUBLIC_PATHS:
         return await call_next(request)
-    if verify_token(request.cookies.get(SESSION_COOKIE)):
+    uid = verify_token(request.cookies.get(SESSION_COOKIE))
+    if uid:
+        # 写进 ContextVar，供各 endpoint 的 current_uid() 读取。
+        # 每个请求一个独立的 context，不会串。
+        _uid.set(uid)
         return await call_next(request)
 
     # 未登录：API 请求回 401（前端据此跳登录页），页面请求直接 302
@@ -2515,7 +2660,34 @@ def get_lan_ip() -> str:
 
 # ---------------------------- 路由：登录 / 登出 ------------------------------
 class LoginReq(BaseModel):
+    username: str = ""
     password: str = ""
+
+
+class RegisterReq(BaseModel):
+    username: str = ""
+    password: str = ""
+    invite: str = ""       # 只有设了 SIGNUP_CODE 时才需要填
+
+
+# 用户名规则：3~20 位，字母数字下划线连字符，必须以字母或数字开头。
+# 收窄字符集是为了避免「长得几乎一样的用户名」用来冒充（同形字攻击）。
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,19}$")
+MIN_PW_LEN = 6
+
+
+def _session_response(uid: int, extra: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    body = {"ok": True, "ttl": SESSION_TTL}
+    if extra:
+        body.update(extra)
+    resp = JSONResponse(body)
+    # 注意：这里刻意不设 secure=True —— 当前是明文 HTTP，设了浏览器就不会回传 Cookie，
+    # 登录会直接失效。等上了 HTTPS（见 README）再打开该标志。
+    resp.set_cookie(
+        SESSION_COOKIE, make_token(uid),
+        max_age=SESSION_TTL, httponly=True, samesite="lax", path="/",
+    )
+    return resp
 
 
 @app.get("/login")
@@ -2531,19 +2703,101 @@ def api_login(req: LoginReq, request: Request):
     ip = _client_ip(request)
     if _login_locked(ip):
         raise HTTPException(429, f"失败次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
-    if not check_password(req.password):
+
+    name = (req.username or "").strip().lower()
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT id, pw_hash FROM users WHERE username=?", (name,)).fetchone()
+
+    # 用户不存在时也走一遍哈希：否则「账号不存在」会比「密码错误」快得多，
+    # 用响应时间就能把哪些用户名存在给枚举出来。
+    stored = row["pw_hash"] if row else "pbkdf2_sha256$%d$00$00" % PBKDF2_ROUNDS
+    ok = verify_password(req.password, stored)
+    if not row or not ok:
         _record_fail(ip)
         time.sleep(0.6)          # 配合 PBKDF2 的 50ms，进一步压低暴力破解速率
-        raise HTTPException(401, "口令不正确")
+        # 不区分「用户不存在」和「密码错」：那等于免费告诉攻击者哪些账号有效
+        raise HTTPException(401, "用户名或密码不正确")
+
     _clear_fails(ip)
-    resp = JSONResponse({"ok": True})
-    # 注意：这里刻意不设 secure=True —— 当前是明文 HTTP，设了浏览器就不会回传 Cookie，
-    # 登录会直接失效。等上了 HTTPS（见 README）再打开该标志。
-    resp.set_cookie(
-        SESSION_COOKIE, make_token(),
-        max_age=SESSION_TTL, httponly=True, samesite="lax", path="/",
-    )
-    return resp
+    return _session_response(int(row["id"]), {"username": name})
+
+
+@app.post("/api/register")
+def api_register(req: RegisterReq, request: Request):
+    """
+    开放注册（可在配置里加邀请码门槛，见 SIGNUP_CODE）。
+
+    ⚠️ 注册接口是**唯一**会在没有登录态时写数据库的入口，所以限流必须严于登录：
+    否则脚本可以批量注册，把这张表刷爆。
+    """
+    ip = _client_ip(request)
+    if _login_locked(ip):
+        raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
+    if SIGNUP_CODE and not hmac.compare_digest((req.invite or "").strip(), SIGNUP_CODE):
+        _record_fail(ip)
+        raise HTTPException(403, "邀请码不正确")
+
+    name = (req.username or "").strip().lower()
+    pw = req.password or ""
+    if not USERNAME_RE.match(name):
+        raise HTTPException(400, "用户名需 3~20 位，只能是字母、数字、下划线或连字符，且以字母或数字开头")
+    if len(pw) < MIN_PW_LEN:
+        raise HTTPException(400, f"密码至少 {MIN_PW_LEN} 位")
+    if len(pw) > 200:
+        raise HTTPException(400, "密码太长了")
+
+    with closing(get_conn()) as conn, conn:
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+            _record_fail(ip)
+            raise HTTPException(409, "这个用户名已经被注册了")
+        cur = conn.execute(
+            "INSERT INTO users (username, pw_hash, created_at) VALUES (?,?,?)",
+            (name, hash_password(pw), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        uid = int(cur.lastrowid)
+        # 第一个注册的账号认领「还没有归属」的老数据。
+        # 升级上来的库里有几十条题和照片，user_id 是 0 —— 直接丢掉太粗暴，
+        # 但也不能猜一个用户塞进去。交给第一个来注册的人最合理。
+        claimed = 0
+        if conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 1:
+            claimed = conn.execute(
+                "UPDATE mistakes SET user_id=? WHERE user_id=0", (uid,)).rowcount
+            # 自由问答的老对话同样认领，否则升级前聊的那些会永远看不到
+            conn.execute("UPDATE chats SET user_id=? WHERE user_id=0", (uid,))
+
+    _clear_fails(ip)
+    return _session_response(uid, {"username": name, "claimed": claimed})
+
+
+@app.get("/api/signup_policy")
+def signup_policy():
+    """登录页用它决定要不要显示「邀请码」输入框。不含邀请码本身，只说要不要。"""
+    return {"invite_required": bool(SIGNUP_CODE)}
+
+
+class PwReq(BaseModel):
+    old: str = ""
+    new: str = ""
+
+
+@app.post("/api/password")
+def api_change_password(req: PwReq):
+    """改自己的密码。必须验旧密码 —— 否则会话被劫持就等于账号被夺。"""
+    uid = current_uid()
+    if len(req.new or "") < MIN_PW_LEN:
+        raise HTTPException(400, f"新密码至少 {MIN_PW_LEN} 位")
+    if len(req.new) > 200:
+        raise HTTPException(400, "新密码太长了")
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT pw_hash FROM users WHERE id=?", (uid,)).fetchone()
+    if not row or not verify_password(req.old or "", row["pw_hash"]):
+        time.sleep(0.4)
+        raise HTTPException(401, "原密码不正确")
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET pw_hash=? WHERE id=?",
+                     (hash_password(req.new), uid))
+    return {"ok": True}
 
 
 @app.post("/api/logout")
@@ -2555,7 +2809,13 @@ def api_logout():
 
 @app.get("/api/session")
 def api_session():
-    return {"ok": True, "ttl": SESSION_TTL}
+    """前端用它拿当前用户名显示在顶栏。"""
+    uid = current_uid()
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+    return {"ok": True, "ttl": SESSION_TTL,
+            "username": row["username"] if row else "",
+            "user_id": uid}
 
 
 # ---------------------------- 路由：站点图标 ---------------------------------
@@ -2620,6 +2880,17 @@ def serve_animation(name: str):
     """
     if not ANIM_NAME_RE.match(name):
         raise HTTPException(404, "动画不存在")
+    # 文件名形如 anim_m{错题id}_{时间戳}.html —— 从里面取出 mid 校验归属。
+    # 不校验的话，登录用户遍历一下就能看别人题目的动画讲解。
+    try:
+        mid = int(name.split("_")[1][1:])
+    except (IndexError, ValueError):
+        raise HTTPException(404, "动画不存在")
+    with closing(get_conn()) as conn:
+        own = conn.execute("SELECT 1 FROM mistakes WHERE id=? AND user_id=?",
+                           (mid, current_uid())).fetchone()
+    if not own:
+        raise HTTPException(404, "动画不存在")
     path = os.path.join(ANIM_DIR, name)
     if not os.path.exists(path):
         raise HTTPException(404, "动画不存在")
@@ -2669,6 +2940,10 @@ def list_mistakes(subject: Optional[str] = None, order: str = "time_desc",
         where.append("(title LIKE ? OR tag LIKE ? OR clean_text LIKE ?)")
         args += [kw, kw, kw]
 
+    # 归属过滤永远在最前面：后面无论怎么拼 where 都跑不掉
+    where.insert(0, "user_id = ?")
+    args.insert(0, current_uid())
+
     sql = "SELECT * FROM mistakes"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -2689,29 +2964,35 @@ def list_mistakes(subject: Optional[str] = None, order: str = "time_desc",
 def stats():
     """各科目 / 各题型数量（导出弹窗和顶部计数用）。"""
     with closing(get_conn()) as conn:
+        uid = current_uid()
         rows = conn.execute(
-            "SELECT subject, COUNT(*) AS n FROM mistakes GROUP BY subject"
-        ).fetchall()
-        total = conn.execute("SELECT COUNT(*) AS n FROM mistakes").fetchone()["n"]
+            "SELECT subject, COUNT(*) AS n FROM mistakes WHERE user_id=? GROUP BY subject",
+            (uid,)).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id=?", (uid,)).fetchone()["n"]
         krows = conn.execute(
-            "SELECT kind, COUNT(*) AS n FROM mistakes GROUP BY kind"
-        ).fetchall()
+            "SELECT kind, COUNT(*) AS n FROM mistakes WHERE user_id=? GROUP BY kind",
+            (uid,)).fetchall()
         # 科目 × 题型 的交叉计数。只给「各题型总数」是不够的：筛了「语文」之后，
         # 题型按钮上还挂着全库的数字，看起来就像筛选没生效。
         xrows = conn.execute(
-            "SELECT subject, kind, COUNT(*) AS n FROM mistakes GROUP BY subject, kind"
+            "SELECT subject, kind, COUNT(*) AS n FROM mistakes WHERE user_id=? GROUP BY subject, kind",
+            (uid,)
         ).fetchall()
     # 本周问 AI 的次数：报告建议每周 1~2 次效果最好，多了要温和提醒
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     asked = conn2 = None
     with closing(get_conn()) as c2:
         asked = c2.execute(
-            "SELECT COUNT(*) AS n FROM chats WHERE role='user' AND created_at >= ?",
-            (week_ago,)).fetchone()["n"]
+            # chats 没有 user 列，归属靠 join 到 mistakes
+            "SELECT COUNT(*) AS n FROM chats c JOIN mistakes m ON m.id = c.mistake_id"
+            " WHERE m.user_id = ? AND c.role='user' AND c.created_at >= ?",
+            (uid, week_ago)).fetchone()["n"]
     with closing(get_conn()) as c2:
         due_count = c2.execute(
-            "SELECT COUNT(*) AS n FROM mistakes WHERE review_due_at = '' OR review_due_at <= ?",
-            (_today(),)).fetchone()["n"]
+            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id = ?"
+            " AND (review_due_at = '' OR review_due_at <= ?)",
+            (uid, _today())).fetchone()["n"]
     by_kind = {k: 0 for k in KINDS}
     for r in krows:
         by_kind[norm_kind(r["kind"])] += r["n"]
@@ -2722,6 +3003,35 @@ def stats():
     return {"total": total, "by_subject": {r["subject"]: r["n"] for r in rows},
             "by_kind": by_kind, "by_subject_kind": by_subject_kind,
             "due": due_count, "week_asked": asked}
+
+
+# ---------------------------- 路由：题目图片（按归属鉴权）--------------------
+@app.get("/media/{kind}/{mid}")
+def serve_media(kind: str, mid: int):
+    """
+    原图 / 去红笔图。**这是多用户下最容易出事的一个口子。**
+
+    原来直接 mount 了 StaticFiles：只要登录就能按 URL 拿到任意文件，
+    而文件名是 original_{id}.jpg、id 连续自增 —— 换个数字就是别人的照片。
+    现在改成先查这道题属不属于当前用户，不属于一律 404（不是 403：
+    403 等于确认「这个 id 存在，只是不给你看」，那也是信息泄露）。
+    """
+    if kind not in ("origin", "clean"):
+        raise HTTPException(404, "不存在")
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT orig_path, clean_path FROM mistakes WHERE id=? AND user_id=?",
+            (mid, current_uid())).fetchone()
+    if not row:
+        raise HTTPException(404, "不存在")
+    rel = row["orig_path"] if kind == "origin" else row["clean_path"]
+    if not rel:
+        raise HTTPException(404, "这道题没有这张图")
+    path = os.path.join(STATIC_DIR, rel)
+    if not os.path.exists(path):
+        raise HTTPException(404, "图片文件缺失")
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 
 # ---------------------------- 路由：上传错题 ---------------------------------
@@ -2896,7 +3206,7 @@ def make_variant(mid: int, force: bool = False):
     if not api_key_ready():
         raise HTTPException(503, "后端未配置 DEEPSEEK_API_KEY，无法生成变式题")
     with closing(get_conn()) as conn:
-        row = conn.execute("SELECT * FROM mistakes WHERE id=?", (mid,)).fetchone()
+        row = owned_mistake(conn, mid)
     if not row:
         raise HTTPException(404, "错题不存在")
     it = row_to_item(row)
@@ -2936,7 +3246,8 @@ def record_review(mid: int, req: ReviewReq):
 
     with closing(get_conn()) as conn, conn:
         row = conn.execute(
-            "SELECT review_stage FROM mistakes WHERE id=?", (mid,)).fetchone()
+            "SELECT review_stage FROM mistakes WHERE id=? AND user_id=?",
+            (mid, current_uid())).fetchone()
         if not row:
             raise HTTPException(404, "错题不存在")
         stage = int(row["review_stage"] or 0)
@@ -2996,7 +3307,7 @@ def update_mistake(mid: int, req: SubjectReq):
         raise HTTPException(400, "没有要修改的字段")
 
     with closing(get_conn()) as conn, conn:
-        if not conn.execute("SELECT 1 FROM mistakes WHERE id=?", (mid,)).fetchone():
+        if not owned_mistake(conn, mid):
             raise HTTPException(404, "错题不存在")
         args.append(mid)
         conn.execute(f"UPDATE mistakes SET {', '.join(sets)} WHERE id=?", args)
@@ -3007,7 +3318,7 @@ def update_mistake(mid: int, req: SubjectReq):
 @app.delete("/api/mistakes/{mid}")
 def delete_mistake(mid: int):
     with closing(get_conn()) as conn, conn:
-        row = conn.execute("SELECT * FROM mistakes WHERE id = ?", (mid,)).fetchone()
+        row = owned_mistake(conn, mid)
         if not row:
             raise HTTPException(404, "错题不存在")
         for rel in (row["orig_path"], row["clean_path"]):
@@ -3038,17 +3349,25 @@ class ChatReq(BaseModel):
 
 @app.get("/api/chat/{mid}")
 def get_chat(mid: int):
+    uid = current_uid()
     with closing(get_conn()) as conn:
+        # 自由问答（0 号）没有对应的错题，天然没有归属可查；其余必须校验。
+        # 两种情况都要按 user_id 过滤 —— 0 号线程是所有用户共用的哨兵值。
+        if mid != GENERAL_CHAT_ID and not owned_mistake(conn, mid):
+            raise HTTPException(404, "错题不存在")
         rows = conn.execute(
-            f"SELECT {_CHAT_COLS} FROM chats WHERE mistake_id=? ORDER BY id", (mid,)
-        ).fetchall()
+            f"SELECT {_CHAT_COLS} FROM chats WHERE mistake_id=? AND user_id=? ORDER BY id",
+            (mid, uid)).fetchall()
     return {"messages": [dict(r) for r in rows]}
 
 
 @app.delete("/api/chat/{mid}")
 def clear_chat(mid: int):
+    uid = current_uid()
     with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM chats WHERE mistake_id=?", (mid,))
+        if mid != GENERAL_CHAT_ID and not owned_mistake(conn, mid):
+            raise HTTPException(404, "错题不存在")
+        conn.execute("DELETE FROM chats WHERE mistake_id=? AND user_id=?", (mid, uid))
     purge_animations(mid)          # 动画文件也一并清掉
     return {"ok": True}
 
@@ -3076,13 +3395,13 @@ def _load_chat_context(req: ChatReq):
         if general:
             it = None
         else:
-            row = conn.execute("SELECT * FROM mistakes WHERE id=?", (req.id,)).fetchone()
+            row = owned_mistake(conn, req.id)
             if not row:
                 raise HTTPException(404, "错题不存在")
             it = row_to_item(row)
         hist = conn.execute(
-            "SELECT role, content FROM chats WHERE mistake_id=? ORDER BY id", (req.id,)
-        ).fetchall()
+            "SELECT role, content FROM chats WHERE mistake_id=? AND user_id=? ORDER BY id",
+            (req.id, current_uid())).fetchall()
 
     mode = req.mode if req.mode in ("guide", "full") else ("full" if general else "guide")
     return it, [dict(h) for h in hist][-CHAT_MAX_TURNS:], msg, mode
@@ -3106,12 +3425,14 @@ def _chat_begin(mid: int, user_msg: str) -> int:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(get_conn()) as conn, conn:
         conn.execute(
-            "INSERT INTO chats (mistake_id, role, content, created_at) VALUES (?,?,?,?)",
-            (mid, "user", user_msg, now),
+            "INSERT INTO chats (mistake_id, role, content, created_at, user_id)"
+            " VALUES (?,?,?,?,?)",
+            (mid, "user", user_msg, now, current_uid()),
         )
         cur = conn.execute(
-            "INSERT INTO chats (mistake_id, role, content, created_at) VALUES (?,?,?,?)",
-            (mid, "assistant", "", now),
+            "INSERT INTO chats (mistake_id, role, content, created_at, user_id)"
+            " VALUES (?,?,?,?,?)",
+            (mid, "assistant", "", now, current_uid()),
         )
         return int(cur.lastrowid)
 
@@ -3126,11 +3447,22 @@ def _chat_update(row_id: int, content: str,
         )
 
 
+def owned_mistake(conn, mid: int):
+    """
+    取一道**属于当前用户**的题；不是自己的就当作不存在。
+
+    所有按 mistake_id 操作的接口都必须先过这一关 —— chats 表本身没有 user 列，
+    它的归属完全靠所属错题，直接按 mistake_id 查会读到别人的对话。
+    """
+    return conn.execute(
+        "SELECT * FROM mistakes WHERE id=? AND user_id=?", (mid, current_uid())).fetchone()
+
+
 def _chat_rows(mid: int) -> List[Dict[str, Any]]:
     with closing(get_conn()) as conn:
         rows = conn.execute(
-            f"SELECT {_CHAT_COLS} FROM chats WHERE mistake_id=? ORDER BY id", (mid,)
-        ).fetchall()
+            f"SELECT {_CHAT_COLS} FROM chats WHERE mistake_id=? AND user_id=? ORDER BY id",
+            (mid, current_uid())).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -3141,17 +3473,19 @@ def _append_chat(mid: int, user_msg: str, reply: str,
     anim = anim or {}
     with closing(get_conn()) as conn, conn:
         conn.execute(
-            "INSERT INTO chats (mistake_id, role, content, created_at) VALUES (?,?,?,?)",
-            (mid, "user", user_msg, now),
+            "INSERT INTO chats (mistake_id, role, content, created_at, user_id)"
+            " VALUES (?,?,?,?,?)",
+            (mid, "user", user_msg, now, current_uid()),
         )
         conn.execute(
-            "INSERT INTO chats (mistake_id, role, content, created_at, anim_url, anim_title, mode)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (mid, "assistant", reply, now, anim.get("url", ""), anim.get("title", ""), mode),
+            "INSERT INTO chats (mistake_id, role, content, created_at, anim_url, anim_title, mode,"
+            " user_id) VALUES (?,?,?,?,?,?,?,?)",
+            (mid, "assistant", reply, now, anim.get("url", ""), anim.get("title", ""), mode,
+             current_uid()),
         )
         rows = conn.execute(
-            f"SELECT {_CHAT_COLS} FROM chats WHERE mistake_id=? ORDER BY id", (mid,)
-        ).fetchall()
+            f"SELECT {_CHAT_COLS} FROM chats WHERE mistake_id=? AND user_id=? ORDER BY id",
+            (mid, current_uid())).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -3371,7 +3705,8 @@ def reclean_all() -> None:
     """
     init_db()
     with closing(get_conn()) as conn:
-        rows = conn.execute("SELECT id, orig_path, clean_path FROM mistakes").fetchall()
+        rows = conn.execute("SELECT id, orig_path, clean_path FROM mistakes WHERE user_id=?",
+                            (current_uid(),)).fetchall()
     if not rows:
         print("数据库里还没有错题。")
         return
