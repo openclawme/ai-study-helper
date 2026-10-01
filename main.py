@@ -126,6 +126,20 @@ AI_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 AI_HTTP_TIMEOUT = float(os.getenv("AI_HTTP_TIMEOUT", "300"))    # 非流式调用的 socket 超时
 
+# TCP 连接的空闲保活时长。**uvicorn 默认只有 5 秒，这是个坑。**
+#
+# 浏览器会把用过的连接留在池子里好几分钟（Chrome 约 5 分钟），
+# 而服务端 5 秒就把两头都以为还活着的连接关掉了。等浏览器下次拿这条
+# 已经死掉的连接发请求 —— 网络层直接失败，前端看到的是一句
+# `Failed to fetch`，后端日志里连一条记录都没有（请求根本没到）。
+# 表现为「偶尔」出错：只有刚好复用到过期连接时才发生。
+#
+# 实测（同一条 TCP 连接，隔 N 秒发第二个请求）：
+#   间隔 2s/4s → 连接还在；间隔 6s/10s → 已被服务端关闭（读到 EOF）
+#
+# 服务端保活必须长过浏览器的池子超时，否则这个竞态永远存在。
+KEEPALIVE_SEC = int(os.getenv("KEEPALIVE_SEC", "75"))
+
 
 def _profile(name: str) -> Dict[str, Any]:
     """取场景档位，认不出来就退回 chat（快档，兜底永远选保守的那个）。"""
@@ -3292,4 +3306,5 @@ if __name__ == "__main__":
         reclean_all()
     else:
         # host 必须是 0.0.0.0，手机才能通过局域网 IP 访问
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info",
+                    timeout_keep_alive=KEEPALIVE_SEC)

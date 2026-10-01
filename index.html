@@ -1008,6 +1008,40 @@ const DOC_EXT = {
   word: ['.doc', '.docx', '.rtf', '.odt'],
   text: ['.txt', '.md', '.markdown', '.text']
 };
+/* 带一次重试的 GET。
+   为什么要重试：uvicorn 默认 5 秒就关掉空闲保活连接，而浏览器会把连接
+   在池子里留几分钟 —— 拿一条已经死掉的连接发请求，网络层直接失败，
+   fetch 抛 "Failed to fetch"，后端日志里连一行都没有（请求没到）。
+   服务端已经把这个超时改长了（见 main.py 的 KEEPALIVE_SEC），
+   但网络本身也会抖（尤其手机切 WiFi/4G），这里再兜一层。
+
+   只对 GET 重试：写操作重试可能造成重复提交（重复上传、重复提问）。 */
+async function fetchGet(url, opts) {
+  const tries = (opts && opts.retries != null) ? opts.retries : 1;
+  const signal = opts && opts.signal;
+  let lastErr;
+  for (let i = 0; i <= tries; i++) {
+    try {
+      return await fetch(url, signal ? { signal } : undefined);
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;    // 主动取消不是故障
+      lastErr = e;
+      if (i < tries) await new Promise(r => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/* 把浏览器的网络错误翻译成人话。
+   "Failed to fetch" / "NetworkError" 对家长没有任何意义。 */
+function netErrMsg(e) {
+  const m = (e && e.message) || String(e);
+  if (/failed to fetch|networkerror|load failed|network request failed/i.test(m)) {
+    return '网络连接中断了。检查一下手机的网络，稍后会自动恢复';
+  }
+  return m;
+}
+
 function docKindOf(name) {
   const n = (name || '').toLowerCase();
   for (const k in DOC_EXT) {
@@ -1459,7 +1493,7 @@ const app = createApp({
     /* ---------------- 数据加载 ---------------- */
     async loadHealth() {
       try {
-        const r = await fetch('/api/health');
+        const r = await fetchGet('/api/health');
         if (r.status === 401) { location.href = '/login'; return; }
         const d = await r.json();
         this.aiReady = !!d.ai_ready;
@@ -1468,7 +1502,7 @@ const app = createApp({
 
     async loadStats() {
       try {
-        const r = await fetch('/api/stats');
+        const r = await fetchGet('/api/stats');
         if (r.status === 401) { location.href = '/login'; return; }
         this.stats = await r.json();
       } catch (e) { /* 统计失败不影响主流程 */ }
@@ -1481,6 +1515,14 @@ const app = createApp({
     },
 
     async loadList() {
+      // 连着点几个科目 chip 会同时飞出好几个请求。不取消上一次的话有两宗罪：
+      //   1) 请求堆在一起，占满浏览器对同源的并发连接数
+      //   2) **先发的慢响应可能后到**，把后点那个科目的列表覆盖掉 ——
+      //      界面停在「数学」上，列表却是「语文」的
+      // 所以：发新请求前先掐掉旧的，回来后再确认自己没被取代。
+      if (this._listAbort) this._listAbort.abort();
+      const ac = new AbortController();
+      this._listAbort = ac;
       this.loading = true;
       try {
         const p = new URLSearchParams();
@@ -1488,8 +1530,9 @@ const app = createApp({
         if (this.activeKind) p.set('kind', this.activeKind);
         if (this.search.trim()) p.set('q', this.search.trim());
         p.set('order', this.order);
-        const r = this.guard(await fetch('/api/mistakes?' + p.toString()));
+        const r = this.guard(await fetchGet('/api/mistakes?' + p.toString(), { signal: ac.signal }));
         const d = await r.json();
+        if (ac.signal.aborted) return;      // 期间又切了科目，这份结果作废
         this.items = d.items || [];
         // 清理已不在列表中的勾选
         const ids = new Set(this.items.map(i => i.id));
@@ -1499,9 +1542,10 @@ const app = createApp({
           this.current = fresh || null;
         }
       } catch (e) {
-        this.notify('列表加载失败：' + e.message, 'error');
+        if (e && e.name === 'AbortError') return;   // 被新请求取代，不是故障
+        this.notify('列表加载失败：' + netErrMsg(e), 'error');
       } finally {
-        this.loading = false;
+        if (!ac.signal.aborted) this.loading = false;
       }
     },
 
@@ -1843,7 +1887,7 @@ const app = createApp({
 
     async loadChat(id) {
       try {
-        const r = this.guard(await fetch('/api/chat/' + id));
+        const r = this.guard(await fetchGet('/api/chat/' + id));
         const d = await r.json();
         // 期间用户已切到别的线程：丢弃这次响应，否则会把新线程的对话覆盖掉
         if (this.threadId !== id) return;
