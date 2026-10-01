@@ -3409,6 +3409,32 @@ def site_icon(request: Request):
                         headers={"Cache-Control": "public, max-age=604800"})
 
 
+# ---------------------------- 路由：论文 -------------------------------------
+# 「我的AI学习助手」这个工具本身就是一份初三探究论文的研究对象，论文就放在这儿，
+# 登录之后点 /paper 就能看。
+#
+# **故意不写进 PUBLIC_PATHS**：服务器是公网 IP，能少开一个公开口子就少开一个。
+# 反正看论文的人（学生本人、老师）本来就有账号，多一步登录不碍事；
+# 而一旦公开，就等于给这台机器又加了一个谁都扫得到的入口。
+#
+# 文件默认放在仓库**外面**（/home/admin/paper/），免得论文的中间稿混进应用仓库；
+# 要挪位置就设 PAPER_FILE 环境变量。
+PAPER_FILE = os.environ.get("PAPER_FILE") or os.path.join(
+    os.path.dirname(BASE_DIR), "paper", "论文.html")
+
+
+@app.get("/paper", include_in_schema=False)
+def paper():
+    if not os.path.exists(PAPER_FILE):
+        raise HTTPException(404, f"论文文件不在服务器上：{PAPER_FILE}")
+    # 和首页一样禁缓存：改完论文刷新就能看到，不用清浏览器缓存
+    return FileResponse(
+        PAPER_FILE,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
 # ---------------------------- 路由：首页 -------------------------------------
 @app.get("/")
 def index():
