@@ -156,6 +156,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 ORIGIN_DIR = os.path.join(STATIC_DIR, "origin")
 CLEAN_DIR = os.path.join(STATIC_DIR, "clean")
+# 列表缩略图。**必须有**：卡片上那个位置只有 56×56 像素，之前直接加载整张原图，
+# 而 clean 图是二值化的，边缘锐利、JPEG 压缩率极差 —— 实测单张能到 1.3MB，
+# 一个科目 7 张卡片就是好几 MB。缩略图把单张压到 10KB 上下。
+THUMB_DIR = os.path.join(STATIC_DIR, "thumb")
+THUMB_EDGE = 240        # 缩略图最长边。卡片显示 56px，两倍屏也只要 112px，240 足够清晰
 DB_PATH = os.path.join(BASE_DIR, "mistakes.db")
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
@@ -386,6 +391,9 @@ def row_to_item(row: sqlite3.Row) -> Dict[str, Any]:
     mid = d.get("id")
     d["orig_url"] = f"/media/origin/{mid}" if d.get("orig_path") else ""
     d["clean_url"] = f"/media/clean/{mid}" if d.get("clean_path") else ""
+    # 列表卡片用缩略图，详情页仍用大图
+    d["thumb_url"] = (f"/media/thumb/{mid}"
+                      if (d.get("clean_path") or d.get("orig_path")) else "")
     d["ai_ok"] = str(d.get("ai_status", "")).startswith("ok")
     d["kind"] = norm_kind(d.get("kind"))
     d["kind_label"] = KINDS[d["kind"]]
@@ -2876,6 +2884,7 @@ async def lifespan(app: FastAPI):
     # 启动时确保静态目录存在（用户明确要求）
     os.makedirs(ORIGIN_DIR, exist_ok=True)
     os.makedirs(CLEAN_DIR, exist_ok=True)
+    os.makedirs(THUMB_DIR, exist_ok=True)
     init_db()
 
     # 初始化会话签名密钥。口令不再有全局的 —— 每个账号存自己的哈希。
@@ -3559,6 +3568,55 @@ def stats():
 
 
 # ---------------------------- 路由：题目图片（按归属鉴权）--------------------
+def ensure_thumb(mid: int, src_abs: str) -> str:
+    """
+    按需生成缩略图并落盘，返回文件路径（失败返回空串）。
+
+    为什么不在上传时就生成：老数据没有缩略图，补一遍要写迁移脚本。
+    按需生成 + 落盘，第一次访问算一次，之后都是直接读文件 —— 两边的活都省了。
+    """
+    dst = os.path.join(THUMB_DIR, f"thumb_{mid}.jpg")
+    if os.path.exists(dst):
+        return dst
+    try:
+        with Image.open(src_abs) as im:
+            im = im.convert("RGB")
+            im.thumbnail((THUMB_EDGE, THUMB_EDGE), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=82, optimize=True)
+        tmp = dst + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(buf.getvalue())
+        os.replace(tmp, dst)          # 原子替换：并发请求不会读到写了一半的文件
+        return dst
+    except Exception:
+        return ""
+
+
+@app.get("/media/thumb/{mid}")
+def serve_thumb(mid: int):
+    """列表卡片用的小图。归属校验跟大图一样。"""
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT orig_path, clean_path FROM mistakes WHERE id=? AND user_id=?",
+            (mid, current_uid())).fetchone()
+    if not row:
+        raise HTTPException(404, "不存在")
+    src = row["clean_path"] or row["orig_path"]
+    if not src:
+        raise HTTPException(404, "这道题没有图")
+    src_abs = os.path.join(STATIC_DIR, src)
+    if not os.path.exists(src_abs):
+        raise HTTPException(404, "图片文件缺失")
+    path = ensure_thumb(mid, src_abs)
+    if not path:
+        # 缩略图生成失败就退回大图，宁可慢也别让卡片开天窗
+        return FileResponse(src_abs, media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=86400"})
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
 @app.get("/media/{kind}/{mid}")
 def serve_media(kind: str, mid: int):
     """

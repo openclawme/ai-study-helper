@@ -409,7 +409,8 @@
             <input type="checkbox" class="w-4 h-4 mt-1 accent-indigo-600 shrink-0"
                    :checked="selectedIds.includes(it.id)"
                    @click.stop="toggleSelect(it.id)">
-            <img :src="it.clean_url || it.orig_url" loading="lazy" alt="题目缩略图"
+            <!-- 用缩略图：这个位置只有 56px，加载整张 2000px 大图要几百 KB 到 1MB+ -->
+            <img :src="it.thumb_url || it.clean_url || it.orig_url" loading="lazy" alt="题目缩略图"
                  class="w-14 h-14 object-cover rounded-xl border border-slate-200 bg-slate-50 shrink-0">
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-1.5 mb-1 flex-wrap">

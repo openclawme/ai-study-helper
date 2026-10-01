@@ -20,6 +20,8 @@ static/origin/
 static/clean/
 # AI 按具体题目生成的动画，内容同样是孩子的题目
 static/anim/
+# 列表缩略图：同样是孩子作业的衍生图片，绝不能提交
+static/thumb/
 
 # 全部错题记录，以及迁移前的备份
 mistakes.db
