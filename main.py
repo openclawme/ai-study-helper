@@ -2034,87 +2034,86 @@ LOGIN_PAGE = """<!DOCTYPE html>
   // 邮件服务是否可用。**初始按可用算**，拿到服务端答复才降级 ——
   // 反过来（默认不可用）会让接口偶发失败时把注册永久锁死。
   var mailReady = true;
+  var pending = {username:'', email:''};   // 跨步骤要用的中间状态
+  var resendTimer = null;
 
   function show(el, on){ el.style.display = on ? '' : 'none'; }
+  function err(msg){ e.textContent=msg; e.style.display='block'; }
 
   /* 按钮文字的**唯一来源**。之前提交处理器会在开头记下当时的文字、结尾再写回去，
      结果把 setMode('verify') 刚设好的「验证并进入」覆盖成了「发送验证码」——
      跟标签页那个 bug 同一个病根：同一处 DOM 由两个地方写。 */
   function btnText(m){
-    return {login:'进入', register:'发送验证码', verify:'验证并进入', reset:'发送验证码'}[m] || '确定';
+    return {login:'进入', register:'发送验证码', verify:'验证并进入',
+            reset:'发送验证码', reset2:'重置并进入'}[m] || '确定';
   }
-  function err(msg){ e.textContent=msg; e.style.display='block'; }
 
-  /* 一个表单要承担四件事：登录 / 注册发码 / 注册验码 / 重置密码。
-     用 mode 切换字段的显隐和按钮文字，比开四个页面少来回跳。 */
+  /* 唯一的渲染入口：四种（五种）状态全在这里决定显隐和文案。
+     之前还有个 setMode 包装函数和第二个 submit 处理器，那两处 hack 正是
+     「同一处 DOM 两处写」的来源，已经并进来了。 */
   function setMode(m){
     mode = m;
-    var isReg = (m==='register' || m==='verify');
-    var isReset = (m==='reset');
-    tabLogin.className = isReg ? '' : 'on';
-    tabReg.className   = isReg ? 'on' : '';
-    // disabled 统一在下面按权威状态算一次，这里不要重复赋值 ——
-    // 原来这行会先把注册解禁，虽然紧接着又被覆盖回去，但「同一状态写两处」
-    // 正是上一个 bug（点一下登录就把注册解锁）的温床。
+    var isReg   = (m === 'register');
+    var isVerify= (m === 'verify');
+    var isReset = (m === 'reset');
+    var isReset2= (m === 'reset2');
+    var inRegFlow = isReg || isVerify;
 
-    show(emailField, isReg || isReset);
-    show(codeField, m==='verify');
-    show(inviteField, m==='register' && inviteField.dataset.needed==='1');
-    // 「忘记密码」和「注册」都依赖邮件服务，没配就都不给进
-    show(resetLink, m==='login' && mailReady);
-    p.setAttribute('autocomplete', isReg ? 'new-password' : 'current-password');
-    u.disabled = (m==='verify' || isReset);   // 这两个阶段用户名/邮箱已经定了
-    // ⚠️ 这两个 disabled 必须**每次都从权威状态算**，不能在别处各写各的。
-    // 原来写的是 tabLogin.disabled = tabReg.disabled = isReset，
-    // 于是点一下「登录」就把异步取回的 mailReady 状态覆盖掉、把注册重新解禁 ——
-    // 表现为「默认点不动注册，点一下登录才能点」，而且能一路填到提交才撞 503。
-    tabLogin.disabled = isReset || m === 'verify';
-    tabReg.disabled = isReset || !mailReady;
+    tabLogin.className = inRegFlow ? '' : 'on';
+    tabReg.className   = inRegFlow ? 'on' : '';
+    // ⚠️ 这两个标签必须**始终可点**（除非服务端根本不支持注册）。
+    // 我上一版在 reset 模式下把两个都禁用了 —— 用户点了「忘记密码」之后
+    // 就再也切不回登录，被困在一张重填密码的表单里。标签是出口，出口不能锁。
+    tabLogin.disabled = false;
+    tabReg.disabled   = !mailReady;
+
+    // 字段显隐：**只留这一步真正用得上的**
+    // 「重置第一步」只要邮箱。之前把用户名和密码也留着，用户点完「忘记密码」
+    // 看到的还是一张登录表单，自然会觉得「点了没反应」。
+    show(u.closest('.field'),  !isReset && !isReset2);   // 重置流程里用户名无关
+    show(p.closest('.field'),  !isReset);                // 第一步不要密码；第二步当「新密码」
+    show(emailField,           isReg || isReset || isReset2);
+    show(codeField,            isVerify || isReset2);
+    show(inviteField,          isReg && inviteField.dataset.needed==='1');
+    show(resetLink,            m === 'login' && mailReady);
+
+    // 第二步的「密码」其实要填的是新密码，标签得跟着改
+    document.querySelector('label[for="p"]').textContent =
+      isReset2 ? '新密码（至少 6 位）' : '密码';
+    p.setAttribute('autocomplete', (isReg || isReset2) ? 'new-password' : 'current-password');
+    if (isReset2) p.value = '';
+
+    u.disabled = isVerify || isReset || isReset2;        // 这几个阶段用户名/邮箱已经定了
+    em.disabled = isReset2;
 
     b.textContent = btnText(m);
     sub.textContent = {
       login:   '登录后看到的是你自己的错题',
       register:'注册需要邮箱验证，验证通过才算建成',
       verify:  '验证码已发到你的邮箱',
-      reset:   '输入注册时的邮箱，我们把验证码发过去'
+      reset:   '输入注册时的邮箱，我们把验证码发过去',
+      reset2:  '输入邮件里的验证码，设置新密码'
     }[m];
-    // 邮件没配好时，说明必须在**每一次**渲染里都带上 ——
-    // 之前是在 fetch 回调里直接改 tip.innerHTML，用户一点「登录」就被这里
-    // 覆盖掉，于是「为什么注册点不动」变得没有任何解释。
+    // 邮件没配好时，说明必须在**每一次**渲染里都带上 —— 之前在 fetch 回调里
+    // 直接改 tip.innerHTML，用户一点「登录」就被这里覆盖掉，于是
+    // 「为什么注册点不动」变得没有任何解释。
     tip.innerHTML = !mailReady
       ? '服务器还没有配置邮件服务，暂时无法注册或找回密码。<br>已有账号仍可正常登录。'
       : {
         login:   '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。',
         register:'用户名注册后不能改。<br>密码至少 6 位。',
-        verify:  '收不到？看看垃圾邮件，或点下面的链接重新发送。',
-        reset:   '这个邮箱有没有注册过，我们都会给出同样的提示。'
+        verify:  '收不到？看看垃圾邮件，或点下面的按钮重新发送。',
+        reset:   '这个邮箱有没有注册过，我们都会给出同样的提示。',
+        reset2:  '重置成功后会自动登录，其它设备的登录状态不受影响。'
       }[m];
     e.style.display='none';
   }
 
-  tabLogin.onclick=function(){ setMode('login'); };
-  tabReg.onclick=function(){ setMode('register'); };
-  document.getElementById('forgot').onclick=function(ev){
+  tabLogin.onclick = function(){ setMode('login'); };
+  tabReg.onclick   = function(){ setMode('register'); };
+  document.getElementById('forgot').onclick = function(ev){
     ev.preventDefault(); setMode('reset'); em.focus();
   };
-
-  fetch('/api/signup_policy').then(function(r){ return r.json(); }).then(function(d){
-    if(d && d.invite_required){ inviteField.dataset.needed='1'; }
-    fetch('/api/mail_policy').then(function(r2){ return r2.json(); }).then(function(d2){
-      // 只有在**明确得知**「邮件没配好」时才禁用注册。
-      // 写成 `if(!d2.mail_ready)` 是错的：请求失败、接口 404、返回体不是预期结构，
-      // 都会让 mail_ready 是 undefined，于是把注册按钮禁掉 ——
-      // 而禁用的按钮连 onclick 都不触发，用户看到的是「点了没反应」，极难排查。
-      // 判等 false 而不是取反，是这里唯一安全写法。
-      if(d2 && d2.mail_ready === false){
-        mailReady = false;
-        setMode(mode);   // 只改状态，渲染全交给 setMode —— 回调里一个字都不碰 DOM
-      }
-    }).catch(function(){});
-  }).catch(function(){});
-
-  var pending = {username:'', email:''};   // 跨步骤要用的中间状态
-  var resendTimer = null;
 
   /* 重发倒计时。服务端 VERIFY_RESEND_SEC 秒内不让重发，
      这里把它显示出来，否则用户点一次吃一个 429。 */
@@ -2166,10 +2165,26 @@ LOGIN_PAGE = """<!DOCTYPE html>
     }
   };
 
+  fetch('/api/signup_policy').then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.invite_required){ inviteField.dataset.needed='1'; }
+    fetch('/api/mail_policy').then(function(r2){ return r2.json(); }).then(function(d2){
+      // 只有在**明确得知**「邮件没配好」时才禁用注册。
+      // 写成 `if(!d2.mail_ready)` 是错的：请求失败、接口 404、返回体不是预期结构，
+      // 都会让 mail_ready 是 undefined，于是把注册按钮禁掉 ——
+      // 而禁用的按钮连 onclick 都不触发，用户看到的是「点了没反应」，极难排查。
+      if(d2 && d2.mail_ready === false){
+        mailReady = false;
+        setMode(mode);   // 只改状态，渲染全交给 setMode —— 回调里一个字都不碰 DOM
+      }
+    }).catch(function(){});
+  }).catch(function(){});
+
+  /* 一个处理器管五种状态：按 mode 选接口和请求体。
+     之前这里和另一个捕获阶段的处理器并存，两个都在改同样的 DOM —— 已经合并。 */
   f.addEventListener('submit', async function(ev){
     ev.preventDefault(); e.style.display='none'; b.disabled=true;
     var savedMode = mode;
-    b.textContent='处理中…';
+    b.textContent = '处理中…';
     try{
       var url, body;
       if(mode==='login'){
@@ -2179,12 +2194,15 @@ LOGIN_PAGE = """<!DOCTYPE html>
         body={username:u.value.trim(), password:p.value, email:em.value.trim(), invite:iv.value.trim()};
       } else if(mode==='verify'){
         url='/api/register/verify'; body={username:pending.username, code:cd.value.trim()};
-      } else {
+      } else if(mode==='reset'){
         url='/api/reset/request'; body={email:em.value.trim()};
+      } else {
+        url='/api/reset/do';
+        body={email:pending.email, code:cd.value.trim(), new:p.value};
       }
-      var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-                             body:JSON.stringify(body)});
-      var d=null; try{ d=await r.json(); }catch(_){}
+      var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                                body:JSON.stringify(body)});
+      var d = null; try{ d = await r.json(); } catch(_){}
       if(r.ok){
         if(mode==='register'){
           pending.username = u.value.trim().toLowerCase();
@@ -2197,12 +2215,13 @@ LOGIN_PAGE = """<!DOCTYPE html>
           pending.email = em.value.trim();
           codeHint.textContent = (d && d.msg) || '如果这个邮箱注册过，验证码已经发出去了';
           setMode('reset2');
+          cd.value=''; cd.focus();
           startResendCountdown((d && d.resend_after) || 60);
         } else {
-          location.href='/'; return;
+          location.href='/'; return;      // 登录 / 验码 / 重置成功
         }
       } else {
-        err((d&&d.detail)||('失败（HTTP '+r.status+'）'));
+        err((d && d.detail) || ('失败（HTTP ' + r.status + '）'));
       }
     }catch(ex){ err('网络错误：'+ex.message); }
     // 成功且切换了模式时，文字由 setMode 管，这里别碰 —— 否则又把它覆盖回去。
@@ -2210,39 +2229,6 @@ LOGIN_PAGE = """<!DOCTYPE html>
     b.disabled = false;
     if (mode === savedMode) b.textContent = btnText(mode);
   });
-
-  /* reset2 = 已发码，等用户填码和新密码。复用同一批输入框，
-     只是把「密码」这一栏的含义从旧密码换成新密码。 */
-  var _setMode = setMode;
-  setMode = function(m){
-    if(m!=='reset2'){ _setMode(m); return; }
-    mode='reset2';
-    show(emailField,true); em.disabled=true;
-    show(codeField,true);
-    document.querySelector('label[for="p"]').textContent='新密码（至少 6 位）';
-    p.value=''; p.setAttribute('autocomplete','new-password');
-    codeHint.textContent = codeHint.textContent;
-    b.textContent='重置并进入';
-    sub.textContent='输入邮件里的验证码，设置新密码';
-    tip.innerHTML='重置成功后会自动登录。<br>其它设备的登录状态不受影响。';
-    e.style.display='none';
-  };
-
-  // reset2 的提交单独处理
-  var _submit = f.onsubmit;
-  f.addEventListener('submit', async function(ev){
-    if(mode!=='reset2') return;
-    ev.preventDefault(); ev.stopImmediatePropagation();
-    e.style.display='none'; b.disabled=true; b.textContent='处理中…';
-    try{
-      var r=await fetch('/api/reset/do',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({email:em.value.trim(), code:cd.value.trim(), new:p.value})});
-      var d=null; try{ d=await r.json(); }catch(_){}
-      if(r.ok){ location.href='/'; return; }
-      err((d&&d.detail)||('失败（HTTP '+r.status+'）'));
-    }catch(ex){ err('网络错误：'+ex.message); }
-    b.disabled=false; b.textContent='重置并进入';
-  }, true);
 
   setMode('login');
 </script></body></html>"""
