@@ -10,13 +10,18 @@ cd "$(dirname "$(readlink -f "$0")")"
 # 从受保护的文件里读 Key。注意：`set -u` 下要用 ${VAR:-} 取默认值，
 # 否则变量未定义时脚本会直接退出。
 if [ -f "$HOME/.cuoti.env" ]; then
+  # ⚠️ set -a（allexport）让文件里**每一个**赋值都自动导出。
+  #
+  # 原来只手动 export 了 DEEPSEEK_API_KEY，后面加 SMTP_* 时就漏了 ——
+  # 表现为「明明配了 SMTP，服务却报 mail_ready:false」，而且不会报任何错。
+  # 用 set -a 就不必每次加新配置都记得补一行 export。
+  set -a
   # shellcheck disable=SC1091
   . "$HOME/.cuoti.env"
+  set +a
 fi
 
-# 关键一步：`.` 引入的变量默认只是**当前 shell 的变量**，不导出。
-# 如果 ~/.cuoti.env 里写的是 `DEEPSEEK_API_KEY=xxx`（没有 export），
-# 后面的 python3 子进程根本拿不到它——表现为「明明配了 Key，服务却说没配」。
+# 这行保留只为配合下面的空值检查（set -u 下的取默认值写法）
 export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
 
 if [ -z "$DEEPSEEK_API_KEY" ]; then
