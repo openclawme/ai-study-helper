@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import shutil
 import socket
 import sqlite3
@@ -44,6 +45,9 @@ import urllib.request
 from contextlib import asynccontextmanager, closing
 from contextvars import ContextVar
 from datetime import datetime, timedelta
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -179,9 +183,9 @@ def get_conn() -> sqlite3.Connection:
     # 检查两张表（而不是一张）：这样从旧版本升级上来、缺 chats 表时也能自动补建
     n = conn.execute(
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' "
-        "AND name IN ('mistakes','chats','users')"
+        "AND name IN ('mistakes','chats','users','signups','mail_log')"
     ).fetchone()["n"]
-    if n < 3:
+    if n < 5:
         _create_schema(conn)
     else:
         # 老库补列 / 改列。CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，只能手动 ALTER。
@@ -216,6 +220,8 @@ def get_conn() -> sqlite3.Connection:
             # 老数据：全部按「今天就该复习」处理 —— 它们从没被复习过，本来就该先过一遍。
             conn.execute("UPDATE mistakes SET review_due_at=? WHERE review_due_at=''",
                          (datetime.now().strftime("%Y-%m-%d"),))
+        if "email" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
         if "user_id" not in cols:
             # 老库里的题还没有归属。留 0，等第一个注册的账号来认领
             # （见 /api/register）—— 直接猜一个用户塞进去反而更糟。
@@ -242,7 +248,39 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             username   TEXT    NOT NULL UNIQUE,
             pw_hash    TEXT    NOT NULL,            -- pbkdf2_sha256$轮数$盐$哈希
+            email      TEXT    NOT NULL DEFAULT '', -- 找回密码用；注册时已验证过
             created_at TEXT    NOT NULL
+        )
+        """
+    )
+    # 待验证的注册。**为什么单独一张表，而不是给 users 加 verified 标志**：
+    # 未验证的行混在 users 里，UNIQUE(username) 会挡住用户重填，
+    # 而且每条查询都得记得过滤 verified —— 漏一处就是个能登录的空账号。
+    # 独立表 + 验证通过才写 users，这类漏检天然不存在。
+    # 发信节流。**必须独立于 signups 的生命周期**：验证成功时那条待验证记录会被删掉，
+    # 如果节流信息也存在那里，删完就查不到「刚发过」，等于没有节流 ——
+    # 循环调用就能把人邮箱轰炸一遍、顺带烧光 SMTP 配额。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mail_log (
+            key     TEXT NOT NULL,
+            sent_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_maillog ON mail_log(key, sent_at DESC)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signups (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            username   TEXT    NOT NULL UNIQUE,
+            email      TEXT    NOT NULL,
+            pw_hash    TEXT    NOT NULL,   -- 先存哈希，验证通过直接搬进 users，明文密码不落库
+            code_hash  TEXT    NOT NULL,   -- 验证码的哈希，不存明文
+            expires_at TEXT    NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 0,
+            sent_at    TEXT    NOT NULL,
+            ip         TEXT    NOT NULL DEFAULT ''
         )
         """
     )
@@ -1657,6 +1695,25 @@ SESSION_COOKIE = "cuoti_session"
 SESSION_TTL = 14 * 24 * 3600          # 14 天免登录；手机端不用天天输口令
 SECRET_FILE = os.path.join(BASE_DIR, ".session_secret")
 PASSWORD_FILE = os.path.join(BASE_DIR, "password.txt")
+# ── 邮件 ────────────────────────────────────────────────────────────────────
+# 用标准库 smtplib，不引第三方依赖。配置全部走环境变量，**不要写进代码**：
+#   SMTP_HOST      smtp.qq.com
+#   SMTP_PORT      465            （465 = SSL，587 = STARTTLS，按端口自动选）
+#   SMTP_USER      你的邮箱账号
+#   SMTP_PASS      授权码（不是登录密码）
+#   SMTP_FROM      发件人，留空则用 SMTP_USER
+# 阿里云默认封 25 端口，所以走 465/587；实测这两个都能出网。
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip() or SMTP_USER
+MAIL_READY = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+
+VERIFY_TTL_MIN = 10           # 验证码有效期
+VERIFY_MAX_TRY = 5            # 一个验证码最多试几次
+VERIFY_RESEND_SEC = 60        # 同一邮箱多久才能重发一次（防轰炸）
+
 # 邀请码：留空 = 开放注册。设成任意字符串后，注册必须填对才放行。
 # 这个应用在公网 IP 上、DeepSeek key 是计费的 —— 万一被扫描器盯上批量注册，
 # 想收紧时把下面这行改成 SIGNUP_CODE = os.getenv("SIGNUP_CODE", "你的邀请码") 重启即可。
@@ -1753,6 +1810,85 @@ def current_uid() -> int:
     return _uid.get()
 
 
+def _code_hash(username: str, code: str) -> str:
+    """
+    验证码只存哈希，不存明文。
+
+    说实话：6 位数字只有 100 万种可能，拿到库的人跑一遍是瞬间的事 ——
+    哈希在这里挡不住有备而来的攻击者。它挡的是「顺手看到明文」，
+    真正的防线是下面的**尝试次数上限**和**有效期**。
+    """
+    return hmac.new(_secret, f"verify:{username}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def send_mail(to: str, subject: str, body: str) -> Tuple[bool, str]:
+    """
+    发一封纯文本邮件。返回 (成功与否, 说明)。
+
+    ⚠️ 这是在同步 endpoint 里调用的阻塞操作（SMTP 握手可能好几秒）。
+    FastAPI 会把同步 endpoint 丢进线程池，所以不会卡住整个服务 ——
+    但也不要在异步 endpoint 里直接调它。
+    """
+    if not MAIL_READY:
+        return False, "服务器未配置邮件服务"
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = SMTP_FROM
+    msg["To"] = to
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    try:
+        if SMTP_PORT == 465:
+            srv = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        else:
+            srv = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+            srv.ehlo()
+            if srv.has_extn("starttls"):
+                srv.starttls()
+                srv.ehlo()
+        with srv:
+            srv.login(SMTP_USER, SMTP_PASS)
+            srv.sendmail(SMTP_FROM, [to], msg.as_string())
+        return True, "已发送"
+    except smtplib.SMTPAuthenticationError:
+        # 最常见的一种：填的是登录密码而不是「授权码」
+        return False, "邮件服务认证失败（注意要用授权码，不是邮箱登录密码）"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def mail_throttle(key: str) -> int:
+    """
+    返回还要等几秒才能重发；0 表示可以发。可以发时会**立刻记账**，
+    避免并发请求同时通过检查。
+    """
+    now = datetime.now()
+    with closing(get_conn()) as conn, conn:
+        row = conn.execute(
+            "SELECT sent_at FROM mail_log WHERE key=? ORDER BY sent_at DESC LIMIT 1",
+            (key,)).fetchone()
+        if row:
+            try:
+                gap = (now - datetime.strptime(row["sent_at"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                if gap < VERIFY_RESEND_SEC:
+                    return int(VERIFY_RESEND_SEC - gap) + 1
+            except ValueError:
+                pass
+        conn.execute("INSERT INTO mail_log (key, sent_at) VALUES (?,?)",
+                     (key, now.strftime("%Y-%m-%d %H:%M:%S")))
+    return 0
+
+
+def mask_email(addr: str) -> str:
+    """a@b.com → a***@b.com。回给前端只用于提示「发到哪个邮箱了」。"""
+    try:
+        name, domain = addr.split("@", 1)
+        keep = name[:1] if len(name) > 1 else ""
+        return f"{keep}***@{domain}"
+    except ValueError:
+        return "***"
+
+
 def _client_ip(request) -> str:
     return request.client.host if request.client else "unknown"
 
@@ -1837,6 +1973,9 @@ LOGIN_PAGE = """<!DOCTYPE html>
     <button type="button" id="tab-login" class="on">登录</button>
     <button type="button" id="tab-reg" >注册</button>
   </div>
+  <p id="reset-link" style="text-align:right;margin:-8px 0 14px">
+    <a href="#" id="forgot" style="font-size:12px;color:#6366f1;text-decoration:none">忘记密码？</a>
+  </p>
 
   <div class="field">
     <label for="u">用户名</label>
@@ -1848,6 +1987,17 @@ LOGIN_PAGE = """<!DOCTYPE html>
     <label for="p">密码</label>
     <input id="p" type="password" autocomplete="current-password"
            inputmode="latin" autocapitalize="off" autocorrect="off" placeholder="请输入密码">
+  </div>
+  <div class="field" id="email-field" style="display:none">
+    <label for="em">邮箱</label>
+    <input id="em" type="email" autocomplete="email" inputmode="email"
+           autocapitalize="off" autocorrect="off" placeholder="用于接收验证码和找回密码">
+  </div>
+  <div class="field" id="code-field" style="display:none">
+    <label for="cd">验证码</label>
+    <input id="cd" type="text" inputmode="numeric" autocomplete="one-time-code"
+           maxlength="6" placeholder="6 位数字" style="letter-spacing:.4em;font-size:20px;text-align:center">
+    <p id="code-hint" style="margin:8px 0 0;font-size:11.5px;color:#94a3b8;line-height:1.6"></p>
   </div>
   <div class="field" id="invite-field" style="display:none">
     <label for="iv">邀请码</label>
@@ -1863,52 +2013,147 @@ LOGIN_PAGE = """<!DOCTYPE html>
 </form>
 <script>
   var f=document.getElementById('f'),u=document.getElementById('u'),p=document.getElementById('p'),
-      iv=document.getElementById('iv'),b=document.getElementById('b'),e=document.getElementById('e'),
+      iv=document.getElementById('iv'),em=document.getElementById('em'),cd=document.getElementById('cd'),
+      codeHint=document.getElementById('code-hint'),codeField=document.getElementById('code-field'),
+      emailField=document.getElementById('email-field'),
+      b=document.getElementById('b'),e=document.getElementById('e'),
       tip=document.getElementById('tip'),sub=document.getElementById('sub'),
-      inviteField=document.getElementById('invite-field'),
+      inviteField=document.getElementById('invite-field'),resetLink=document.getElementById('reset-link'),
       tabLogin=document.getElementById('tab-login'),tabReg=document.getElementById('tab-reg'),
       mode='login';
 
+  function show(el, on){ el.style.display = on ? '' : 'none'; }
+  function err(msg){ e.textContent=msg; e.style.display='block'; }
+
+  /* 一个表单要承担四件事：登录 / 注册发码 / 注册验码 / 重置密码。
+     用 mode 切换字段的显隐和按钮文字，比开四个页面少来回跳。 */
   function setMode(m){
-    mode=m;
-    var reg=(m==='register');
-    tabLogin.className = reg ? '' : 'on';
-    tabReg.className   = reg ? 'on' : '';
-    b.textContent = reg ? '注册并进入' : '进入';
-    sub.textContent = reg ? '注册后你会得到自己的错题库' : '登录后看到的是你自己的错题';
-    p.setAttribute('autocomplete', reg ? 'new-password' : 'current-password');
-    inviteField.style.display = 'none';   // 邀请码栏由服务端配置决定，见下方探测
-    tip.innerHTML = reg
-      ? '用户名注册后不能改。<br>密码至少 6 位，忘了只能让管理员重置。'
-      : '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。';
+    mode = m;
+    var isReg = (m==='register' || m==='verify');
+    var isReset = (m==='reset');
+    tabLogin.className = isReg ? '' : 'on';
+    tabReg.className   = isReg ? 'on' : '';
+    tabLogin.disabled = tabReg.disabled = isReset;
+
+    show(emailField, isReg || isReset);
+    show(codeField, m==='verify');
+    show(inviteField, m==='register' && inviteField.dataset.needed==='1');
+    show(resetLink, m==='login');
+    p.setAttribute('autocomplete', isReg ? 'new-password' : 'current-password');
+    u.disabled = (m==='verify' || isReset);   // 这两个阶段用户名/邮箱已经定了
+
+    var text = {login:'进入', register:'发送验证码', verify:'验证并进入', reset:'发送验证码'}[m];
+    b.textContent = text;
+    sub.textContent = {
+      login:   '登录后看到的是你自己的错题',
+      register:'注册需要邮箱验证，验证通过才算建成',
+      verify:  '验证码已发到你的邮箱',
+      reset:   '输入注册时的邮箱，我们把验证码发过去'
+    }[m];
+    tip.innerHTML = {
+      login:   '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。',
+      register:'用户名注册后不能改。<br>密码至少 6 位。',
+      verify:  '收不到？看看垃圾邮件，或点下面的链接重新发送。',
+      reset:   '这个邮箱有没有注册过，我们都会给出同样的提示。'
+    }[m];
     e.style.display='none';
   }
+
   tabLogin.onclick=function(){ setMode('login'); };
   tabReg.onclick=function(){ setMode('register'); };
+  document.getElementById('forgot').onclick=function(ev){
+    ev.preventDefault(); setMode('reset'); em.focus();
+  };
 
-  // 服务端配了邀请码才显示那一栏 —— 不配就不给用户一个填了也没用的框
   fetch('/api/signup_policy').then(function(r){ return r.json(); }).then(function(d){
     if(d && d.invite_required){ inviteField.dataset.needed='1'; }
+    fetch('/api/mail_policy').then(function(r2){ return r2.json(); }).then(function(d2){
+      // 只有在**明确得知**「邮件没配好」时才禁用注册。
+      // 写成 `if(!d2.mail_ready)` 是错的：请求失败、接口 404、返回体不是预期结构，
+      // 都会让 mail_ready 是 undefined，于是把注册按钮禁掉 ——
+      // 而禁用的按钮连 onclick 都不触发，用户看到的是「点了没反应」，极难排查。
+      // 判等 false 而不是取反，是这里唯一安全写法。
+      if(d2 && d2.mail_ready === false){
+        tabReg.disabled = true;
+        document.getElementById('forgot').style.display='none';
+        tip.innerHTML = '服务器还没有配置邮件服务，暂时无法注册或找回密码。<br>已有账号仍可正常登录。';
+      }
+    }).catch(function(){});
   }).catch(function(){});
 
-  f.addEventListener('submit',async function(ev){
+  var pending = {username:'', email:''};   // 跨步骤要用的中间状态
+
+  f.addEventListener('submit', async function(ev){
     ev.preventDefault(); e.style.display='none'; b.disabled=true;
-    var label = mode==='register' ? '注册中…' : '验证中…';
-    b.textContent=label;
+    var saved = b.textContent; b.textContent='处理中…';
     try{
-      var body = { username: u.value.trim(), password: p.value };
-      if(mode==='register'){
-        if(inviteField.dataset.needed==='1') body.invite = iv.value.trim();
-        if(inviteField.dataset.needed!=='1' && iv.value.trim()) body.invite = iv.value.trim();
+      var url, body;
+      if(mode==='login'){
+        url='/api/login'; body={username:u.value.trim(), password:p.value};
+      } else if(mode==='register'){
+        url='/api/register';
+        body={username:u.value.trim(), password:p.value, email:em.value.trim(), invite:iv.value.trim()};
+      } else if(mode==='verify'){
+        url='/api/register/verify'; body={username:pending.username, code:cd.value.trim()};
+      } else {
+        url='/api/reset/request'; body={email:em.value.trim()};
       }
-      var r=await fetch(mode==='register' ? '/api/register' : '/api/login',{
-        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-      if(r.ok){ location.href='/'; return; }
+      var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+                             body:JSON.stringify(body)});
       var d=null; try{ d=await r.json(); }catch(_){}
-      e.textContent=(d&&d.detail)||('失败（HTTP '+r.status+'）'); e.style.display='block';
-    }catch(err){ e.textContent='网络错误：'+err.message; e.style.display='block'; }
-    b.disabled=false; b.textContent = mode==='register' ? '注册并进入' : '进入';
+      if(r.ok){
+        if(mode==='register'){
+          pending.username = u.value.trim().toLowerCase();
+          setMode('verify');
+          codeHint.textContent = '验证码已发送到 ' + (d.email || em.value) + '，'
+                               + d.ttl_min + ' 分钟内有效。';
+          cd.value=''; cd.focus();
+        } else if(mode==='reset'){
+          codeHint.textContent = (d && d.msg) || '如果这个邮箱注册过，验证码已经发出去了';
+          setMode('reset2');
+        } else {
+          location.href='/'; return;
+        }
+      } else {
+        err((d&&d.detail)||('失败（HTTP '+r.status+'）'));
+      }
+    }catch(ex){ err('网络错误：'+ex.message); }
+    b.disabled=false; b.textContent=saved;
   });
+
+  /* reset2 = 已发码，等用户填码和新密码。复用同一批输入框，
+     只是把「密码」这一栏的含义从旧密码换成新密码。 */
+  var _setMode = setMode;
+  setMode = function(m){
+    if(m!=='reset2'){ _setMode(m); return; }
+    mode='reset2';
+    show(emailField,true); em.disabled=true;
+    show(codeField,true);
+    document.querySelector('label[for="p"]').textContent='新密码（至少 6 位）';
+    p.value=''; p.setAttribute('autocomplete','new-password');
+    codeHint.textContent = codeHint.textContent;
+    b.textContent='重置并进入';
+    sub.textContent='输入邮件里的验证码，设置新密码';
+    tip.innerHTML='重置成功后会自动登录。<br>其它设备的登录状态不受影响。';
+    e.style.display='none';
+  };
+
+  // reset2 的提交单独处理
+  var _submit = f.onsubmit;
+  f.addEventListener('submit', async function(ev){
+    if(mode!=='reset2') return;
+    ev.preventDefault(); ev.stopImmediatePropagation();
+    e.style.display='none'; b.disabled=true; b.textContent='处理中…';
+    try{
+      var r=await fetch('/api/reset/do',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({email:em.value.trim(), code:cd.value.trim(), new:p.value})});
+      var d=null; try{ d=await r.json(); }catch(_){}
+      if(r.ok){ location.href='/'; return; }
+      err((d&&d.detail)||('失败（HTTP '+r.status+'）'));
+    }catch(ex){ err('网络错误：'+ex.message); }
+    b.disabled=false; b.textContent='重置并进入';
+  }, true);
+
   setMode('login');
 </script></body></html>"""
 
@@ -2620,7 +2865,8 @@ app = FastAPI(title="我的AI学习助手", version="1.0.0", lifespan=lifespan)
 # 标签页/收藏夹/添加到主屏幕都会拿到一张 HTML 当图片，图标直接空白。
 # /api/signup_policy 也必须在里面：登录页要在**登录之前**调它，
 # 才知道要不要显示邀请码输入框。漏了它，配了邀请码也不会出现那个框。
-PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/signup_policy",
+PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
+                "/api/reset/request", "/api/reset/do", "/api/signup_policy", "/api/mail_policy",
                 "/favicon.ico", "/favicon.svg", "/favicon-192.png",
                 "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"}
 
@@ -2667,7 +2913,26 @@ class LoginReq(BaseModel):
 class RegisterReq(BaseModel):
     username: str = ""
     password: str = ""
+    email: str = ""
     invite: str = ""       # 只有设了 SIGNUP_CODE 时才需要填
+
+
+class VerifyReq(BaseModel):
+    username: str = ""
+    code: str = ""
+
+
+class ResetReq(BaseModel):
+    email: str = ""
+
+
+class ResetDoReq(BaseModel):
+    email: str = ""
+    code: str = ""
+    new: str = ""
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
 
 
 # 用户名规则：3~20 位，字母数字下划线连字符，必须以字母或数字开头。
@@ -2723,13 +2988,26 @@ def api_login(req: LoginReq, request: Request):
     return _session_response(int(row["id"]), {"username": name})
 
 
+def _send_code(to: str, username: str, code: str, purpose: str) -> Tuple[bool, str]:
+    what = "注册验证" if purpose == "signup" else "重置密码"
+    body = (
+        f"你的{what}验证码是：\n\n"
+        f"    {code}\n\n"
+        f"{VERIFY_TTL_MIN} 分钟内有效，只能使用一次。\n"
+        f"如果不是你本人操作，忽略这封邮件即可，你的账号不会有任何变化。\n\n"
+        f"—— 我的AI学习助手"
+    )
+    return send_mail(to, f"【我的AI学习助手】{what}验证码：{code}", body)
+
+
 @app.post("/api/register")
 def api_register(req: RegisterReq, request: Request):
     """
-    开放注册（可在配置里加邀请码门槛，见 SIGNUP_CODE）。
+    注册第一步：校验资料 → 发验证码。**这一步不创建账号。**
 
-    ⚠️ 注册接口是**唯一**会在没有登录态时写数据库的入口，所以限流必须严于登录：
-    否则脚本可以批量注册，把这张表刷爆。
+    账号要等验证码验过才写进 users（见 /api/register/verify）。
+    这样「邮箱是真的」就成了注册的前提 —— 对一个跑在公网、
+    背后挂着计费 API key 的服务来说，这是最有效的一道防机器人门槛。
     """
     ip = _client_ip(request)
     if _login_locked(ip):
@@ -2737,37 +3015,185 @@ def api_register(req: RegisterReq, request: Request):
     if SIGNUP_CODE and not hmac.compare_digest((req.invite or "").strip(), SIGNUP_CODE):
         _record_fail(ip)
         raise HTTPException(403, "邀请码不正确")
+    if not MAIL_READY:
+        raise HTTPException(503, "服务器还没有配置邮件服务，暂时无法注册。请联系管理员。")
 
     name = (req.username or "").strip().lower()
+    email = (req.email or "").strip()
     pw = req.password or ""
     if not USERNAME_RE.match(name):
         raise HTTPException(400, "用户名需 3~20 位，只能是字母、数字、下划线或连字符，且以字母或数字开头")
+    if not EMAIL_RE.match(email) or len(email) > 120:
+        raise HTTPException(400, "邮箱格式不正确")
     if len(pw) < MIN_PW_LEN:
         raise HTTPException(400, f"密码至少 {MIN_PW_LEN} 位")
     if len(pw) > 200:
         raise HTTPException(400, "密码太长了")
 
-    with closing(get_conn()) as conn, conn:
+    now = datetime.now()
+    with closing(get_conn()) as conn:
         if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
             _record_fail(ip)
             raise HTTPException(409, "这个用户名已经被注册了")
+        if conn.execute("SELECT 1 FROM users WHERE email=? AND email!=''",
+                        (email,)).fetchone():
+            _record_fail(ip)
+            raise HTTPException(409, "这个邮箱已经注册过了")
+    # 重发节流：不然这个接口就是个免费的邮件轰炸机
+    wait = mail_throttle("signup:" + name)
+    if wait:
+        raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
+    ok, msg = _send_code(email, name, code, "signup")
+    if not ok:
+        raise HTTPException(502, f"验证码发送失败：{msg}")
+
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM signups WHERE username=?", (name,))
+        conn.execute(
+            "INSERT INTO signups (username, email, pw_hash, code_hash, expires_at, sent_at, ip)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (name, email, hash_password(pw), _code_hash(name, code),
+             (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+             now.strftime("%Y-%m-%d %H:%M:%S"), ip))
+    return {"ok": True, "need_code": True, "email": mask_email(email),
+            "ttl_min": VERIFY_TTL_MIN}
+
+
+@app.post("/api/register/verify")
+def api_register_verify(req: VerifyReq, request: Request):
+    """注册第二步：验码 → 建账号 → 直接登录。"""
+    ip = _client_ip(request)
+    name = (req.username or "").strip().lower()
+    code = (req.code or "").strip()
+    if _login_locked(ip):
+        raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
+
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT * FROM signups WHERE username=?", (name,)).fetchone()
+    # 统一的失败措辞：不区分「没这条待验证记录」和「码错了」
+    bad = HTTPException(400, "验证码不正确或已过期，请重新获取")
+    if not row or not code:
+        _record_fail(ip)
+        raise bad
+    if row["attempts"] >= VERIFY_MAX_TRY:
+        _record_fail(ip)
+        raise HTTPException(429, "这个验证码试错太多次了，请重新获取")
+    if datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.now():
+        _record_fail(ip)
+        raise bad
+    if not hmac.compare_digest(row["code_hash"], _code_hash(name, code)):
+        with closing(get_conn()) as conn, conn:
+            conn.execute("UPDATE signups SET attempts = attempts + 1 WHERE id=?", (row["id"],))
+        _record_fail(ip)
+        raise bad
+
+    with closing(get_conn()) as conn, conn:
+        # 抢在并发之前再确认一次用户名没被占（两个请求同时验同一个码）
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+            conn.execute("DELETE FROM signups WHERE id=?", (row["id"],))
+            raise HTTPException(409, "这个用户名已经被注册了")
         cur = conn.execute(
-            "INSERT INTO users (username, pw_hash, created_at) VALUES (?,?,?)",
-            (name, hash_password(pw), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
+            "INSERT INTO users (username, pw_hash, email, created_at) VALUES (?,?,?,?)",
+            (name, row["pw_hash"], row["email"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         uid = int(cur.lastrowid)
-        # 第一个注册的账号认领「还没有归属」的老数据。
-        # 升级上来的库里有几十条题和照片，user_id 是 0 —— 直接丢掉太粗暴，
-        # 但也不能猜一个用户塞进去。交给第一个来注册的人最合理。
+        conn.execute("DELETE FROM signups WHERE id=?", (row["id"],))
+        # 第一个注册的账号认领升级上来的老数据
         claimed = 0
         if conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 1:
             claimed = conn.execute(
                 "UPDATE mistakes SET user_id=? WHERE user_id=0", (uid,)).rowcount
-            # 自由问答的老对话同样认领，否则升级前聊的那些会永远看不到
             conn.execute("UPDATE chats SET user_id=? WHERE user_id=0", (uid,))
 
     _clear_fails(ip)
     return _session_response(uid, {"username": name, "claimed": claimed})
+
+
+# ── 忘记密码 ────────────────────────────────────────────────────────────────
+@app.post("/api/reset/request")
+def api_reset_request(req: ResetReq, request: Request):
+    """
+    发重置验证码。
+
+    ⚠️ 无论这个邮箱是否注册过，**返回完全一样**。否则这个接口就成了
+    「查某个邮箱有没有注册」的免费查询器。
+    """
+    ip = _client_ip(request)
+    if _login_locked(ip):
+        raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
+    if not MAIL_READY:
+        raise HTTPException(503, "服务器还没有配置邮件服务，暂时无法重置密码。请联系管理员。")
+
+    email = (req.email or "").strip()
+    generic = {"ok": True, "msg": "如果这个邮箱注册过，验证码已经发出去了"}
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "邮箱格式不正确")
+
+    with closing(get_conn()) as conn:
+        u = conn.execute("SELECT id, username FROM users WHERE email=? AND email!=''",
+                         (email,)).fetchone()
+    wait = mail_throttle("reset:" + email)
+    if wait:
+        raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+
+    if u:
+        code = "".join(secrets.choice("0123456789") for _ in range(6))
+        ok, msg = _send_code(email, u["username"], code, "reset")
+        if not ok:
+            # 发信失败要让本人知道，不然他会一直等一封永远不来的邮件
+            raise HTTPException(502, f"验证码发送失败：{msg}")
+        now = datetime.now()
+        with closing(get_conn()) as conn, conn:
+            conn.execute("DELETE FROM signups WHERE username=? AND ip='reset'", (email,))
+            conn.execute(
+                "INSERT INTO signups (username, email, pw_hash, code_hash, expires_at, sent_at, ip)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (email, email, "", _code_hash(email, code),
+                 (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+                 now.strftime("%Y-%m-%d %H:%M:%S"), "reset"))
+    return generic
+
+
+@app.post("/api/reset/do")
+def api_reset_do(req: ResetDoReq, request: Request):
+    ip = _client_ip(request)
+    if _login_locked(ip):
+        raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
+    email = (req.email or "").strip()
+    code = (req.code or "").strip()
+    new = req.new or ""
+    if len(new) < MIN_PW_LEN:
+        raise HTTPException(400, f"新密码至少 {MIN_PW_LEN} 位")
+
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT * FROM signups WHERE username=? AND ip='reset'",
+                           (email,)).fetchone()
+        u = conn.execute("SELECT id FROM users WHERE email=? AND email!=''", (email,)).fetchone()
+    bad = HTTPException(400, "验证码不正确或已过期，请重新获取")
+    if not row or not u or not code:
+        _record_fail(ip); raise bad
+    if row["attempts"] >= VERIFY_MAX_TRY:
+        raise HTTPException(429, "这个验证码试错太多次了，请重新获取")
+    if datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.now():
+        _record_fail(ip); raise bad
+    if not hmac.compare_digest(row["code_hash"], _code_hash(email, code)):
+        with closing(get_conn()) as conn, conn:
+            conn.execute("UPDATE signups SET attempts = attempts + 1 WHERE id=?", (row["id"],))
+        _record_fail(ip); raise bad
+
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(new), u["id"]))
+        conn.execute("DELETE FROM signups WHERE id=?", (row["id"],))
+    _clear_fails(ip)
+    # 重置成功直接给会话：他已经证明了对邮箱的控制权，没必要再输一遍
+    return _session_response(int(u["id"]), {"username": ""})
+
+
+@app.get("/api/mail_policy")
+def mail_policy():
+    """登录页用它决定要不要禁用「注册 / 找回密码」——没配邮件就别让用户白填一堆。"""
+    return {"mail_ready": MAIL_READY}
 
 
 @app.get("/api/signup_policy")
@@ -2795,8 +3221,7 @@ def api_change_password(req: PwReq):
         time.sleep(0.4)
         raise HTTPException(401, "原密码不正确")
     with closing(get_conn()) as conn, conn:
-        conn.execute("UPDATE users SET pw_hash=? WHERE id=?",
-                     (hash_password(req.new), uid))
+        conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(req.new), uid))
     return {"ok": True}
 
 
