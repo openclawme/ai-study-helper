@@ -237,22 +237,38 @@
           <span class="text-xs text-slate-400">照片 / PDF / Word / 文本</span>
         </div>
 
-        <!-- 只放一个按钮、一个 input。
-             之前分成「拍照」和「相册」两个，但 capture="environment" 在桌面端会被忽略、
-             在很多手机上也只是让系统弹一个含「拍照」的菜单 —— 两个按钮点开的是同一个对话框。
-             去掉 capture，交给系统原生选择器，它本来就会同时给出「拍照 / 相册」两个入口。 -->
-        <button class="btn btn-primary w-full py-4 text-base shadow-lg shadow-indigo-200"
-                :disabled="uploading" @click="triggerPick">
-          <svg class="w-5 h-5" aria-hidden="true"><use href="#i-camera"/></svg>
-          <span v-if="!uploading">拍照 / 选文件</span>
-          <span v-else><span class="spin">⏳</span> 处理中…</span>
-        </button>
+        <!-- ⚠️ 必须是**两个** input，不能合成一个。
+             手机的选择器有一条硬规则：**相机拍不出来的类型，就不给相机入口**。
+             所以只要 accept 里带上 .pdf/.doc，系统就直接跳到文件浏览器，
+             「拍照」这个选项根本不会出现 —— 而这恰恰是最主要的用法（孩子拍作业）。
+             实测确认过：accept="image/*" 时会给出拍照/相册；一旦加上 pdf/doc 就只剩选文件。
+             拆开之后：拍照那个只收图片（相机入口回来了），文档那个收全部类型。
+             capture="environment" 不写：写了在 iOS 上会直接进相机、反而没有「从相册选」；
+             不写则系统自己弹「拍照 / 相册 / 浏览」三选一。 -->
+        <div class="flex gap-2">
+          <button class="btn btn-primary flex-1 py-4 text-base shadow-lg shadow-indigo-200 md:hidden"
+                  :disabled="uploading" @click="triggerPick('cam')">
+            <svg class="w-5 h-5" aria-hidden="true"><use href="#i-camera"/></svg>
+            <span>拍照</span>
+          </button>
+          <button class="btn btn-primary py-4 text-base shadow-lg shadow-indigo-200"
+                  :class="uploading ? '' : 'flex-1'"
+                  :disabled="uploading" @click="triggerPick('file')">
+            <svg class="w-5 h-5" aria-hidden="true"><use href="#i-file"/></svg>
+            <span v-if="!uploading">选文件</span>
+            <span v-else><span class="spin">⏳</span> 处理中…</span>
+          </button>
+        </div>
+        <!-- 只收图片：这样系统才会把「拍照」摆在选项里 -->
+        <input ref="camInput" type="file" accept="image/*"
+               class="hidden" @change="onFileChange">
+        <!-- 收全部类型：PDF / Word / 文本 -->
         <input ref="fileInput" type="file"
                accept="image/*,.pdf,.doc,.docx,.txt,.md,application/pdf"
                class="hidden" @change="onFileChange">
 
         <p class="text-xs text-slate-400 mt-2 leading-relaxed">
-          <b class="text-slate-500">照片</b>：手机上点这个按钮，系统会让你选「拍照」或「从相册选」，
+          <b class="text-slate-500">拍照</b>：手机上是单独的按钮，点开就能选「拍照」或「从相册选」。
           上传前自动压缩，原图完整保留手写与红笔批改。<br>
           <b class="text-slate-500">文件</b>：也可以选 PDF / Word / 纯文本，
           AI 会<b class="text-slate-500">逐页把整份卷子拆成一道一道的题</b>，
@@ -1560,10 +1576,12 @@ const app = createApp({
     },
 
     /* ---------------- 上传 ---------------- */
-    triggerPick() {
-      const el = this.$refs.fileInput;
+    /* which: 'cam' = 拍照（只收图片，系统才会给相机入口）
+              'file' = 选文件（图片 + PDF + Word + 文本） */
+    triggerPick(which) {
+      const el = this.$refs[which === 'cam' ? 'camInput' : 'fileInput'];
       if (!el) return;
-      el.value = '';          // 清空，否则连续选同一张图不会触发 change
+      el.value = '';          // 清空，否则连续选同一个文件不会触发 change
       el.click();
     },
 
