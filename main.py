@@ -196,6 +196,25 @@ def get_conn() -> sqlite3.Connection:
         if "kind" not in cols:
             # 默认 'mistake'：老数据全都是错题，这个默认值正好把它们标记对
             conn.execute("ALTER TABLE mistakes ADD COLUMN kind TEXT NOT NULL DEFAULT 'mistake'")
+        # ── 学习行为字段 ────────────────────────────────────────────────
+        # 在此之前，两张表记的全是「AI 产出了什么」，关于孩子本人一个字段都没有。
+        # 而「虚假精通」恰恰只能从孩子的行为里看出来 —— 所以补上这几列。
+        if "variant_result" not in cols:
+            # 变式题做了没、做对没：'' = 还没做 / right / wrong
+            # 这是全应用唯一能证伪「虚假精通」的信号，之前做完没有任何回写。
+            conn.execute("ALTER TABLE mistakes ADD COLUMN variant_result TEXT NOT NULL DEFAULT ''")
+        if "variant_done_at" not in cols:
+            conn.execute("ALTER TABLE mistakes ADD COLUMN variant_done_at TEXT NOT NULL DEFAULT ''")
+        if "review_due_at" not in cols:
+            # 间隔重复：下次该把这题翻出来看的日期（YYYY-MM-DD）。
+            # 错题本天然适合复习调度，但在这之前所有错题都是「存进去就沉底」。
+            conn.execute("ALTER TABLE mistakes ADD COLUMN review_due_at TEXT NOT NULL DEFAULT ''")
+        if "review_stage" not in cols:
+            # 连续答对了几轮。答对一次进一级、间隔拉长；答错直接归零。
+            conn.execute("ALTER TABLE mistakes ADD COLUMN review_stage INTEGER NOT NULL DEFAULT 0")
+            # 老数据：全部按「今天就该复习」处理 —— 它们从没被复习过，本来就该先过一遍。
+            conn.execute("UPDATE mistakes SET review_due_at=? WHERE review_due_at=''",
+                         (datetime.now().strftime("%Y-%m-%d"),))
         if "source" not in cols:
             # 来自哪里：照片 / 《期中卷》第 3 页 / 文本文件。
             # 一份 PDF 拆出来的多道题会共用同一张页面图，没有这列就说不清为什么
@@ -296,7 +315,19 @@ def row_to_item(row: sqlite3.Row) -> Dict[str, Any]:
     d["ai_ok"] = str(d.get("ai_status", "")).startswith("ok")
     d["kind"] = norm_kind(d.get("kind"))
     d["kind_label"] = KINDS[d["kind"]]
+    # 今天该不该复习这道题（前端据此打标/筛选）
+    d["due"] = bool(d.get("review_due_at")) and str(d["review_due_at"]) <= _today()
     return d
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+# 答对一次就往后推多久（天）。答错直接回到 1 天。
+# 这套间隔取自间隔重复的常规做法（1 → 3 → 7 → 16 → 35），不是精确的 SM-2，
+# 对这个场景够用：错题本的关键是「别沉底」，不是把算法调到最优。
+REVIEW_INTERVALS = [1, 3, 7, 16, 35]
 
 
 # =============================================================================
@@ -946,11 +977,13 @@ def _persist_item(*, raw_image: Optional[bytes], ai: Dict[str, Any],
     with closing(get_conn()) as conn, conn:
         cur = conn.execute(
             "INSERT INTO mistakes (subject, tag, title, orig_path, clean_path, clean_text,"
-            " variant_q, variant_a, ai_status, kind, analysis, source, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " variant_q, variant_a, ai_status, kind, analysis, source, created_at, review_due_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (subject, "", "", "", "", "", "", "", "processing",
              ai.get("kind", "mistake"), "", source,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             # 刚录入的题先放一天，明天进复习队列
+             (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")),
         )
         new_id = int(cur.lastrowid)
 
@@ -2617,9 +2650,14 @@ def health():
 # ---------------------------- 路由：错题列表 ---------------------------------
 @app.get("/api/mistakes")
 def list_mistakes(subject: Optional[str] = None, order: str = "time_desc",
-                  q: Optional[str] = None, kind: Optional[str] = None, limit: int = 500):
-    """题目列表。支持科目筛选、题型筛选（错题/经典题）、关键词搜索、三种排序。"""
+                  q: Optional[str] = None, kind: Optional[str] = None,
+                  due: bool = False, limit: int = 500):
+    """题目列表。支持科目 / 题型 / 待复习筛选、关键词搜索、三种排序。"""
     where, args = [], []
+    if due:
+        # 到期的（含从没排过复习的老数据）
+        where.append("(review_due_at = '' OR review_due_at <= ?)")
+        args.append(_today())
     if subject and subject != "全部":
         where.append("subject = ?")
         args.append(subject)
@@ -2670,6 +2708,10 @@ def stats():
         asked = c2.execute(
             "SELECT COUNT(*) AS n FROM chats WHERE role='user' AND created_at >= ?",
             (week_ago,)).fetchone()["n"]
+    with closing(get_conn()) as c2:
+        due_count = c2.execute(
+            "SELECT COUNT(*) AS n FROM mistakes WHERE review_due_at = '' OR review_due_at <= ?",
+            (_today(),)).fetchone()["n"]
     by_kind = {k: 0 for k in KINDS}
     for r in krows:
         by_kind[norm_kind(r["kind"])] += r["n"]
@@ -2679,7 +2721,7 @@ def stats():
         d[norm_kind(r["kind"])] += r["n"]
     return {"total": total, "by_subject": {r["subject"]: r["n"] for r in rows},
             "by_kind": by_kind, "by_subject_kind": by_subject_kind,
-            "week_asked": asked}
+            "due": due_count, "week_asked": asked}
 
 
 # ---------------------------- 路由：上传错题 ---------------------------------
@@ -2869,6 +2911,60 @@ def make_variant(mid: int, force: bool = False):
         conn.execute("UPDATE mistakes SET variant_q=?, variant_a=? WHERE id=?",
                      (v["variant_question"], v["variant_analysis"], mid))
     return {"ok": True, "cached": False, "variant_q": v["variant_question"], "variant_a": v["variant_analysis"]}
+
+
+# ---------------------------- 路由：变式题结果 / 复习调度 ----------------------
+class ReviewReq(BaseModel):
+    # right = 做对了 / wrong = 做错了 / skip = 还没做（撤回到未记录状态）
+    result: str
+
+
+@app.post("/api/mistakes/{mid}/review")
+def record_review(mid: int, req: ReviewReq):
+    """
+    记录变式题「做没做、做对没做对」，并据此排下一次复习。
+
+    这是全应用**唯一**能证伪「虚假精通」的信号：在此之前，孩子看完 AI 的讲解
+    觉得懂了、和真的能独立做出来，在数据库里长得一模一样。
+    现在的规则很朴素：
+        做对 → 进一级，间隔拉长（1→3→7→16→35 天）
+        做错 → 归零，明天再来
+        还没做 → 撤回记录，但不改变已排的复习
+    """
+    if req.result not in ("right", "wrong", "skip"):
+        raise HTTPException(400, "result 只能是 right / wrong / skip")
+
+    with closing(get_conn()) as conn, conn:
+        row = conn.execute(
+            "SELECT review_stage FROM mistakes WHERE id=?", (mid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "错题不存在")
+        stage = int(row["review_stage"] or 0)
+
+        if req.result == "skip":
+            # 撤销误点：只清结果，不动复习排期
+            conn.execute(
+                "UPDATE mistakes SET variant_result='', variant_done_at='' WHERE id=?", (mid,))
+            new_stage, due = stage, None
+        else:
+            if req.result == "right":
+                new_stage = min(stage + 1, len(REVIEW_INTERVALS) - 1)
+            else:
+                new_stage = 0
+            days = REVIEW_INTERVALS[new_stage]
+            due = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+            conn.execute(
+                "UPDATE mistakes SET variant_result=?, variant_done_at=?,"
+                " review_stage=?, review_due_at=? WHERE id=?",
+                (req.result, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                 new_stage, due, mid))
+
+        r = conn.execute("SELECT * FROM mistakes WHERE id=?", (mid,)).fetchone()
+
+    return {"ok": True, "item": row_to_item(r),
+            "stage": int(r["review_stage"] or 0),
+            "next_due": r["review_due_at"],
+            "interval_days": REVIEW_INTERVALS[int(r["review_stage"] or 0)]}
 
 
 # ---------------------------- 路由：修改科目 ---------------------------------
