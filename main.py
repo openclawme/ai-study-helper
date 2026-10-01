@@ -1998,6 +1998,16 @@ LOGIN_PAGE = """<!DOCTYPE html>
     <input id="cd" type="text" inputmode="numeric" autocomplete="one-time-code"
            maxlength="6" placeholder="6 位数字" style="letter-spacing:.4em;font-size:20px;text-align:center">
     <p id="code-hint" style="margin:8px 0 0;font-size:11.5px;color:#94a3b8;line-height:1.6"></p>
+    <!-- 重发的出口。错误提示写着「请重新获取」，就必须真的给一个能点的地方 ——
+         之前只有提示没有出口，用户只能点回「注册」把密码和邮箱重填一遍。
+         带倒计时是因为服务端有 60 秒节流：不给倒计时，用户点了会撞 429，又一个死胡同。 -->
+    <p style="margin:10px 0 0;text-align:center">
+      <button type="button" id="resend"
+              style="width:auto;margin:0;padding:6px 14px;font-size:12.5px;font-weight:600;
+                     background:#eef0fe;color:#4f46e5;border:0;border-radius:8px">
+        重新发送验证码
+      </button>
+    </p>
   </div>
   <div class="field" id="invite-field" style="display:none">
     <label for="iv">邀请码</label>
@@ -2026,6 +2036,13 @@ LOGIN_PAGE = """<!DOCTYPE html>
   var mailReady = true;
 
   function show(el, on){ el.style.display = on ? '' : 'none'; }
+
+  /* 按钮文字的**唯一来源**。之前提交处理器会在开头记下当时的文字、结尾再写回去，
+     结果把 setMode('verify') 刚设好的「验证并进入」覆盖成了「发送验证码」——
+     跟标签页那个 bug 同一个病根：同一处 DOM 由两个地方写。 */
+  function btnText(m){
+    return {login:'进入', register:'发送验证码', verify:'验证并进入', reset:'发送验证码'}[m] || '确定';
+  }
   function err(msg){ e.textContent=msg; e.style.display='block'; }
 
   /* 一个表单要承担四件事：登录 / 注册发码 / 注册验码 / 重置密码。
@@ -2054,8 +2071,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
     tabLogin.disabled = isReset || m === 'verify';
     tabReg.disabled = isReset || !mailReady;
 
-    var text = {login:'进入', register:'发送验证码', verify:'验证并进入', reset:'发送验证码'}[m];
-    b.textContent = text;
+    b.textContent = btnText(m);
     sub.textContent = {
       login:   '登录后看到的是你自己的错题',
       register:'注册需要邮箱验证，验证通过才算建成',
@@ -2098,10 +2114,62 @@ LOGIN_PAGE = """<!DOCTYPE html>
   }).catch(function(){});
 
   var pending = {username:'', email:''};   // 跨步骤要用的中间状态
+  var resendTimer = null;
+
+  /* 重发倒计时。服务端 VERIFY_RESEND_SEC 秒内不让重发，
+     这里把它显示出来，否则用户点一次吃一个 429。 */
+  function startResendCountdown(sec){
+    var el = document.getElementById('resend');
+    if(resendTimer) clearInterval(resendTimer);
+    var left = sec;
+    function tick(){
+      if(left <= 0){
+        clearInterval(resendTimer); resendTimer = null;
+        el.disabled = false; el.textContent = '重新发送验证码';
+        return;
+      }
+      el.disabled = true;
+      el.textContent = '重新发送（' + left + 's）';
+      left--;
+    }
+    tick();
+    resendTimer = setInterval(tick, 1000);
+  }
+
+  document.getElementById('resend').onclick = async function(){
+    var el = this;
+    if(el.disabled) return;
+    el.disabled = true; el.textContent = '发送中…';
+    try{
+      var reg = (mode === 'verify');
+      var url = reg ? '/api/register/resend' : '/api/reset/request';
+      var body = reg ? {username: pending.username} : {email: pending.email};
+      var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                                body: JSON.stringify(body)});
+      var d = null; try{ d = await r.json(); } catch(_){}
+      if(r.ok){
+        codeHint.textContent = reg
+          ? ('新验证码已发送到 ' + (d.email || '') + '，' + d.ttl_min + ' 分钟内有效。')
+          : ((d && d.msg) || '如果这个邮箱注册过，验证码已经发出去了');
+        cd.value = ''; cd.focus();
+        e.style.display = 'none';
+        startResendCountdown((d && d.resend_after) || 60);
+      } else {
+        err((d && d.detail) || ('重发失败（HTTP ' + r.status + '）'));
+        // 被节流时按剩余时间起倒计时，而不是让按钮一直可点一直失败
+        var m = ((d && d.detail) || '').match(/(\\d+)\\s*秒/);
+        startResendCountdown(m ? Math.min(+m[1], 60) : 5);
+      }
+    }catch(ex){
+      err('网络错误：' + ex.message);
+      el.disabled = false; el.textContent = '重新发送验证码';
+    }
+  };
 
   f.addEventListener('submit', async function(ev){
     ev.preventDefault(); e.style.display='none'; b.disabled=true;
-    var saved = b.textContent; b.textContent='处理中…';
+    var savedMode = mode;
+    b.textContent='处理中…';
     try{
       var url, body;
       if(mode==='login'){
@@ -2124,9 +2192,12 @@ LOGIN_PAGE = """<!DOCTYPE html>
           codeHint.textContent = '验证码已发送到 ' + (d.email || em.value) + '，'
                                + d.ttl_min + ' 分钟内有效。';
           cd.value=''; cd.focus();
+          startResendCountdown(d.resend_after || 60);
         } else if(mode==='reset'){
+          pending.email = em.value.trim();
           codeHint.textContent = (d && d.msg) || '如果这个邮箱注册过，验证码已经发出去了';
           setMode('reset2');
+          startResendCountdown((d && d.resend_after) || 60);
         } else {
           location.href='/'; return;
         }
@@ -2134,7 +2205,10 @@ LOGIN_PAGE = """<!DOCTYPE html>
         err((d&&d.detail)||('失败（HTTP '+r.status+'）'));
       }
     }catch(ex){ err('网络错误：'+ex.message); }
-    b.disabled=false; b.textContent=saved;
+    // 成功且切换了模式时，文字由 setMode 管，这里别碰 —— 否则又把它覆盖回去。
+    // 失败或原地不动时，按**当前** mode 重算（不是开头那个快照，它可能已经过期）。
+    b.disabled = false;
+    if (mode === savedMode) b.textContent = btnText(mode);
   });
 
   /* reset2 = 已发码，等用户填码和新密码。复用同一批输入框，
@@ -2882,7 +2956,8 @@ app = FastAPI(title="我的AI学习助手", version="1.0.0", lifespan=lifespan)
 # /api/signup_policy 也必须在里面：登录页要在**登录之前**调它，
 # 才知道要不要显示邀请码输入框。漏了它，配了邀请码也不会出现那个框。
 PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
-                "/api/reset/request", "/api/reset/do", "/api/signup_policy", "/api/mail_policy",
+                "/api/register/resend", "/api/reset/request", "/api/reset/do",
+                "/api/signup_policy", "/api/mail_policy",
                 "/favicon.ico", "/favicon.svg", "/favicon-192.png",
                 "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"}
 
@@ -3074,7 +3149,58 @@ def api_register(req: RegisterReq, request: Request):
              (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
              now.strftime("%Y-%m-%d %H:%M:%S"), ip))
     return {"ok": True, "need_code": True, "email": mask_email(email),
-            "ttl_min": VERIFY_TTL_MIN}
+            "ttl_min": VERIFY_TTL_MIN, "resend_after": VERIFY_RESEND_SEC}
+
+
+class ResendReq(BaseModel):
+    username: str = ""
+
+
+@app.post("/api/register/resend")
+def api_register_resend(req: ResendReq, request: Request):
+    """
+    重新发送注册验证码。
+
+    **为什么需要这个接口**：验证码 10 分钟过期，过期后用户看到的是
+    「请重新获取」—— 光有提示没有出口，他就只能点回「注册」把密码和邮箱
+    重填一遍。这个接口只凭用户名就能重发，因为要用的资料（邮箱、口令哈希）
+    服务端本来就存着，没必要让客户端再交一次。
+
+    只能发给「待验证记录里那个邮箱」，改不了收件地址 —— 否则它就成了
+    一个任意发信接口。
+    """
+    ip = _client_ip(request)
+    if _login_locked(ip):
+        raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
+    if not MAIL_READY:
+        raise HTTPException(503, "服务器还没有配置邮件服务")
+    name = (req.username or "").strip().lower()
+
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT * FROM signups WHERE username=?", (name,)).fetchone()
+    # 不区分「没这条记录」和「用户名不对」：这条接口是公开的
+    if not row:
+        raise HTTPException(404, "没有待验证的注册，请重新填写注册信息")
+
+    wait = mail_throttle("signup:" + name)
+    if wait:
+        raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
+    ok, msg = _send_code(row["email"], name, code, "signup")
+    if not ok:
+        raise HTTPException(502, f"验证码发送失败：{msg}")
+
+    now = datetime.now()
+    with closing(get_conn()) as conn, conn:
+        # 重发等于作废旧码，并把试错次数清零（否则用户试错几次后重发也没用）
+        conn.execute(
+            "UPDATE signups SET code_hash=?, expires_at=?, sent_at=?, attempts=0 WHERE id=?",
+            (_code_hash(name, code),
+             (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+             now.strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+    return {"ok": True, "email": mask_email(row["email"]), "ttl_min": VERIFY_TTL_MIN,
+            "resend_after": VERIFY_RESEND_SEC}
 
 
 @app.post("/api/register/verify")
