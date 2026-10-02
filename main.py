@@ -3454,6 +3454,23 @@ def paper():
     return paper_response(PAPER_FILE)
 
 
+@app.get("/paper.docx", include_in_schema=False)
+def paper_docx():
+    """
+    论文的 Word 版，方便直接下载去打印或投稿。
+    缓存禁用：每次 存档.sh 都会重新生成，改完刷新就能拿到新的，不用清缓存。
+    """
+    path = os.path.join(PAPER_DIR, "论文.docx")
+    if not os.path.exists(path):
+        raise HTTPException(404, "Word 版还没生成，先在服务器上跑一次 存档.sh")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename="我的AI学习助手-探究论文.docx",   # filename= 会自动做 RFC5987 编码，中文名在浏览器里不乱码
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
 @app.get("/paper/versions", include_in_schema=False)
 def paper_version_list():
     """
