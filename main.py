@@ -29,6 +29,7 @@ import base64
 import hashlib
 import hmac
 import io
+import html
 import json
 import os
 import re
@@ -3418,21 +3419,91 @@ def site_icon(request: Request):
 # 而一旦公开，就等于给这台机器又加了一个谁都扫得到的入口。
 #
 # 文件默认放在仓库**外面**（/home/admin/paper/），免得论文的中间稿混进应用仓库；
-# 要挪位置就设 PAPER_FILE 环境变量。
-PAPER_FILE = os.environ.get("PAPER_FILE") or os.path.join(
-    os.path.dirname(BASE_DIR), "paper", "论文.html")
+# 要挪位置就设 PAPER_DIR 环境变量。
+PAPER_DIR = os.environ.get("PAPER_DIR") or os.path.join(
+    os.path.dirname(BASE_DIR), "paper")
+PAPER_FILE = os.path.join(PAPER_DIR, "论文.html")
+PAPER_VERSIONS = os.path.join(PAPER_DIR, "versions")
+PAPER_MANIFEST = os.path.join(PAPER_VERSIONS, "manifest.json")
+
+
+def read_manifest() -> list:
+    """版本清单。坏了就当空的 —— 论文本身比清单重要，不能因为清单读不出来就连论文也看不了。"""
+    try:
+        with open(PAPER_MANIFEST, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def paper_response(path: str):
+    # 和首页一样禁缓存：改完论文刷新就能看到，不用清浏览器缓存
+    return FileResponse(
+        path,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/paper", include_in_schema=False)
 def paper():
+    """最新版。"""
     if not os.path.exists(PAPER_FILE):
         raise HTTPException(404, f"论文文件不在服务器上：{PAPER_FILE}")
-    # 和首页一样禁缓存：改完论文刷新就能看到，不用清浏览器缓存
-    return FileResponse(
-        PAPER_FILE,
-        media_type="text/html; charset=utf-8",
-        headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
-    )
+    return paper_response(PAPER_FILE)
+
+
+@app.get("/paper/versions", include_in_schema=False)
+def paper_version_list():
+    """
+    版本清单页。论文改了很多轮，老师和评委想看"某一轮是什么样"时得有地方找。
+
+    放在 /paper/v{n} **之前**注册：否则 "versions" 会被当成版本号去匹配。
+    """
+    rows = []
+    for it in sorted(read_manifest(), key=lambda x: x.get("v", 0), reverse=True):
+        v = it.get("v")
+        rows.append(
+            f'<li><a href="/paper/v{v}">v{v}</a>'
+            f'<span class="d">{html.escape(str(it.get("date", "")))}</span>'
+            f'<span class="n">{html.escape(str(it.get("note", "")))}</span></li>'
+        )
+    body = "\n".join(rows) or '<li class="empty">还没有存档。第一个版本存下来之后，这里就会出现。</li>'
+    return HTMLResponse(f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>论文版本</title><style>
+ body{{margin:0;padding:32px 20px;background:#FAFAF8;color:#1B1A18;
+      font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.9}}
+ .w{{max-width:640px;margin-inline:auto}}
+ h1{{font-size:1.25rem;margin:0 0 6px}}
+ p.sub{{color:#8A867E;font-size:.85rem;margin:0 0 26px}}
+ ul{{list-style:none;padding:0;margin:0}}
+ li{{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;
+     padding:13px 16px;margin-bottom:8px;background:#fff;border:1px solid #E2DFD8;border-radius:6px}}
+ li.empty{{color:#8A867E;font-size:.9rem}}
+ a{{font-weight:700;color:#B33A2B;text-decoration:none;font-size:1.02rem;min-width:2.6rem}}
+ a:hover{{text-decoration:underline}}
+ .d{{color:#8A867E;font-size:.8rem;font-variant-numeric:tabular-nums}}
+ .n{{flex:1;min-width:12rem;color:#5E5B55;font-size:.88rem}}
+ .back{{display:inline-block;margin-top:22px;font-size:.9rem}}
+</style></head><body><div class="w">
+<h1>论文版本</h1>
+<p class="sub">「我的AI学习助手」探究论文 · 每一轮改动都存一版，随时可以回看</p>
+<ul>{body}</ul>
+<a class="back" href="/paper">→ 看最新版</a>
+</div></body></html>""")
+
+
+@app.get("/paper/v{ver}", include_in_schema=False)
+def paper_by_version(ver: str):
+    """按版本号访问历史存档，例如 /paper/v1。"""
+    if not ver.isdigit():
+        raise HTTPException(404, "版本号只能是数字")
+    path = os.path.join(PAPER_VERSIONS, f"v{ver}.html")
+    if not os.path.exists(path):
+        raise HTTPException(404, f"没有 v{ver} 这个版本，去 /paper/versions 看有哪些")
+    return paper_response(path)
 
 
 # ---------------------------- 路由：首页 -------------------------------------
