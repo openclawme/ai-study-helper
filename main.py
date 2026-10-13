@@ -228,6 +228,13 @@ def get_conn() -> sqlite3.Connection:
                          (datetime.now().strftime("%Y-%m-%d"),))
         if "email" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
             conn.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+        # 管理后台要显示「最后登录」。老数据补不出来（以前没记），留空串，
+        # 页面上显示成「—」，别显示成 1970 年。
+        if "last_login_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT NOT NULL DEFAULT ''")
+        if "must_change_pw" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
+            # 老数据一律 0：他们的口令是本人设的，没有"被重置"这回事
+            conn.execute("ALTER TABLE users ADD COLUMN must_change_pw INTEGER NOT NULL DEFAULT 0")
         if "user_id" not in cols:
             # 老库里的题还没有归属。留 0，等第一个注册的账号来认领
             # （见 /api/register）—— 直接猜一个用户塞进去反而更糟。
@@ -242,6 +249,9 @@ def get_conn() -> sqlite3.Connection:
             # 这是事实不是猜测。不回填的话，老题在详情页会缺一行来源，看着像丢了数据。
             conn.execute("UPDATE mistakes SET source='照片' WHERE source=''")
         conn.commit()
+    # 管理后台的两张表：新库老库都要有，且不属于上面那个「5 张表齐不齐」的判断
+    _create_admin_tables(conn)
+    conn.commit()
     return conn
 
 
@@ -255,7 +265,11 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             username   TEXT    NOT NULL UNIQUE,
             pw_hash    TEXT    NOT NULL,            -- pbkdf2_sha256$轮数$盐$哈希
             email      TEXT    NOT NULL DEFAULT '', -- 找回密码用；注册时已验证过
-            created_at TEXT    NOT NULL
+            created_at TEXT    NOT NULL,
+            last_login_at TEXT NOT NULL DEFAULT '',  -- 后台的「活跃度」看这一列
+            -- 管理员重置过口令 → 置 1。此时除了改密码/登出，其它接口一律拦住，
+            -- 逼他先把临时口令换成自己的。改完自动清 0。
+            must_change_pw INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -349,7 +363,37 @@ def _create_schema(conn: sqlite3.Connection) -> None:
                      "COALESCE((SELECT m.user_id FROM mistakes m WHERE m.id = chats.mistake_id), 0)")
     # 列一定存在了，现在才能建索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_owner ON chats(user_id, id)")
+    _create_admin_tables(conn)
     conn.commit()
+
+
+def _create_admin_tables(conn) -> None:
+    """
+    管理后台用的两张表。**无条件执行**（不用 IF NOT EXISTS 之外的条件）——
+    get_conn 里那个「表齐不齐」的判断只数原来 5 张表，新表加进去会把它算乱。
+
+    llm_usage 从装上那天才开始记：LLM 调用量在此之前的**补不回来**（没留过痕）。
+    后台页面上会标明统计起始日，活动度另用 mistakes/chats 的 created_at 算。
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_usage (
+          id      INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          day     TEXT    NOT NULL,
+          kind    TEXT    NOT NULL,
+          calls   INTEGER NOT NULL DEFAULT 0
+        )""")
+    # 同一个用户、同一天、同一种调用只留一行，靠它做 UPSERT 累加
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_u ON llm_usage(user_id, day, kind)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_log (
+          id     INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts     TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target TEXT NOT NULL DEFAULT '',
+          detail TEXT NOT NULL DEFAULT ''
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adminlog_ts ON admin_log(ts DESC)")
 
 
 def init_db() -> None:
@@ -745,6 +789,7 @@ def call_deepseek(image_path: str, subject: str) -> Dict[str, Any]:
                 timeout=AI_HTTP_TIMEOUT,      # 非流式调用没法中途打断，只能靠 socket 超时兜住
                 **_think_kwargs(), **kwargs,
             )
+            _llm_tick("vision")       # 后台的调用量统计
             ch = resp.choices[0]
             data = extract_json(ch.message.content)
             if data:
@@ -1016,6 +1061,7 @@ def call_split_page(page: Dict[str, Any]) -> List[Dict[str, Any]]:
                 temperature=AI_TEMPERATURE, max_tokens=SPLIT_MAX_TOKENS,
                 timeout=AI_HTTP_TIMEOUT, **_think_kwargs(), **kwargs,
             )
+            _llm_tick("split")
             ch = resp.choices[0]
             data = extract_json(ch.message.content)
             if data is not None:
@@ -1153,6 +1199,7 @@ def call_variant(it: Dict[str, Any]) -> Dict[str, str]:
                 response_format={"type": "json_object"} if attempt == 1 else None,
                 **_think_kwargs(),
             )
+            _llm_tick("variant")
             data = extract_json(resp.choices[0].message.content)
             if data and (data.get("variant_question") or data.get("variant_analysis")):
                 return {"variant_question": str(data.get("variant_question", "")).strip(),
@@ -1731,6 +1778,48 @@ LOGIN_MAX_FAIL = 8                    # 单 IP 窗口内允许的失败次数
 LOGIN_WINDOW = 600                    # 限流窗口（秒）
 PBKDF2_ROUNDS = 120_000               # 每次校验约 50ms，本身就是一道暴力破解门槛
 
+# ── 管理后台（/admin） ──────────────────────────────────────────────────────
+# 它和用户登录是**两套完全独立的凭据**：用户口令存在 users 表里，管理员口令只在
+# 环境变量里。这样管理员不需要注册一个账号，用户会话被偷也不等于后台被偷。
+#
+# **不设或短于 12 字符 = 后台整个关闭**（/admin 显示未启用，接口一律 404）。
+# 绝不设默认口令 —— 公网机器上开一个默认口令的后台，第一个晚上就会被扫描器拿走。
+# 上了 HTTPS 之后设成 1。设了之后浏览器只走加密连接回传 Cookie。
+# **明文 HTTP 下千万别开** —— 开了浏览器就不回传，登录会直接失效。
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "").strip() in ("1", "true", "yes", "on")
+
+ADMIN_PASS = os.getenv("ADMIN_PASS", "").strip()
+ADMIN_MIN_LEN = 12
+ADMIN_COOKIE = "cuoti_admin"
+ADMIN_TTL = 12 * 3600                 # 12 小时。比用户的 14 天短得多，这是有意的
+START_TS = time.time()                # 进程启动时刻，后台用来算运行时长
+# 被重置过口令的账号，只能碰这三个接口 —— 改密码、看会话、登出。
+# 别的全拦住，直到他把临时口令换成自己的。
+MUST_CHANGE_ALLOW = {"/api/password", "/api/session", "/api/logout"}
+
+ADMIN_PAGE_FILE = os.path.join(BASE_DIR, "admin.html")
+# 管理员在后台改过口令之后，哈希存这儿。
+# **为什么不写回 ~/.cuoti.env**：那个文件里还有 DeepSeek key 和邮箱授权码，
+# 让一个网页请求去改写它是拿全部凭据冒险。而且改完不用重启。
+# 忘了口令就删掉这个文件 —— 自动回到环境变量里那把。
+ADMIN_HASH_FILE = os.path.join(BASE_DIR, ".admin_pass")
+
+# 口令没配时给一张纯提示页。**不含任何表单、任何数据** —— 连"后台长什么样"
+# 都不告诉匿名访问者。
+ADMIN_DISABLED_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>管理后台未启用</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#0f172a;color:#e2e8f0;padding:24px;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.b{max-width:420px;line-height:1.8;font-size:14px}
+h1{font-size:17px;margin:0 0 10px}code{background:#1e293b;padding:2px 6px;border-radius:5px;font-size:13px}
+p{color:#94a3b8;margin:0 0 8px}</style></head><body><div class="b">
+<h1>管理后台未启用</h1>
+<p>服务器上没有配置 <code>ADMIN_PASS</code>，或者它短于 12 位 —— 这两种情况都按「未启用」处理。</p>
+<p>要启用：把 <code>ADMIN_PASS=...</code>（至少 12 位）写进 <code>~/.cuoti.env</code>，然后重启服务。</p>
+</div></body></html>"""
+
 _secret: bytes = b""
 _login_fails: Dict[str, list] = {}
 _login_lock = threading.Lock()
@@ -1819,6 +1908,118 @@ def current_uid() -> int:
     return _uid.get()
 
 
+# ── 管理员会话 ──────────────────────────────────────────────────────────────
+# 签名密钥在 _secret 后面接一段固定盐。这是关键：用户 token 的签名用 _secret，
+# 管理员用 _secret+b"|admin"，**同一段文本两边算出来的签名不同**，所以
+# 拿一个普通用户的 Cookie 去冒充管理员是算不过去的。
+
+_admin_pw_hash: str = ""     # 启动时算一次，进程里只留哈希，明文只在环境变量里
+
+
+def admin_enabled() -> bool:
+    """能不能进后台。**看的是已经算好的哈希**，不是环境变量本身 —— 这样
+    在后台改过口令之后，即使环境变量的值已经过时也照样能用。"""
+    return bool(_admin_pw_hash)
+
+
+def admin_load_password() -> str:
+    """
+    取当前管理员口令的哈希。优先用哈希文件（后台改过的），否则用环境变量。
+
+    返回空串 = 后台未启用（fail closed，绝不回落成默认口令）。
+    """
+    try:
+        if os.path.exists(ADMIN_HASH_FILE):
+            with open(ADMIN_HASH_FILE, encoding="utf-8") as f:
+                saved = f.read().strip()
+            if saved:
+                return saved
+    except OSError:
+        pass
+    if len(ADMIN_PASS) >= ADMIN_MIN_LEN:
+        return hash_password(ADMIN_PASS)
+    return ""
+
+
+def _admin_pv() -> str:
+    """
+    口令版本号，掺进管理员令牌的签名里。
+
+    这样一改口令，**所有**已发出的管理员令牌立刻失效（包括改口令的那次请求
+    自己发的那个）—— 否则改了口令，偷到旧 Cookie 的人还能接着用 12 小时。
+    """
+    return hashlib.sha256(_admin_pw_hash.encode()).hexdigest()[:12]
+
+
+def _admin_secret() -> bytes:
+    """
+    管理员签名密钥 = HMAC(主密钥, "admin-session-v1")。
+
+    不直接用 _secret：万一日后 .session_secret 落到别人手里，那把钥匙也**不能
+    直接拿来签管理员 token** —— 他得再推一次 HMAC 才知道该用什么密钥。
+    """
+    return hmac.new(_secret, b"admin-session-v1", hashlib.sha256).digest()
+
+
+def check_admin_password(pw: str) -> bool:
+    """
+    口令比对走 pbkdf2（12 万轮，约 50ms）。
+
+    **故意不在明文上做 compare_digest**：那样每次尝试是亚微秒级，限流就成了
+    唯一门槛，机器可以打得飞快。走哈希等于给每次尝试强加 50ms，本身就是一道
+    暴力破解门槛 —— 和用户登录一个道理。
+    """
+    if not admin_enabled() or not _admin_pw_hash:
+        return False
+    return verify_password(pw or "", _admin_pw_hash)
+
+
+def make_admin_token() -> str:
+    exp = str(int(time.time()) + ADMIN_TTL)
+    sig = hmac.new(_admin_secret(), f"admin.{exp}.{_admin_pv()}".encode(),
+                   hashlib.sha256).hexdigest()
+    return f"admin.{exp}.{sig}"
+
+
+def verify_admin_token(tok: Optional[str]) -> bool:
+    parts = (tok or "").split(".")
+    if len(parts) != 3 or parts[0] != "admin":
+        return False
+    try:
+        if int(parts[1]) < time.time():
+            return False
+    except ValueError:
+        return False
+    want = hmac.new(_admin_secret(), f"admin.{parts[1]}.{_admin_pv()}".encode(),
+                    hashlib.sha256).hexdigest()
+    return hmac.compare_digest(parts[2], want)
+
+
+def is_admin_request(request: Request) -> bool:
+    """这个请求带的是不是有效的管理员 Cookie。"""
+    return admin_enabled() and verify_admin_token(
+        request.cookies.get(ADMIN_COOKIE))
+
+
+def _llm_tick(kind: str, uid: Optional[int] = None) -> None:
+    """
+    给一次 LLM 调用记一笔（后台的「DeepSeek 调用量」就是它攒出来的）。
+
+    计数失败**绝不能影响主流程** —— 孩子正在等讲解，不能因为记个数失败就报错，
+    所以整段吞异常。宁可少记一笔，不可答不出来。
+    """
+    try:
+        u = current_uid() if uid is None else uid
+        today = datetime.now().strftime("%Y-%m-%d")
+        with closing(get_conn()) as conn, conn:
+            conn.execute(
+                "INSERT INTO llm_usage (user_id, day, kind, calls) VALUES (?,?,?,1) "
+                "ON CONFLICT(user_id, day, kind) DO UPDATE SET calls = calls + 1",
+                (u, today, kind))
+    except Exception:
+        pass
+
+
 def _code_hash(username: str, code: str) -> str:
     """
     验证码只存哈希，不存明文。
@@ -1899,7 +2100,23 @@ def mask_email(addr: str) -> str:
 
 
 def _client_ip(request) -> str:
-    return request.client.host if request.client else "unknown"
+    """
+    真实客户端 IP（登录限流按它分桶）。
+
+    ⚠️ 上了 HTTPS 之后前面会站一个 Caddy，那时 request.client.host **永远是
+    127.0.0.1** —— 所有访客挤进同一个桶：要么管理员自己打错几次就把全世界锁死，
+    要么限流完全形同虚设。所以必须看 X-Forwarded-For。
+
+    但**绝不能无条件信这个头**：不经过代理时谁都能伪造它，随手换个值就绕开了
+    限流。规则是「只有直连方是本机时才采信」—— 也就是只在真的架了本机反代时生效。
+    """
+    peer = request.client.host if request.client else ""
+    if peer in ("127.0.0.1", "::1"):
+        fwd = request.headers.get("x-forwarded-for", "")
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first
+    return peer or "unknown"
 
 
 def _login_locked(ip: str) -> bool:
@@ -2777,6 +2994,7 @@ def call_tutor_stream(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]
                                        write=30.0, pool=10.0),
                 **_think_kwargs(profile),
             )
+            _llm_tick("chat")
             parser = AnimFenceParser()
             msf = ManualStepFilter()
             last_chunk = time.time()
@@ -2860,6 +3078,7 @@ def call_tutor(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]], ques
                 timeout=AI_HTTP_TIMEOUT,
                 **_think_kwargs(profile),
             )
+            _llm_tick("chat")
             ch = resp.choices[0]
             text = (ch.message.content or "").strip()
             if text:
@@ -2889,8 +3108,20 @@ async def lifespan(app: FastAPI):
     init_db()
 
     # 初始化会话签名密钥。口令不再有全局的 —— 每个账号存自己的哈希。
-    global _secret
+    global _secret, _admin_pw_hash
     _secret = _load_secret()
+    # 管理员口令在这里算一次哈希（之后进程里只有哈希，明文只在环境变量里）。
+    # 没配或太短就留空，后台整个关闭。
+    _admin_pw_hash = admin_load_password()
+    if admin_enabled() and not os.path.exists(ADMIN_HASH_FILE):
+        # 用的是环境变量那把：立刻落一份哈希，之后就统一走文件了。
+        # 好处是口令只在环境变量里出现一次，进程里始终只有哈希。
+        try:
+            with open(ADMIN_HASH_FILE, "w", encoding="utf-8") as f:
+                f.write(_admin_pw_hash)
+            os.chmod(ADMIN_HASH_FILE, 0o600)
+        except OSError as e:
+            print(f"  ⚠️  管理员口令哈希落盘失败（不影响本次运行）：{e}", flush=True)
     with closing(get_conn()) as _c:
         _users = _c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
 
@@ -2911,6 +3142,9 @@ async def lifespan(app: FastAPI):
          else ("  注册门槛 ：  需要邀请码（SIGNUP_CODE）" if SIGNUP_CODE
                else "  注册门槛 ：  开放注册（设 SIGNUP_CODE 可加邀请码）")),
         f"  免登录期 ：  {SESSION_TTL // 86400} 天",
+        (f"  管理后台 ：  已启用   http://<本机IP>:8000/admin"
+         if admin_enabled() else
+         "  管理后台 ：  未启用（设 ADMIN_PASS，至少 12 位，再重启）"),
         "  公网访问 ：  需在阿里云安全组放行 TCP 8000",
         "=" * 66,
     ]
@@ -2954,6 +3188,9 @@ app = FastAPI(title="我的AI学习助手", version="1.0.0", lifespan=lifespan)
 PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/api/register/resend", "/api/reset/request", "/api/reset/do",
                 "/api/signup_policy", "/api/mail_policy",
+                # 管理后台：页面本身要能打开（否则登录表单都加载不出来），
+                # 登录/登出接口也要能不带 Cookie 调。数据接口在下面单独把关。
+                "/admin", "/api/admin/login", "/api/admin/logout",
                 "/favicon.ico", "/favicon.svg", "/favicon-192.png",
                 "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"}
 
@@ -2967,7 +3204,40 @@ async def auth_guard(request: Request, call_next):
     path = request.url.path
     if path in PUBLIC_PATHS:
         return await call_next(request)
+
+    # ── 管理后台走**另一条**鉴权线，和用户会话完全隔离 ──────────────────
+    # 到这里 /api/admin/login 和 /api/admin/logout 已经被上面放行了，
+    # 剩下的 /api/admin/* 必须带有效的管理员 Cookie。
+    #
+    # 未启用（没配 ADMIN_PASS）和没登录返回**同一个 404**：扫描器分不清
+    # 「这里有个后台但你没登录」和「这里什么都没有」。前端把 404 当作需要登录。
+    if path.startswith("/api/admin/"):
+        if is_admin_request(request):
+            # 显式把 uid 钉成 -1：管理员**没有**用户身份。万一哪个管理接口顺手
+            # 写了 current_uid()，-1 匹配不到任何行，立刻表现为空数据；而留在
+            # 默认值 0 的话，会**悄悄读到 user_id=0 的老数据**，那更难发现。
+            _uid.set(-1)
+            return await call_next(request)
+        return JSONResponse({"detail": "需要管理员登录"}, status_code=404)
+
     uid = verify_token(request.cookies.get(SESSION_COOKIE))
+    if uid and path.startswith("/api/"):
+        # 这一次查库同时管两件事：
+        #  ① 账号被管理员删掉之后，那个 Cookie 在**签名上仍然有效**（verify_token
+        #     只看签名和过期，不查库），能继续用到 14 天后。不拦的话他可以接着
+        #     上传、接着烧 key，往一个已经不存在的 user_id 里写数据。
+        #  ② 管理员重置过口令的账号，除了改密码/登出，别的接口一律拦住 ——
+        #     否则"临时口令"只是个摆设，他照样能正常用。
+        # 只对 /api/ 查这一下：/media/* 本来就靠归属查询返回 404，不必多查。
+        with closing(get_conn()) as _c:
+            _row = _c.execute("SELECT must_change_pw FROM users WHERE id=?",
+                              (uid,)).fetchone()
+        if not _row:
+            uid = 0
+        elif _row["must_change_pw"] and path not in MUST_CHANGE_ALLOW:
+            return JSONResponse(
+                {"detail": "管理员重置了你的密码，请先设置自己的新密码",
+                 "must_change_pw": True}, status_code=403)
     if uid:
         # 写进 ContextVar，供各 endpoint 的 current_uid() 读取。
         # 每个请求一个独立的 context，不会串。
@@ -3029,6 +3299,15 @@ MIN_PW_LEN = 6
 
 
 def _session_response(uid: int, extra: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    # 记「最后登录」。放在这里而不是各个登录接口里：登录成功和注册验证成功
+    # 都从这一个出口发会话，一处覆盖两种入口，将来加第三种入口也不会漏。
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute("UPDATE users SET last_login_at=? WHERE id=?",
+                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid))
+    except Exception:
+        pass
+
     body = {"ok": True, "ttl": SESSION_TTL}
     if extra:
         body.update(extra)
@@ -3038,6 +3317,7 @@ def _session_response(uid: int, extra: Optional[Dict[str, Any]] = None) -> JSONR
     resp.set_cookie(
         SESSION_COOKIE, make_token(uid),
         max_age=SESSION_TTL, httponly=True, samesite="lax", path="/",
+        secure=COOKIE_SECURE,
     )
     return resp
 
@@ -3359,7 +3639,9 @@ def api_change_password(req: PwReq):
         time.sleep(0.4)
         raise HTTPException(401, "原密码不正确")
     with closing(get_conn()) as conn, conn:
-        conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(req.new), uid))
+        # 顺手清 must_change_pw：管理员重置出来的临时口令，改完就算交差了
+        conn.execute("UPDATE users SET pw_hash=?, must_change_pw=0 WHERE id=?",
+                     (hash_password(req.new), uid))
     return {"ok": True}
 
 
@@ -3375,10 +3657,12 @@ def api_session():
     """前端用它拿当前用户名显示在顶栏。"""
     uid = current_uid()
     with closing(get_conn()) as conn:
-        row = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+        row = conn.execute("SELECT username, must_change_pw FROM users WHERE id=?", (uid,)).fetchone()
     return {"ok": True, "ttl": SESSION_TTL,
             "username": row["username"] if row else "",
-            "user_id": uid}
+            "user_id": uid,
+            # 管理员重置过口令 → 前端必须弹一个不能关的改密码框
+            "must_change_pw": bool(row["must_change_pw"]) if row else False}
 
 
 # ---------------------------- 路由：站点图标 ---------------------------------
@@ -3443,6 +3727,25 @@ def paper_response(path: str):
         path,
         media_type="text/html; charset=utf-8",
         headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/admin", include_in_schema=False)
+def admin_page():
+    """
+    管理后台页面。**在 PUBLIC_PATHS 里** —— 否则登录表单都加载不出来。
+    这没问题：页面本身不含任何数据，所有数据都在 /api/admin/* 后面把着。
+    """
+    if not admin_enabled():
+        return HTMLResponse(ADMIN_DISABLED_PAGE, status_code=503,
+                            headers={"Cache-Control": "no-store"})
+    if not os.path.exists(ADMIN_PAGE_FILE):
+        raise HTTPException(404, f"后台页面不在服务器上：{ADMIN_PAGE_FILE}")
+    return FileResponse(
+        ADMIN_PAGE_FILE, media_type="text/html; charset=utf-8",
+        # 面板内容不该被搜索引擎收录，也不该被浏览器缓存
+        headers={"Cache-Control": "no-store, must-revalidate",
+                 "X-Robots-Tag": "noindex, nofollow"},
     )
 
 
@@ -3557,14 +3860,23 @@ def serve_animation(name: str):
     if not ANIM_NAME_RE.match(name):
         raise HTTPException(404, "动画不存在")
     # 文件名形如 anim_m{错题id}_{时间戳}.html —— 从里面取出 mid 校验归属。
-    # 不校验的话，登录用户遍历一下就能看别人题目的动画讲解。
+    # 不校验的话，登录用户遍历一下就能看别人的动画讲解。
     try:
         mid = int(name.split("_")[1][1:])
     except (IndexError, ValueError):
         raise HTTPException(404, "动画不存在")
     with closing(get_conn()) as conn:
-        own = conn.execute("SELECT 1 FROM mistakes WHERE id=? AND user_id=?",
-                           (mid, current_uid())).fetchone()
+        if mid == GENERAL_CHAT_ID:
+            # ⚠️ 自由问答里的动画：0 不是错题 id，而是「不属于任何一道题」的哨兵，
+            #    mistakes 表里根本没有 id=0 的行 —— 原先一律走下面那条查询，
+            #    结果这些动画**生成了却永远打不开**（点开 404、页面内预览也白屏）。
+            #    归属只能反查 chats：那一行的 anim_url 精确指向这个文件。
+            #    同样带 user_id 过滤，所以「遍历文件名看别人动画」这条路依然堵死。
+            own = conn.execute("SELECT 1 FROM chats WHERE anim_url=? AND user_id=?",
+                               (f"/anim/{name}", current_uid())).fetchone()
+        else:
+            own = conn.execute("SELECT 1 FROM mistakes WHERE id=? AND user_id=?",
+                               (mid, current_uid())).fetchone()
     if not own:
         raise HTTPException(404, "动画不存在")
     path = os.path.join(ANIM_DIR, name)
@@ -3592,6 +3904,539 @@ def serve_animation(name: str):
 @app.get("/api/health")
 def health():
     return {"ok": True, "model": MODEL_NAME, "ai_ready": api_key_ready(), "subjects": SUBJECTS}
+
+
+# ---------------------------- 路由：管理后台 ---------------------------------
+# 设计要点：
+#   · 凭据独立（环境变量 ADMIN_PASS），不占 users 表 —— 管理员不是"某个用户"
+#   · 签名密钥独立（_admin_secret），用户会话换不成管理员会话
+#   · 未启用和未登录返**同一个 404**，扫描器看不出这里有没有后台
+#   · 改状态的接口额外要求 X-Admin: 1 —— 跨站带自定义头会触发 CORS 预检，
+#     而本服务没开 CORS，预检必失败。这是 samesite=lax 之外的第二道 CSRF 防线。
+
+class AdminLoginReq(BaseModel):
+    password: str = ""
+
+
+class AdminDeleteReq(BaseModel):
+    confirm: str = ""
+
+
+class AdminPwReq(BaseModel):
+    old_password: str = ""
+    new_password: str = ""
+
+
+class AdminResetPwReq(BaseModel):
+    password: str = ""          # 留空 = 由后台生成一个随机的
+
+
+def _admin_audit(action: str, target: str = "", detail: str = "",
+                 ip: str = "", ok: bool = True) -> None:
+    """
+    管理操作留痕。**成败都写** —— 面板在公网，出事之后这张表是唯一能回答
+    「谁、什么时候、删了什么」的东西。写失败不能影响主流程，但要打日志。
+    """
+    try:
+        with closing(get_conn()) as conn, conn:
+            conn.execute(
+                "INSERT INTO admin_log (ts, action, target, detail) VALUES (?,?,?,?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), action, target,
+                 (f"ip={ip} ok={int(ok)} {detail}")[:500]))
+    except Exception as e:
+        print(f"  ⚠️  管理审计写入失败：{e}", flush=True)
+
+
+def _require_admin_csrf(request: Request) -> None:
+    if request.headers.get("x-admin") != "1":
+        raise HTTPException(403, "缺少 X-Admin 头")
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_file(follow_symlinks=False):
+                        total += e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+_cpu_prev = {"ticks": 0, "t": 0.0}
+_cpu_lock = threading.Lock()
+
+
+def _proc_stats() -> Dict[str, Any]:
+    """
+    零依赖取系统指标（本机没装 psutil，也不为这个面板引一个新依赖）。
+
+    CPU 百分比**必须两次采样** —— /proc 只给累计滴答。间隔太近或太久就不报，
+    宁可显示 null 也不拿一个十秒前的增量冒充"现在"。
+    """
+    out: Dict[str, Any] = {"pid": os.getpid(), "cpu_pct": None}
+    try:
+        mi = {}
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                k, _, v = ln.partition(":")
+                mi[k] = int(v.split()[0]) * 1024          # kB -> B
+        total, avail = mi.get("MemTotal", 0), mi.get("MemAvailable", 0)
+        out["mem"] = {
+            "total": total, "available": avail,
+            "used_pct": round((total - avail) / total * 100, 1) if total else 0.0,
+            "swap_total": mi.get("SwapTotal", 0), "swap_free": mi.get("SwapFree", 0),
+        }
+    except Exception:
+        out["mem"] = None
+
+    out["rss"] = out["ticks"] = out["threads"] = 0
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        out["rss"] = int(open("/proc/self/statm").read().split()[1]) * page
+        raw = open("/proc/self/stat").read()
+        # ⚠️ comm 字段可能有空格和括号，必须从**最后一个 ')'** 之后开始切列
+        f = raw[raw.rfind(")") + 2:].split()
+        out["ticks"] = int(f[11]) + int(f[12])            # utime + stime
+        out["threads"] = int(f[17])
+    except Exception:
+        pass
+
+    hz = os.sysconf("SC_CLK_TCK") or 100
+    now = time.time()
+    with _cpu_lock:
+        pt, ptt = _cpu_prev["ticks"], _cpu_prev["t"]
+        _cpu_prev["ticks"], _cpu_prev["t"] = out["ticks"], now
+    if pt and 1.0 <= now - ptt <= 30.0:
+        out["cpu_pct"] = round((out["ticks"] - pt) / hz / (now - ptt) * 100, 1)
+    out["cpu_seconds"] = round(out["ticks"] / hz, 1)
+    try:
+        out["load"] = list(os.getloadavg())
+    except Exception:
+        out["load"] = None
+    out["cpu_count"] = os.cpu_count() or 1
+    out["uptime_sec"] = int(now - START_TS)
+    return out
+
+
+_NAME_PAT = {
+    "origin": re.compile(r"^original_(\d+)\.jpg$"),
+    "clean": re.compile(r"^clean_(\d+)\.jpg$"),
+    "thumb": re.compile(r"^thumb_(\d+)\.jpg$"),
+    "anim": re.compile(r"^anim_m(\d+)_\d+\.html$"),
+}
+
+
+def _scan_static_by_owner(conn) -> Tuple[Dict[int, Dict[str, int]], Dict[str, Any]]:
+    """
+    按**目录扫**算每个用户占多少，而不是把 mistakes 里的路径加起来。理由：
+    · thumb 是按需生成的缓存，DB 里根本没这个字段；
+    · anim 只在 chats.anim_url 里，而清对话会删文件，DB 和磁盘本来就对不上。
+
+    按 DB 算的话，磁盘上那些孤儿永远看不见 —— 盘只会涨，不会有人知道是谁的。
+
+    ⚠️ anim_m0_* 会被归到孤儿桶，**这是故意的**：0 号是自由问答的**全站共享**哨兵，
+    按文件名归属给任何一个用户都是错的。
+    """
+    mid2uid = {int(r["id"]): int(r["user_id"])
+               for r in conn.execute("SELECT id, user_id FROM mistakes")}
+    per: Dict[int, Dict[str, int]] = {}
+    orphans: Dict[str, Any] = {"files": 0, "bytes": 0, "samples": []}
+    for sub, pat in _NAME_PAT.items():
+        d = os.path.join(STATIC_DIR, sub)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for fn in names:
+            m = pat.match(fn)
+            if not m:
+                continue
+            try:
+                sz = os.path.getsize(os.path.join(d, fn))
+            except OSError:
+                continue
+            mid = int(m.group(1))
+            uid = None if (sub == "anim" and mid == GENERAL_CHAT_ID) else mid2uid.get(mid)
+            if uid is None:
+                orphans["files"] += 1
+                orphans["bytes"] += sz
+                if len(orphans["samples"]) < 20:
+                    orphans["samples"].append(f"{sub}/{fn}")
+                continue
+            b = per.setdefault(uid, {"origin": 0, "clean": 0, "thumb": 0,
+                                     "anim": 0, "total": 0, "files": 0})
+            b[sub] += sz
+            b["total"] += sz
+            b["files"] += 1
+    return per, orphans
+
+
+def _safe_static_path(rel: str) -> Optional[str]:
+    """
+    DB 里的相对路径 -> 磁盘绝对路径，并确认它**真的在 STATIC_DIR 里面**。
+
+    为什么必须有这道闸：路径来自数据库。万一哪天写进了 '../../main.py'，
+    按它删就是在删源码。realpath 之后再比前缀，最省事也最不容易绕过。
+    """
+    if not rel:
+        return None
+    root = os.path.realpath(STATIC_DIR)
+    p = os.path.realpath(os.path.join(STATIC_DIR, rel))
+    return p if p.startswith(root + os.sep) else None
+
+
+@app.post("/api/admin/login")
+def admin_login(req: AdminLoginReq, request: Request):
+    ip = _client_ip(request)
+    key = "admin:" + ip                    # 单独一个失败桶，不占用户登录的配额
+    if _login_locked(key):
+        raise HTTPException(429, f"失败次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
+    if not check_admin_password(req.password):
+        _record_fail(key)
+        _admin_audit("login_fail", detail="口令不正确", ip=ip, ok=False)
+        time.sleep(1.0)                    # 比用户登录的 0.6 更长
+        raise HTTPException(401, "口令不正确")
+    _clear_fails(key)
+    _admin_audit("login_ok", ip=ip, ok=True)
+    resp = JSONResponse({"ok": True, "ttl": ADMIN_TTL})
+    resp.set_cookie(ADMIN_COOKIE, make_admin_token(), max_age=ADMIN_TTL,
+                    httponly=True, samesite="lax", path="/",
+                    secure=COOKIE_SECURE)
+    return resp
+
+
+@app.post("/api/admin/logout")
+def admin_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(ADMIN_COOKIE, path="/")
+    return resp
+
+
+@app.post("/api/admin/password")
+def admin_change_password(req: AdminPwReq, request: Request):
+    """
+    管理员改自己的口令。
+
+    **不写回 ~/.cuoti.env** —— 那个文件里还有 DeepSeek key 和邮箱授权码，
+    让一个网页请求去改写它，等于拿全部凭据冒险。哈希单独存 .admin_pass，
+    改完立即生效、不用重启；忘了就删掉那个文件，回到环境变量里那把。
+    """
+    _require_admin_csrf(request)
+    ip = _client_ip(request)
+    if not check_admin_password(req.old_password):
+        _admin_audit("admin_pw_change", detail="原口令不正确", ip=ip, ok=False)
+        time.sleep(1.0)
+        raise HTTPException(400, "原口令不正确")
+    new = (req.new_password or "").strip()
+    if len(new) < ADMIN_MIN_LEN:
+        raise HTTPException(400, f"新口令至少 {ADMIN_MIN_LEN} 位")
+    if new == (req.old_password or ""):
+        raise HTTPException(400, "新口令和原口令一样，等于没改")
+
+    global _admin_pw_hash
+    h = hash_password(new)
+    # 先写临时文件再 rename：中途断电也不会留下一个写了一半的哈希文件
+    tmp = ADMIN_HASH_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(h)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ADMIN_HASH_FILE)
+    except OSError as e:
+        _admin_audit("admin_pw_change", detail=f"写入失败 {e}", ip=ip, ok=False)
+        raise HTTPException(500, f"保存失败，口令未改动：{e}")
+    _admin_pw_hash = h
+    _admin_audit("admin_pw_change", detail="已修改", ip=ip, ok=True)
+
+    # 口令版本变了 → 所有旧令牌（包括这次请求带的那张）当场失效。
+    # 所以必须**立刻发一张新的**回去，否则改完就被自己踢出去了。
+    resp = JSONResponse({"ok": True, "ttl": ADMIN_TTL})
+    resp.set_cookie(ADMIN_COOKIE, make_admin_token(), max_age=ADMIN_TTL,
+                    httponly=True, samesite="lax", path="/",
+                    secure=COOKIE_SECURE)
+    return resp
+
+
+@app.post("/api/admin/users/{uid}/reset_password")
+def admin_reset_user_password(uid: int, req: AdminResetPwReq, request: Request):
+    """
+    把某个用户的口令重置成临时口令，并强制他下次登录必须改。
+
+    用在同学忘了密码、邮箱又收不到验证码的时候。
+    """
+    _require_admin_csrf(request)
+    ip = _client_ip(request)
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "用户不存在")
+        username = row["username"]
+
+    pw = (req.password or "").strip()
+    generated = False
+    if pw:
+        if len(pw) < MIN_PW_LEN:
+            raise HTTPException(400, f"口令至少 {MIN_PW_LEN} 位")
+    else:
+        # 去掉了容易看错的字符（0/O、1/l/I）—— 这个口令多半要靠口头转达或手抄
+        alphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        pw = "".join(secrets.choice(alphabet) for _ in range(12))
+        generated = True
+
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET pw_hash=?, must_change_pw=1 WHERE id=?",
+                     (hash_password(pw), uid))
+    _admin_audit("reset_user_pw", username,
+                 "已置为临时口令，下次登录必须先改", ip, ok=True)
+    return {"ok": True, "username": username, "password": pw, "generated": generated}
+
+
+@app.get("/api/admin/overview")
+def admin_overview():
+    du = shutil.disk_usage(BASE_DIR)
+    storage = {
+        "origin": _dir_bytes(ORIGIN_DIR), "clean": _dir_bytes(CLEAN_DIR),
+        "thumb": _dir_bytes(THUMB_DIR), "anim": _dir_bytes(ANIM_DIR),
+    }
+    db_main = db_bak = 0
+    try:
+        for fn in os.listdir(BASE_DIR):
+            p = os.path.join(BASE_DIR, fn)
+            if fn == "mistakes.db":
+                db_main += os.path.getsize(p)
+            elif fn.startswith("mistakes.db.bak"):
+                db_bak += os.path.getsize(p)
+    except OSError:
+        pass
+
+    with closing(get_conn()) as conn:
+        one = lambda q, a=(): conn.execute(q, a).fetchone()[0]  # noqa: E731
+        today = datetime.now().strftime("%Y-%m-%d")
+        week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+        app_info = {
+            "users": one("SELECT COUNT(*) FROM users"),
+            "mistakes": one("SELECT COUNT(*) FROM mistakes"),
+            "chats": one("SELECT COUNT(*) FROM chats"),
+            "ai_ready": api_key_ready(),
+            "last_upload_at": one("SELECT COALESCE(MAX(created_at),'') FROM mistakes"),
+        }
+        llm = {
+            "today": one("SELECT COALESCE(SUM(calls),0) FROM llm_usage WHERE day=?", (today,)),
+            "days7": one("SELECT COALESCE(SUM(calls),0) FROM llm_usage WHERE day>=?", (week_ago,)),
+            "total": one("SELECT COALESCE(SUM(calls),0) FROM llm_usage"),
+            "since": one("SELECT COALESCE(MIN(day),'') FROM llm_usage"),
+            "by_kind": [{"kind": r["kind"], "calls": r["c"]} for r in conn.execute(
+                "SELECT kind, SUM(calls) AS c FROM llm_usage GROUP BY kind ORDER BY c DESC")],
+        }
+
+    storage["db"] = db_main
+    storage["db_backups"] = db_bak
+    return {
+        "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "disk": {"total": du.total, "used": du.used, "free": du.free,
+                 "used_pct": round(du.used / du.total * 100, 1) if du.total else 0.0},
+        "storage": {**storage, "total": sum(storage.values())},
+        "proc": _proc_stats(),
+        "app": app_info,
+        "llm": llm,
+    }
+
+
+@app.get("/api/admin/users")
+def admin_users():
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT id, username, email, created_at, last_login_at FROM users ORDER BY id"
+        ).fetchall()
+        per, orphans = _scan_static_by_owner(conn)
+        n_users = len(rows)
+        out = []
+        for r in rows:
+            uid = int(r["id"])
+            last_act = conn.execute(
+                "SELECT MAX(t) AS t FROM ("
+                "  SELECT MAX(created_at) AS t FROM mistakes WHERE user_id=?"
+                "  UNION ALL SELECT MAX(created_at) FROM chats WHERE user_id=?)",
+                (uid, uid)).fetchone()["t"] or ""
+            st = per.get(uid, {"origin": 0, "clean": 0, "thumb": 0, "anim": 0,
+                               "total": 0, "files": 0})
+            out.append({
+                "id": uid, "username": r["username"], "email": r["email"],
+                "created_at": r["created_at"], "last_login_at": r["last_login_at"],
+                "last_activity": last_act,
+                "mistakes": conn.execute("SELECT COUNT(*) FROM mistakes WHERE user_id=?",
+                                         (uid,)).fetchone()[0],
+                "chats": conn.execute("SELECT COUNT(*) FROM chats WHERE user_id=?",
+                                      (uid,)).fetchone()[0],
+                "storage": st,
+                # 删最后一个账号 = 没人能登录了（后台没有建号功能），所以挡住
+                "can_delete": n_users > 1,
+                "block": "" if n_users > 1 else "这是最后一个账号，删掉之后没人能登录",
+            })
+    return {"users": out, "orphans": orphans,
+            "totals": {"users": n_users,
+                       "bytes": sum(u["storage"]["total"] for u in out)}}
+
+
+@app.get("/api/admin/llm")
+def admin_llm(days: int = 30):
+    days = max(1, min(int(days or 30), 365))
+    since = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    with closing(get_conn()) as conn:
+        by_day = [dict(r) for r in conn.execute(
+            "SELECT day, SUM(calls) AS calls FROM llm_usage WHERE day>=? "
+            "GROUP BY day ORDER BY day DESC", (since,))]
+        by_kind = [dict(r) for r in conn.execute(
+            "SELECT kind, SUM(calls) AS calls FROM llm_usage WHERE day>=? "
+            "GROUP BY kind ORDER BY calls DESC", (since,))]
+        # 这页最有运维价值的一格：**哪个账号在烧 key**
+        by_user = [dict(r) for r in conn.execute(
+            "SELECT u.user_id AS uid, COALESCE(us.username, '(已删除)') AS username,"
+            "       SUM(u.calls) AS calls"
+            "  FROM llm_usage u LEFT JOIN users us ON us.id = u.user_id"
+            " WHERE u.day>=? GROUP BY u.user_id ORDER BY calls DESC", (since,))]
+        total = conn.execute(
+            "SELECT COALESCE(SUM(calls),0) FROM llm_usage WHERE day>=?",
+            (since,)).fetchone()[0]
+    return {"days": by_day, "by_kind": by_kind, "by_user": by_user,
+            "since": since, "total": total}
+
+
+@app.get("/api/admin/users/{uid}/delete_preview")
+def admin_delete_preview(uid: int):
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT id, username, email FROM users WHERE id=?",
+                           (uid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "用户不存在")
+        n_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        n_mis = conn.execute("SELECT COUNT(*) FROM mistakes WHERE user_id=?",
+                             (uid,)).fetchone()[0]
+        n_chat = conn.execute("SELECT COUNT(*) FROM chats WHERE user_id=?",
+                              (uid,)).fetchone()[0]
+        per, _ = _scan_static_by_owner(conn)
+        st = per.get(uid, {"total": 0, "files": 0, "origin": 0, "clean": 0,
+                           "thumb": 0, "anim": 0})
+    return {"user": {"id": uid, "username": row["username"], "email": row["email"]},
+            "will_delete": {"mistakes": n_mis, "chats": n_chat,
+                            "files": st["files"], "bytes": st["total"],
+                            "by_dir": {k: st[k] for k in ("origin", "clean", "thumb", "anim")}},
+            "block": "" if n_users > 1 else "这是最后一个账号，删掉之后没人能登录"}
+
+
+@app.post("/api/admin/users/{uid}/delete")
+def admin_delete_user(uid: int, req: AdminDeleteReq, request: Request):
+    """
+    整个删号：账号 + 名下全部数据（DB 行 + 磁盘文件）。**不可恢复。**
+
+    顺序是刻意的：先查路径 -> 删行 -> 删文件。反过来的话，一旦中途失败，
+    DB 里就留下指向不存在文件的记录，用户看到一排破图。
+    """
+    _require_admin_csrf(request)
+    ip = _client_ip(request)
+
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT id, username FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "用户不存在")
+        username = row["username"]
+
+        # 防呆一：前端要输入用户名才解锁按钮，**后端再比一次**。前端那道只防手滑。
+        if (req.confirm or "").strip().lower() != username.lower():
+            _admin_audit("delete_user", username, "用户名不匹配，已中止", ip, ok=False)
+            raise HTTPException(400, "输入的用户名不匹配，已中止")
+
+        # 防呆二：不许删掉最后一个账号。删了就没人能登录了（后台没有建号功能），
+        # 而 SIGNUP_CODE 若已设置，连重新注册都进不来。
+        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] <= 1:
+            _admin_audit("delete_user", username, "拒绝：最后一个账号", ip, ok=False)
+            raise HTTPException(400, "这是最后一个账号，删掉之后没人能登录，已拒绝")
+
+        # ── ① 先收集全部文件路径（此刻 mistakes 行还在）────────────────────
+        mrows = conn.execute(
+            "SELECT id, orig_path, clean_path FROM mistakes WHERE user_id=?",
+            (uid,)).fetchall()
+        mids = [int(r["id"]) for r in mrows]
+
+        paths: List[str] = []
+        for r in mrows:
+            for rel in (r["orig_path"], r["clean_path"]):
+                p = _safe_static_path(rel)
+                if p:
+                    paths.append(p)
+            paths.append(thumb_path(int(r["id"])))
+        try:
+            anim_names = os.listdir(ANIM_DIR)
+        except OSError:
+            anim_names = []
+        for mid in mids:
+            # ⚠️ mid 一定 > 0（0 是自由问答的**全站共享**哨兵）。这里绝不能出现
+            #    anim_m0_*：那会删掉**所有人**的自由问答动画。
+            if mid == GENERAL_CHAT_ID:
+                continue
+            pre = f"anim_m{mid}_"
+            paths += [os.path.join(ANIM_DIR, fn) for fn in anim_names if fn.startswith(pre)]
+        # 按 chats.anim_url 兜一遍：清对话会删文件、DB 字段可能还指着旧文件
+        for a in conn.execute(
+                "SELECT anim_url FROM chats WHERE user_id=? AND anim_url<>''", (uid,)):
+            name = (a["anim_url"] or "").rsplit("/", 1)[-1]
+            if ANIM_NAME_RE.match(name):
+                paths.append(os.path.join(ANIM_DIR, name))
+        paths = sorted(set(paths))
+
+        n_mis = len(mids)
+        n_chat = conn.execute("SELECT COUNT(*) FROM chats WHERE user_id=?",
+                              (uid,)).fetchone()[0]
+
+        # ── ② 删 DB 行（一个事务）────────────────────────────────────────
+        with closing(get_conn()) as c2, c2:
+            c2.execute("DELETE FROM chats WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM llm_usage WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM mistakes WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM users WHERE id=?", (uid,))
+            # 同名的待验证注册记录也清掉：留着的话 UNIQUE(username) 会卡住他
+            # 以后用同名重新注册，而他并没有做错什么。
+            # mail_log **不删** —— 那是发信节流记录，删了等于给「用他的邮箱发
+            # 轰炸信」开了口子。
+            c2.execute("DELETE FROM signups WHERE username=?", (username,))
+
+    # ── ③ 删文件：失败逐条上报，**绝不学 drop_thumb 那样静默吞掉** ──────────
+    freed = gone = 0
+    errors: List[Dict[str, str]] = []
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                sz = os.path.getsize(p)
+                os.remove(p)
+                freed += sz
+                gone += 1
+        except OSError as e:
+            errors.append({"path": os.path.relpath(p, BASE_DIR),
+                           "error": f"{type(e).__name__}: {e}"})
+
+    detail = (f"错题 {n_mis} 道 / 对话 {n_chat} 条 / 文件 {gone} 个 "
+              f"({freed / 1048576:.1f} MB) 已删"
+              + (f"；{len(errors)} 个文件删不掉" if errors else ""))
+    _admin_audit("delete_user", username, detail, ip, ok=not errors)
+    return {"ok": True, "username": username, "deleted": {
+        "mistakes": n_mis, "chats": n_chat, "files": gone, "bytes": freed},
+        "file_errors": errors,
+        "note": "SQLite 文件不会立刻变小；需要时手动执行 VACUUM"}
+
+
+@app.get("/api/admin/audit")
+def admin_audit_list(limit: int = 100):
+    limit = max(1, min(int(limit or 100), 500))
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT ts, action, target, detail FROM admin_log ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()
+    return {"items": [dict(r) for r in rows]}
 
 
 # ---------------------------- 路由：错题列表 ---------------------------------
@@ -4499,5 +5344,9 @@ if __name__ == "__main__":
         reclean_all()
     else:
         # host 必须是 0.0.0.0，手机才能通过局域网 IP 访问
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info",
-                    timeout_keep_alive=KEEPALIVE_SEC)
+        # 架了 Caddy 之后把 BIND_HOST 设成 127.0.0.1：8000 只给本机反代用，
+        # 公网直接扫不到，少一个入口。
+        uvicorn.run(app,
+                    host=os.getenv("BIND_HOST", "0.0.0.0"),
+                    port=int(os.getenv("BIND_PORT", "8000")),
+                    log_level="info", timeout_keep_alive=KEEPALIVE_SEC)

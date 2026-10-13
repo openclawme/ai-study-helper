@@ -936,16 +936,23 @@
 
   <!-- ==================== 改密码弹窗 ==================== -->
   <div v-if="showPw" class="fixed inset-0 z-[70] bg-slate-900/50 flex items-center justify-center p-4"
-       @click.self="showPw = false">
+       @click.self="!mustChangePw && (showPw = false)">
     <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
       <div class="flex items-center gap-2 px-5 py-3.5 border-b border-slate-100">
         <svg class="w-4 h-4 text-slate-500" aria-hidden="true"><use href="#i-lock"/></svg>
         <h3 class="font-bold text-slate-800 flex-1">修改密码</h3>
-        <button @click="showPw = false" class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭">
+        <!-- 被管理员重置过口令时不给关：必须先把临时口令换掉 -->
+        <button v-if="!mustChangePw" @click="showPw = false"
+                class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭">
           <svg class="w-5 h-5" aria-hidden="true"><use href="#i-x"/></svg>
         </button>
       </div>
       <div class="p-5 space-y-3">
+        <div v-if="mustChangePw"
+             class="text-[12.5px] leading-relaxed rounded-xl px-3.5 py-3
+                    bg-amber-50 border border-amber-200 text-amber-800">
+          老师（管理员）把你的密码重置成了临时密码。请先在这里换成你自己的 —— 换好之前，其它功能都还不能用。
+        </div>
         <div>
           <label class="block text-xs font-semibold text-slate-500 mb-1.5">当前密码</label>
           <input v-model="pwOld" type="password" autocomplete="current-password"
@@ -1483,7 +1490,7 @@ const app = createApp({
       searchTimer: null,
       stats: { total: 0, by_subject: {} },
       me: '',            // 当前登录的用户名，顶栏显示用
-      showPw: false, pwOld: '', pwNew: '', pwBusy: false,
+      showPw: false, pwOld: '', pwNew: '', pwBusy: false, mustChangePw: false,
       /* 导出弹窗 */
       showExport: false,
       exportOpts: {
@@ -1625,6 +1632,13 @@ const app = createApp({
         location.href = '/login';
         throw new Error('登录已过期');
       }
+      // 管理员重置过口令：后端会把改密码之外的接口全挡成 403。
+      // 这里不能只当普通错误弹一下就完 —— 得把那个不能关的改密码框顶出来。
+      if (r && r.status === 403) {
+        r.clone().json().then((d) => {
+          if (d && d.must_change_pw) { this.mustChangePw = true; this.openPw(); }
+        }).catch(() => {});
+      }
       return r;
     },
 
@@ -1656,7 +1670,14 @@ const app = createApp({
         let d = null; try { d = await r.json(); } catch (e) {}
         if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
         this.showPw = false;
-        this.notify('密码已修改');
+        if (this.mustChangePw) {
+          // 临时口令换掉了，拦截随之解除 —— 把列表补上，刚才被 403 挡住了
+          this.mustChangePw = false;
+          this.loadList(); this.loadStats(); this.loadChat(GENERAL_ID);
+          this.notify('密码已改成你自己的了，现在都能用了');
+        } else {
+          this.notify('密码已修改');
+        }
       } catch (e) {
         this.notify('修改失败：' + netErrMsg(e), 'error');
       } finally { this.pwBusy = false; }
@@ -1672,7 +1693,13 @@ const app = createApp({
       // 用户名单独取一次：/api/health 是公开的，不带账号信息
       try {
         const r2 = await fetchGet('/api/session');
-        if (r2.ok) { const d2 = await r2.json(); this.me = d2.username || ''; }
+        if (r2.ok) {
+          const d2 = await r2.json();
+          this.me = d2.username || '';
+          this.mustChangePw = !!d2.must_change_pw;
+          // 被重置过口令：直接把改密码框顶出来，且不给关（见弹窗里的 v-if）
+          if (this.mustChangePw) this.openPw();
+        }
       } catch (e) { /* 拿不到就不显示，不影响使用 */ }
     },
 

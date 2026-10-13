@@ -10,6 +10,7 @@
 # 泄露 = 任何人都能登录这个应用 / 伪造登录态
 password.txt
 .session_secret
+.admin_pass
 *.env
 .cuoti.env
 

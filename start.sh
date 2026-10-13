@@ -43,17 +43,24 @@ if [ -z "$DEEPSEEK_API_KEY" ]; then
   echo "    配置方式： echo 'DEEPSEEK_API_KEY=sk-你的key' > ~/.cuoti.env && chmod 600 ~/.cuoti.env"
 fi
 
-OLD=$(fuser 8000/tcp 2>/dev/null | tr -d ' ')
+# 端口和解释器都可从 ~/.cuoti.env 覆盖：
+#   BIND_PORT  换端口（默认 8000）—— 必须和 main.py 里的 BIND_PORT 是同一个值
+#   PYTHON     指定解释器（默认 python3）—— 新机器上装了 venv 就指到 venv/bin/python
+# 下面这两个 fuser 也必须跟着走，写死 8000 的话换了端口就停不掉旧进程。
+PORT="${BIND_PORT:-8000}"
+PY="${PYTHON:-python3}"
+
+OLD=$(fuser "$PORT/tcp" 2>/dev/null | tr -d ' ')
 if [ -n "$OLD" ]; then
   echo "停止旧进程 $OLD …"
-  fuser -k 8000/tcp 2>/dev/null
+  fuser -k "$PORT/tcp" 2>/dev/null
   sleep 1.5
 fi
 
-nohup python3 main.py > "$HOME/cuoti.log" 2>&1 &
+nohup "$PY" main.py > "$HOME/cuoti.log" 2>&1 &
 sleep 5
 
-PID=$(fuser 8000/tcp 2>/dev/null | tr -d ' ')
+PID=$(fuser "$PORT/tcp" 2>/dev/null | tr -d ' ')
 if [ -n "$PID" ]; then
   echo "✅ 已启动 (PID $PID)"
   sed -n '3,18p' "$HOME/cuoti.log"

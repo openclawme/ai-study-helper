@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<meta name="robots" content="noindex,nofollow">
+<title>管理后台 · 我的AI学习助手</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  *{box-sizing:border-box}
+  /* ⚠️ 必须有这条：#login 上写了 display:flex，会盖掉 hidden 属性自带的
+     display:none —— 没有它，登录之后登录框会一直留在页面上压着后台。 */
+  [hidden]{display:none !important}
+  body{margin:0;background:#0f172a;color:#e2e8f0;font-size:14px;
+       font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+       padding:0 0 calc(30px + env(safe-area-inset-bottom))}
+  header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:10px;
+         padding:12px 14px;background:#1e293b;border-bottom:1px solid #334155}
+  header h1{font-size:15px;margin:0;flex:1}
+  main{padding:14px;max-width:820px;margin:0 auto}
+  h2{font-size:12px;letter-spacing:.1em;color:#94a3b8;margin:22px 0 9px;font-weight:700}
+  h2:first-child{margin-top:6px}
+  .grid{display:grid;grid-template-columns:1fr;gap:9px}
+  @media(min-width:560px){.grid{grid-template-columns:repeat(2,1fr)}}
+  .card{background:#1e293b;border-radius:13px;padding:13px 14px}
+  .k{font-size:11.5px;color:#94a3b8}
+  .v{font-size:19px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}
+  .sub{font-size:11.5px;color:#64748b;margin-top:4px;line-height:1.6}
+  .bar{height:5px;border-radius:3px;background:#334155;overflow:hidden;margin-top:8px}
+  .bar i{display:block;height:100%;background:#818cf8;border-radius:3px}
+  .bar.warn i{background:#f59e0b} .bar.hot i{background:#ef4444}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:10px}
+  .mini{font-size:12px;color:#94a3b8;line-height:1.9}
+  .mini b{color:#e2e8f0;font-weight:600}
+  button{font-family:inherit;cursor:pointer;border:0;border-radius:9px;
+         min-height:36px;padding:0 13px;font-size:13.5px;font-weight:600;
+         background:#334155;color:#e2e8f0}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .danger{background:#dc2626;color:#fff}
+  .wide{width:100%;min-height:46px;font-size:15px}
+  .empty{color:#64748b;font-size:13px;padding:10px 2px}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;
+       background:#334155;color:#cbd5e1;margin-left:6px;vertical-align:1px}
+  /* 登录 */
+  #login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  #login .box{width:100%;max-width:360px;background:#1e293b;border-radius:16px;padding:26px 22px}
+  #login h1{font-size:17px;margin:0 0 4px;text-align:center}
+  #login p{text-align:center;color:#94a3b8;font-size:12px;margin:0 0 20px}
+  input[type=password],input[type=text]{width:100%;min-height:48px;padding:12px 13px;
+       font-size:16px;border-radius:11px;border:1.5px solid #334155;background:#0f172a;
+       color:#e2e8f0;outline:none;font-family:inherit}
+  input:focus{border-color:#6366f1}
+  .err{color:#fca5a5;font-size:12.5px;margin-top:10px;min-height:17px;line-height:1.6}
+  /* 底部抽屉 */
+  .sheet{position:fixed;inset:0;z-index:60;background:rgba(2,6,23,.78);display:none;
+         align-items:flex-end;justify-content:center}
+  .sheet.on{display:flex}
+  @media(min-width:560px){.sheet{align-items:center;padding:20px}}
+  .panel{background:#1e293b;width:100%;max-width:440px;border-radius:17px 17px 0 0;
+         padding:18px;padding-bottom:calc(18px + env(safe-area-inset-bottom));
+         max-height:92vh;overflow-y:auto}
+  @media(min-width:560px){.panel{border-radius:17px}}
+  .panel h3{margin:0 0 12px;font-size:16px;color:#fca5a5}
+  .warnbox{background:#450a0a;border:1px solid #7f1d1d;border-radius:11px;
+           padding:11px 13px;font-size:12.5px;line-height:1.85;color:#fecaca;margin-bottom:14px}
+  .warnbox b{color:#fff}
+  .hint{font-size:11.5px;color:#94a3b8;margin:8px 0 0;line-height:1.7}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="box">
+    <h1>管理后台</h1>
+    <p>需要管理员口令</p>
+    <input id="pw" type="password" autocomplete="current-password" placeholder="管理员口令">
+    <div class="err" id="loginErr"></div>
+    <button class="wide" id="loginBtn" style="margin-top:12px">登录</button>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>管理后台</h1>
+    <button id="refresh">刷新</button>
+    <button id="logout">退出</button>
+  </header>
+  <main>
+    <h2>系统</h2>
+    <div class="grid" id="overview"></div>
+    <h2>账号</h2>
+    <div class="grid" id="users"></div>
+    <h2>安全</h2>
+    <div class="grid" id="security"></div>
+    <h2>AI 用量</h2>
+    <div id="usage"></div>
+    <h2>管理操作记录</h2>
+    <div id="audit"></div>
+  </main>
+</div>
+
+<div class="sheet" id="pwSheet">
+  <div class="panel">
+    <h3 style="color:#c7d2fe">修改我的口令</h3>
+    <p class="hint" style="margin:0 0 12px">
+      改完立即生效、不用重启。忘了就 SSH 上去删掉 <code>.admin_pass</code>，会回到环境变量里那把。
+    </p>
+    <input id="pwOld" type="password" autocomplete="current-password" placeholder="当前口令" style="margin-bottom:9px">
+    <input id="pwNew" type="password" autocomplete="new-password" placeholder="新口令（至少 12 位）" style="margin-bottom:9px">
+    <input id="pwNew2" type="password" autocomplete="new-password" placeholder="再输一遍新口令">
+    <div class="err" id="pwErr"></div>
+    <div style="display:flex;gap:9px;margin-top:14px">
+      <button class="wide" id="pwCancel" style="flex:1">取消</button>
+      <button class="wide" id="pwGo" style="flex:1.4" disabled>确认修改</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="resetSheet">
+  <div class="panel">
+    <h3 style="color:#fcd34d">临时口令</h3>
+    <p class="hint" style="margin:0 0 12px">
+      把下面这串发给对方。<b>只显示这一次</b>——关掉就再也看不到了，但可以重新生成。
+      他下次登录会被强制改成自己的口令。
+    </p>
+    <div class="warnbox" id="resetOut" style="background:#422006;border-color:#854d0e;color:#fde68a;
+         font-family:ui-monospace,Menlo,Consolas,monospace;font-size:17px;
+         letter-spacing:.04em;word-break:break-all;text-align:center"></div>
+    <div style="display:flex;gap:9px;margin-top:6px">
+      <button class="wide" id="resetCopy" style="flex:1">复制</button>
+      <button class="wide" id="resetClose" style="flex:1.4">知道了</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="sheet">
+  <div class="panel">
+    <h3>删除账号</h3>
+    <div class="warnbox" id="delWarn"></div>
+    <input id="delInput" type="text" autocomplete="off" spellcheck="false">
+    <p class="hint" id="delHint"></p>
+    <div class="err" id="delErr"></div>
+    <div style="display:flex;gap:9px;margin-top:14px">
+      <button class="wide" id="delCancel" style="flex:1">取消</button>
+      <button class="wide danger" id="delGo" style="flex:1.4" disabled>永久删除</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var busy = false;          // 抽屉开着时暂停自动刷新，否则输到一半数字全跳
+
+  // 所有来自数据库的字符串一律用 textContent 写入。
+  // 管理员页面是全站最高价值的 XSS 目标：一个恶意注册用户只要让 username/email
+  // 里带上 <script>，用 innerHTML 拼就等于把后台交出去了。
+  function el(tag, cls, txt) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt !== undefined && txt !== null) e.textContent = String(txt);
+    return e;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function fmtB(n) {
+    n = Number(n) || 0;
+    var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(1) : n) + ' ' + u[i];
+  }
+  function fmtDur(s) {
+    s = Math.max(0, Math.floor(Number(s) || 0));
+    var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+        m = Math.floor(s % 3600 / 60);
+    return d ? d + ' 天 ' + h + ' 小时' : (h ? h + ' 小时 ' + m + ' 分' : m + ' 分');
+  }
+  function fmtT(s) { return (s || '').slice(0, 16) || '—'; }
+
+  function showLogin() { $('login').hidden = false; $('app').hidden = true; }
+  function showApp() { $('login').hidden = true; $('app').hidden = false; }
+
+  async function api(path, opt) {
+    opt = opt || {};
+    opt.headers = Object.assign({ 'Content-Type': 'application/json' }, opt.headers || {});
+    var r = await fetch(path, opt);
+    // 未登录和「后台未启用」都返回 404（不给扫描器任何信息），这里一律当作要登录
+    if (r.status === 404 && !opt.raw) { showLogin(); throw new Error('需要登录'); }
+    var d = null;
+    try { d = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    return d;
+  }
+
+  // ── 登录 ──────────────────────────────────────────────────────────────
+  async function doLogin() {
+    var btn = $('loginBtn'), err = $('loginErr');
+    err.textContent = '';
+    btn.disabled = true; btn.textContent = '登录中…';
+    try {
+      await api('/api/admin/login', {
+        method: 'POST', raw: true,
+        body: JSON.stringify({ password: $('pw').value })
+      });
+      $('pw').value = '';
+      showApp();
+      load();
+    } catch (e) {
+      err.textContent = e.message.indexOf('HTTP 404') >= 0 ? '后台未启用或口令不正确' : e.message;
+    }
+    btn.disabled = false; btn.textContent = '登录';
+  }
+
+  // ── 渲染 ──────────────────────────────────────────────────────────────
+  function meter(label, pct, cls) {
+    var c = el('div', 'bar' + (cls || ''));
+    var i = el('i');
+    i.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + '%';
+    c.appendChild(i);
+    return c;
+  }
+
+  function statCard(k, v, subs, pct, cls) {
+    var c = el('div', 'card');
+    c.appendChild(el('div', 'k', k));
+    c.appendChild(el('div', 'v', v));
+    if (pct !== undefined && pct !== null) c.appendChild(meter(k, pct, cls));
+    if (subs) {
+      var s = el('div', 'sub');
+      s.textContent = subs;
+      c.appendChild(s);
+    }
+    return c;
+  }
+
+  function renderOverview(o) {
+    var box = $('overview'); clear(box);
+    var d = o.disk, st = o.storage, p = o.proc, mem = p.mem;
+
+    box.appendChild(statCard(
+      '磁盘', d.used_pct + '% 已用',
+      fmtB(d.used) + ' / ' + fmtB(d.total) + '　剩 ' + fmtB(d.free),
+      d.used_pct, d.used_pct > 90 ? 'hot' : (d.used_pct > 75 ? 'warn' : '')));
+
+    box.appendChild(statCard(
+      '本应用占用', fmtB(st.total),
+      '原图 ' + fmtB(st.origin) + '　干净图 ' + fmtB(st.clean) +
+      '　缩略图 ' + fmtB(st.thumb) + '　动画 ' + fmtB(st.anim) +
+      '　数据库 ' + fmtB(st.db) + '　备份 ' + fmtB(st.db_backups)));
+
+    if (mem) {
+      box.appendChild(statCard(
+        '内存', mem.used_pct + '% 已用',
+        '共 ' + fmtB(mem.total) + '　可用 ' + fmtB(mem.available),
+        mem.used_pct, mem.used_pct > 90 ? 'hot' : (mem.used_pct > 75 ? 'warn' : '')));
+    }
+
+    var load = p.load ? p.load[0].toFixed(2) + ' / ' + p.load[1].toFixed(2) + ' / ' + p.load[2].toFixed(2) : '—';
+    box.appendChild(statCard(
+      '本进程',
+      p.cpu_pct === null ? 'CPU 采样中' : 'CPU ' + p.cpu_pct + '%',
+      '内存 ' + fmtB(p.rss) + '　线程 ' + p.threads + '　' + p.cpu_count + ' 核　负载 ' + load +
+      '　已运行 ' + fmtDur(p.uptime_sec)));
+
+    var l = o.llm;
+    box.appendChild(statCard(
+      'DeepSeek 调用', l.today + ' 次',
+      '近 7 天 ' + l.days7 + ' 次　累计 ' + l.total + ' 次' +
+      (l.since ? '　（从 ' + l.since + ' 起统计，之前的没留痕）' : '　（还没有记录）')));
+
+    box.appendChild(statCard(
+      '数据', o.app.users + ' 个账号',
+      '错题 ' + o.app.mistakes + ' 道　对话 ' + o.app.chats + ' 条' +
+      '　AI ' + (o.app.ai_ready ? '可用' : '未配置') +
+      '　最后上传 ' + fmtT(o.app.last_upload_at)));
+  }
+
+  function renderUsers(data) {
+    var box = $('users'); clear(box);
+    if (!data.users.length) { box.appendChild(el('div', 'empty', '还没有账号')); return; }
+    data.users.forEach(function (u) {
+      var c = el('div', 'card');
+      var top = el('div', 'row');
+      var name = el('div');
+      var t = el('div', null, u.username);
+      t.style.cssText = 'font-size:15px;font-weight:700';
+      name.appendChild(t);
+      name.appendChild(el('div', 'sub', u.email || '（没填邮箱）'));
+      top.appendChild(name);
+      var acts = el('div');
+      acts.style.cssText = 'display:flex;gap:7px;flex:none';
+      var rst = el('button', null, '重置口令');
+      rst.addEventListener('click', function () { resetPw(u); });
+      acts.appendChild(rst);
+      var del = el('button', 'danger', '删除');
+      del.disabled = !u.can_delete;
+      if (!u.can_delete) del.title = u.block;
+      del.addEventListener('click', function () { openDelete(u); });
+      acts.appendChild(del);
+      top.appendChild(acts);
+      c.appendChild(top);
+
+      var m = el('div', 'mini');
+      m.textContent = '错题 ' + u.mistakes + ' 道　对话 ' + u.chats + ' 条　占用 ' + fmtB(u.storage.total) +
+        '（' + u.storage.files + ' 个文件）';
+      c.appendChild(m);
+      var m2 = el('div', 'mini');
+      m2.textContent = '注册 ' + fmtT(u.created_at) + '　最后登录 ' + fmtT(u.last_login_at) +
+        '　最后活动 ' + fmtT(u.last_activity);
+      c.appendChild(m2);
+      if (!u.can_delete) {
+        var w = el('div', 'sub', '⚠️ ' + u.block);
+        w.style.color = '#fca5a5';
+        c.appendChild(w);
+      }
+      box.appendChild(c);
+    });
+
+    var orph = data.orphans;
+    if (orph && orph.files) {
+      var oc = el('div', 'card');
+      oc.appendChild(el('div', 'k', '不属于任何账号的文件'));
+      oc.appendChild(el('div', 'v', orph.files + ' 个 / ' + fmtB(orph.bytes)));
+      oc.appendChild(el('div', 'sub', '多半是删错题时没清掉的动画，或者自由问答的共享动画（0 号哨兵，不属于任何一个人）'));
+      box.appendChild(oc);
+    }
+  }
+
+  function renderSecurity() {
+    var box = $('security'); clear(box);
+    var c = el('div', 'card');
+    c.appendChild(el('div', 'k', '管理员口令'));
+    c.appendChild(el('div', 'v', '已启用'));
+    c.appendChild(el('div', 'sub', '改口令立即生效，不用重启服务。'));
+    var b = el('button', null, '修改口令');
+    b.style.marginTop = '10px';
+    b.addEventListener('click', function () {
+      $('pwOld').value = $('pwNew').value = $('pwNew2').value = '';
+      $('pwErr').textContent = ''; $('pwGo').disabled = true;
+      $('pwSheet').classList.add('on');
+    });
+    c.appendChild(b);
+    box.appendChild(c);
+  }
+
+  function renderUsage(u) {
+    var box = $('usage'); clear(box);
+    var c = el('div', 'card');
+    if (!u.total) {
+      c.appendChild(el('div', 'empty', '近 30 天没有调用记录'));
+    } else {
+      var m = el('div', 'mini');
+      m.textContent = '近 ' + u.days.length + ' 天合计 ' + u.total + ' 次';
+      c.appendChild(m);
+      var kb = el('div', 'mini');
+      kb.textContent = '按类型：' + (u.by_kind.length ? u.by_kind.map(function (x) {
+        return (KIND[x.kind] || x.kind) + ' ' + x.calls;
+      }).join('　') : '—');
+      c.appendChild(kb);
+      var ub = el('div', 'mini');
+      ub.textContent = '按账号：' + (u.by_user.length ? u.by_user.map(function (x) {
+        return x.username + ' ' + x.calls;
+      }).join('　') : '—');
+      c.appendChild(ub);
+    }
+    box.appendChild(c);
+  }
+
+  function renderAudit(a) {
+    var box = $('audit'); clear(box);
+    var c = el('div', 'card');
+    if (!a.items.length) {
+      c.appendChild(el('div', 'empty', '还没有管理操作'));
+    } else {
+      a.items.forEach(function (it) {
+        var d = el('div', 'mini');
+        d.textContent = it.ts + '　' + (ACT[it.action] || it.action) +
+          (it.target ? '　' + it.target : '') + (it.detail ? '　' + it.detail : '');
+        c.appendChild(d);
+      });
+    }
+    box.appendChild(c);
+  }
+
+  var KIND = { vision: '识题', split: '拆卷', variant: '变式题', chat: '答疑' };
+  var ACT = { login_ok: '登录成功', login_fail: '登录失败', delete_user: '删除账号',
+              admin_pw_change: '改管理员口令', reset_user_pw: '重置用户口令' };
+
+  async function load() {
+    try {
+      var o = await api('/api/admin/overview');
+      var u = await api('/api/admin/users');
+      var l = await api('/api/admin/llm?days=30');
+      var a = await api('/api/admin/audit?limit=40');
+      renderOverview(o); renderUsers(u); renderUsage(l); renderAudit(a);
+      renderSecurity();
+    } catch (e) {
+      if (String(e.message).indexOf('需要登录') < 0) console.warn(e);
+    }
+  }
+
+  // ── 删除 ──────────────────────────────────────────────────────────────
+  var pending = null;
+
+  async function openDelete(u) {
+    pending = u;
+    busy = true;
+    var warn = $('delWarn'), inp = $('delInput'), go = $('delGo'), err = $('delErr');
+    err.textContent = '';
+    warn.textContent = '正在统计…';
+    inp.value = '';
+    inp.placeholder = '输入 ' + u.username;
+    go.disabled = true; go.textContent = '永久删除';
+    $('sheet').classList.add('on');
+    try {
+      var pv = await api('/api/admin/users/' + u.id + '/delete_preview');
+      var w = pv.will_delete;
+      clear(warn);
+      warn.appendChild(el('div', null, '账号「' + u.username + '」和它的全部数据会被永久删除，无法恢复：'));
+      var b = el('div', null);
+      b.style.marginTop = '6px';
+      b.textContent = '· 错题 ' + w.mistakes + ' 道\n· 对话 ' + w.chats + ' 条\n· 文件 ' +
+        w.files + ' 个（' + fmtB(w.bytes) + '）\n· 账号本身';
+      b.style.whiteSpace = 'pre-line';
+      warn.appendChild(b);
+      $('delHint').textContent = '确认请输入这个账号的用户名：' + u.username;
+    } catch (e) {
+      warn.textContent = '统计失败：' + e.message;
+    }
+  }
+
+  function closeSheet() {
+    $('sheet').classList.remove('on');
+    pending = null; busy = false;
+  }
+
+  $('delInput').addEventListener('input', function () {
+    var u = pending;
+    $('delGo').disabled = !u || this.value.trim().toLowerCase() !== u.username.toLowerCase();
+  });
+
+  $('delCancel').addEventListener('click', closeSheet);
+  $('sheet').addEventListener('click', function (e) { if (e.target === $('sheet')) closeSheet(); });
+
+  $('delGo').addEventListener('click', async function () {
+    if (!pending) return;
+    var u = pending, go = this, err = $('delErr');
+    err.textContent = '';
+    if (!confirm('最后确认：' + u.username + ' 的账号与全部数据会被永久删除，无法恢复。')) return;
+    go.disabled = true; go.textContent = '删除中…';
+    try {
+      var r = await api('/api/admin/users/' + u.id + '/delete', {
+        method: 'POST', raw: true,
+        headers: { 'X-Admin': '1' },
+        body: JSON.stringify({ confirm: $('delInput').value.trim() })
+      });
+      var msg = '已删除：错题 ' + r.deleted.mistakes + ' 道、对话 ' + r.deleted.chats +
+        ' 条、文件 ' + r.deleted.files + ' 个（' + fmtB(r.deleted.bytes) + '）';
+      // 文件删不掉是真实故障（权限、只读挂载），必须让人看见，不能静默吞掉
+      if (r.file_errors && r.file_errors.length) {
+        msg += '\n\n⚠️ 有 ' + r.file_errors.length + ' 个文件没能删掉：\n' +
+          r.file_errors.slice(0, 10).map(function (x) { return x.path + ' — ' + x.error; }).join('\n');
+      }
+      alert(msg);
+      closeSheet();
+      load();
+    } catch (e) {
+      err.textContent = '删除失败：' + e.message;
+      go.disabled = false; go.textContent = '永久删除';
+    }
+  });
+
+  // ── 改自己的口令 ──────────────────────────────────────────────────────
+  function pwCheck() {
+    var ok = $('pwOld').value && $('pwNew').value.length >= 12 &&
+             $('pwNew').value === $('pwNew2').value;
+    $('pwGo').disabled = !ok;
+  }
+  ['pwOld', 'pwNew', 'pwNew2'].forEach(function (id) {
+    $(id).addEventListener('input', pwCheck);
+  });
+  $('pwCancel').addEventListener('click', function () { $('pwSheet').classList.remove('on'); });
+  $('pwGo').addEventListener('click', async function () {
+    var go = this, err = $('pwErr');
+    err.textContent = '';
+    if ($('pwNew').value !== $('pwNew2').value) { err.textContent = '两次输入的新口令不一样'; return; }
+    go.disabled = true; go.textContent = '修改中…';
+    try {
+      await api('/api/admin/password', {
+        method: 'POST', raw: true, headers: { 'X-Admin': '1' },
+        body: JSON.stringify({ old_password: $('pwOld').value, new_password: $('pwNew').value })
+      });
+      $('pwSheet').classList.remove('on');
+      $('pwOld').value = $('pwNew').value = $('pwNew2').value = '';
+      alert('口令已修改。旧口令立刻失效。');
+    } catch (e) {
+      err.textContent = e.message;
+      go.disabled = false;
+    }
+    go.textContent = '确认修改';
+  });
+
+  // ── 重置某个用户的口令 ────────────────────────────────────────────────
+  async function resetPw(u) {
+    if (!confirm('把「' + u.username + '」的口令重置成一个临时口令？\n' +
+                 '他下次登录会被强制改成自己的。')) return;
+    try {
+      var r = await api('/api/admin/users/' + u.id + '/reset_password', {
+        method: 'POST', raw: true, headers: { 'X-Admin': '1' },
+        body: JSON.stringify({})
+      });
+      $('resetOut').textContent = r.password;
+      $('resetSheet').classList.add('on');
+      load();
+    } catch (e) {
+      alert('重置失败：' + e.message);
+    }
+  }
+  $('resetClose').addEventListener('click', function () {
+    $('resetOut').textContent = '';
+    $('resetSheet').classList.remove('on');
+  });
+  $('resetCopy').addEventListener('click', function () {
+    var t = $('resetOut').textContent, b = this;
+    // navigator.clipboard 在非 HTTPS 下不可用（本站就是明文 HTTP），所以要兜底
+    var done = function () { b.textContent = '已复制'; setTimeout(function () { b.textContent = '复制'; }, 1500); };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(t).then(done, function () {});
+    } else {
+      var ta = document.createElement('textarea');
+      ta.value = t; ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+  });
+
+  // ── 事件绑定 ──────────────────────────────────────────────────────────
+  $('loginBtn').addEventListener('click', doLogin);
+  $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+  $('refresh').addEventListener('click', function () { if (!busy) load(); });
+  $('logout').addEventListener('click', async function () {
+    try { await api('/api/admin/logout', { method: 'POST', raw: true }); } catch (e) {}
+    showLogin();
+  });
+
+  // 自动刷新：抽屉开着或页面在后台时跳过
+  setInterval(function () {
+    if (!busy && !document.hidden && !$('app').hidden) load();
+  }, 20000);
+
+  // 进来先探一次：能拿到数据就直接进后台，否则显示登录
+  (async function () {
+    try {
+      await api('/api/admin/overview');
+      showApp(); load();
+    } catch (e) {
+      showLogin();
+      $('pw').focus();
+    }
+  })();
+})();
+</script>
+</body>
+</html>
