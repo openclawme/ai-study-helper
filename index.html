@@ -820,6 +820,29 @@
                     <div v-else class="rich" v-rich="m.content"></div>
                   </div>
 
+                  <!-- 联网检索：查了什么、来源在哪。
+                       这是「AI 给的东西得自己过一遍脑子」最直接的一课 ——
+                       看得到出处，才谈得上自己判断。 -->
+                  <div v-if="m.searching"
+                       class="mt-2 flex items-center gap-1.5 text-xs text-sky-700">
+                    <svg class="w-3.5 h-3.5 shrink-0" aria-hidden="true"><use href="#i-search"/></svg>
+                    <span>正在查资料…</span>
+                  </div>
+                  <div v-else-if="m.search"
+                       class="mt-2 rounded-[14px] border border-sky-200 bg-sky-50/70 px-3 py-2">
+                    <div class="flex items-center gap-1.5 text-xs font-semibold text-sky-800">
+                      <svg class="w-3.5 h-3.5 shrink-0" aria-hidden="true"><use href="#i-search"/></svg>
+                      <span>联网查了 {{ m.search.searches }} 次</span>
+                    </div>
+                    <ul v-if="m.search.sources && m.search.sources.length" class="mt-1 space-y-0.5">
+                      <li v-for="(s, i) in m.search.sources" :key="i" class="text-[11px] leading-snug">
+                        <a :href="s.url" target="_blank" rel="noopener noreferrer"
+                           class="text-sky-700 hover:underline break-all">{{ s.title || s.url }}</a>
+                      </li>
+                    </ul>
+                    <p class="text-[10px] text-sky-700/70 mt-1">网上搜来的可能过时或有错，自己判断一下。</p>
+                  </div>
+
                   <!-- AI 生成的可交互动画：点链接直接在浏览器打开 -->
                   <div v-if="m.anim" class="rounded-[14px] border border-emerald-200 bg-emerald-50/70 overflow-hidden">
                     <div class="flex items-center gap-2 px-3 py-2">
@@ -2097,7 +2120,12 @@ const app = createApp({
         if (this.threadId !== id) return;
         // 把服务端存的 anim_url/anim_title 归一成前端用的 anim 对象
         this.chatMsgs = (d.messages || []).map(m => Object.assign({}, m, {
-          anim: m.anim_url ? { title: m.anim_title || '可视化动画', url: m.anim_url, show: false } : null
+          anim: m.anim_url ? { title: m.anim_title || '可视化动画', url: m.anim_url, show: false } : null,
+          // 联网来源也存过库，回看时照样显示
+          search: (function (j) {
+            try { const o = j ? JSON.parse(j) : null;
+                  return (o && o.searches) ? o : null; } catch (e) { return null; }
+          })(m.search_json)
         }));
       } catch (e) {
         if (this.threadId !== id) return;
@@ -2361,6 +2389,8 @@ const app = createApp({
       });
       const ai = this.chatMsgs[this.chatMsgs.length - 1];
       ai.anim = null;
+      ai.search = null;      // 联网查过什么（含来源），没查过就是 null
+      ai.searching = false;  // 正在查 —— 检索那两三秒要让人看得见
       this.$nextTick(() => this.scrollChat(true));
 
       this._chatAbort = new AbortController();
@@ -2409,7 +2439,14 @@ const app = createApp({
               let ev;
               try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
 
-              if (ev.type === 'reasoning') {
+              if (ev.type === 'searching') {
+                ai.searching = true;
+              } else if (ev.type === 'search') {
+                // 联网检索：查了几次、来源是什么。存下来跟消息一起渲染，
+                // 也要落库——学生事后回看才知道哪句是模型记得的、哪句是刚查的。
+                ai.searching = false;
+                ai.search = { searches: ev.searches || 0, sources: ev.sources || [] };
+              } else if (ev.type === 'reasoning') {
                 pendR += ev.text; schedule();
               } else if (ev.type === 'delta') {
                 pendC += ev.text; schedule();
@@ -2423,6 +2460,7 @@ const app = createApp({
                 // 正文收完：关掉流式标记，思考过程收起成一行摘要
                 ai.streaming = false;
                 ai.showReasoning = false;
+                ai.searching = false;
               }
             }
           }
