@@ -281,10 +281,10 @@
           </button>
         </div>
         <!-- 只收图片：这样系统才会把「拍照」摆在选项里 -->
-        <input ref="camInput" type="file" accept="image/*"
+        <input ref="camInput" type="file" accept="image/*" multiple
                class="hidden" @change="onFileChange">
         <!-- 收全部类型：PDF / Word / 文本 -->
-        <input ref="fileInput" type="file"
+        <input ref="fileInput" type="file" multiple
                accept="image/*,.pdf,.doc,.docx,.txt,.md,application/pdf"
                class="hidden" @change="onFileChange">
 
@@ -1859,10 +1859,10 @@ const app = createApp({
     /* 文档上传：用 fetch 读 SSE 流。不能用 XHR —— XHR 拿不到流式响应，
        一整份卷子几分钟不吭声，用户会以为卡死了。
        代价是拿不到上传进度（只能显示"正在上传"），文档一般几 MB，可以接受。 */
-    async uploadDocument(file) {
+    async uploadDocument(file, label = '') {
       this.uploading = true;
       this.uploadPct = 0;
-      this.uploadMsg = '正在上传 ' + file.name + '…';
+      this.uploadMsg = label + '正在上传 ' + file.name + '…';
       const fd = new FormData();
       fd.append('file', file);
       fd.append('subject', this.activeSubject === '全部' ? '数学' : this.activeSubject);
@@ -1891,7 +1891,7 @@ const app = createApp({
             let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
             if (ev.type === 'start') {
               this.uploadPct = 5;
-              this.uploadMsg = '共 ' + ev.total_pages + ' 页，开始逐页拆题…';
+              this.uploadMsg = label + '共 ' + ev.total_pages + ' 页，开始逐页拆题…';
             } else if (ev.type === 'page') {
               // 页内进度按已完成页数估算，找不到题目也不会卡在 0
               this.uploadPct = Math.min(90, 5 + Math.round((ev.page - 1) / ev.total * 85));
@@ -1936,37 +1936,82 @@ const app = createApp({
     },
 
     async onFileChange(e) {
-      const file = e.target.files && e.target.files[0];
-      if (!file) return;
-      // 文档（PDF/Word/文本）走另一条链路：它们要逐页拆题，可能要几分钟，
-      // 必须能实时看到进度。图片那条路保持不变（有上传进度条，手机上更友好）。
-      if (docKindOf(file.name)) return this.uploadDocument(file);
+      const files = Array.from(e.target.files || []);
+      // 立刻清空，否则再选同一批文件不会触发 change
+      e.target.value = '';
+      if (!files.length) return;
 
+      if (files.length > 20) {
+        this.notify('一次最多 20 个文件，这次只处理前 20 个', 'error');
+        files.length = 20;
+      }
+
+      // 文档（PDF/Word/文本）走另一条链路：要逐页拆题，一份可能几分钟。
+      // 图片链路有上传进度条，手机上更友好。两条路都可能一次选多个。
+      const docs = files.filter(f => docKindOf(f.name));
+      const imgs = files.filter(f => !docKindOf(f.name));
+
+      // 文档：**逐份**处理。一份卷子几分钟，同时塞几份会完全看不出进度。
+      for (let i = 0; i < docs.length; i++) {
+        const tag = docs.length > 1 ? `（第 ${i + 1}/${docs.length} 份）` : '';
+        await this.uploadDocument(docs[i], tag);
+        if (this.authExpired) return;
+      }
+
+      if (imgs.length) await this.uploadImages(imgs);
+    },
+
+    /* 批量图片：**串行**压缩 + 上传。
+       刻意不并发 —— 每张都要调一次 AI（10~30 秒），并发会把接口打满、
+       还可能触发限流；串行反而更稳，进度也看得清。 */
+    async uploadImages(files) {
+      const n = files.length;
+      let ok = 0, last = null;
+      const failed = [];
       this.uploading = true;
-      this.uploadPct = 0;
-      this.uploadMsg = '正在压缩图片…';
       try {
-        const blob = await this.compress(file);
-        this.uploadMsg = '正在上传（' + (blob.size / 1024 / 1024).toFixed(1) + ' MB）…';
-        const res = await this.doUpload(blob);
-        await this.loadList();
-        const it = this.items.find(x => x.id === res.item.id) || res.item;
-        this.openDetail(it);
-        if (res.subject_fixed_from) {
-          // 用户在「全部」筛选下上传时科目会默认成某一种，AI 认出来后会纠正归档
-          this.notify(`科目已自动纠正：你选的是「${res.subject_fixed_from}」，`
-                      + `AI 从图上认出是「${res.item.subject}」`);
-        } else if (res.item.ai_ok) {
-          this.notify('AI 解析完成：' + (res.item.tag || '已生成考点'));
-        } else {
-          this.notify('图片已保存，但 AI 未完成：' + (res.item.ai_status || '未知原因'), 'error');
+        for (let i = 0; i < n; i++) {
+          // 只选了一张时不加前缀，和以前的行为一模一样
+          const tag = n > 1 ? `第 ${i + 1}/${n} 张：` : '';
+          this.uploadPct = 0;
+          this.uploadMsg = tag + '正在压缩图片…';
+          try {
+            const blob = await this.compress(files[i]);
+            last = await this.doUpload(blob, tag);
+            ok++;
+          } catch (err) {
+            if (this.authExpired) return;
+            // 单张失败不能拖垮整批：记下来接着传下一张
+            failed.push((files[i].name || `第 ${i + 1} 张`) + '：' + err.message);
+          }
         }
-      } catch (err) {
-        this.notify('上传失败：' + err.message, 'error');
       } finally {
         this.uploading = false;
         this.uploadPct = 0;
         this.uploadMsg = '';
+      }
+
+      await this.loadList();
+
+      if (n === 1 && last) {
+        // 单张：行为和以前一致 —— 直接打开详情
+        const it = this.items.find(x => x.id === last.item.id) || last.item;
+        this.openDetail(it);
+        if (last.subject_fixed_from) {
+          this.notify(`科目已自动纠正：你选的是「${last.subject_fixed_from}」，`
+                      + `AI 从图上认出是「${last.item.subject}」`);
+        } else if (last.item.ai_ok) {
+          this.notify('AI 解析完成：' + (last.item.tag || '已生成考点'));
+        } else {
+          this.notify('图片已保存，但 AI 未完成：' + (last.item.ai_status || '未知原因'), 'error');
+        }
+      } else if (ok) {
+        // 多张：不自动跳详情，让人先在列表里看到新传的这几张
+        this.notify(`已归档 ${ok} 张` + (failed.length ? `，${failed.length} 张失败` : ''));
+      }
+
+      if (failed.length) {
+        this.notify('这些没传上去 —— ' + failed.join('；'), 'error');
       }
     },
 
@@ -1990,20 +2035,25 @@ const app = createApp({
     },
 
     loadBitmap(file) {
+      // 读不出来多半是「扩展名是 .jpg，内容其实不是图片」，或者 HEIC 这类
+      // 浏览器解不了的格式。原始报错是英文的（"The source image could not be
+      // decoded."），对初三学生没有意义，这里统一换成一句能看懂的话。
+      const bad = () => new Error('这张图读不出来，可能不是图片，或格式不支持（试试 JPG/PNG）');
       if (window.createImageBitmap) {
         return createImageBitmap(file, { imageOrientation: 'from-image' })
-          .catch(() => createImageBitmap(file));   // 旧浏览器不支持该选项时降级
+          .catch(() => createImageBitmap(file))   // 旧浏览器不支持该选项时降级
+          .catch(() => { throw bad(); });
       }
       return new Promise((resolve, reject) => {
         const img = new Image();
         img.onload = () => resolve(img);
-        img.onerror = () => reject(new Error('无法读取该图片'));
+        img.onerror = () => reject(bad());
         img.src = URL.createObjectURL(file);
       });
     },
 
     /* 用 XHR 拿真实上传进度；服务器端 AI 解析阶段用「AI 解析中」提示 */
-    doUpload(blob) {
+    doUpload(blob, label = '') {
       return new Promise((resolve, reject) => {
         const fd = new FormData();
         fd.append('file', blob, 'photo.jpg');
@@ -2019,7 +2069,7 @@ const app = createApp({
         };
         xhr.upload.onload = () => {
           this.uploadPct = 95;
-          this.uploadMsg = 'AI 正在识别考点、擦除手写、生成变式题…（约 10~30 秒）';
+          this.uploadMsg = label + 'AI 正在识别考点、擦除手写、生成变式题…（约 10~30 秒）';
         };
         xhr.onload = () => {
           this.uploadPct = 100;
