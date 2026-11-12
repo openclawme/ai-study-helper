@@ -2064,10 +2064,7 @@ const app = createApp({
         this.exitArmedUntil = 0;
         clearTimeout(this.exitToastTimer);
         const base = location.pathname + location.search;
-        if (!this.exitGuardPushed) {
-          history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
-          this.exitGuardPushed = true;
-        }
+        if (!this.exitGuardPushed) this.pushExitGuardState();
         history.pushState({ ...(history.state || {}), appOverlay: true }, '', base + '#app-overlay');
         this.overlayHistoryPushed = true;
       } else if (!open && this.overlayHistoryPushed) {
@@ -2080,9 +2077,22 @@ const app = createApp({
        第一次左滑/返回只弹提示；再滑一次才真正离开。 */
     /* 真正往历史里压退出守卫。带 hash：同 URL 的 pushState 在微信/手机
        WebView 里常常不算一层可回退历史，左滑会直接关掉整个页面。 */
-    pushExitGuard() {
+    /* 内层下面的守卫：点击打开内层时 pushState 仍有效，用它把 #app-home 垫在下面 */
+    pushExitGuardState() {
       const base = location.pathname + location.search;
       history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
+      this.exitGuardPushed = true;
+    },
+
+    /* 首页守卫：系统浏览器/微信往往只在点击手势里认 pushState；
+       location.hash 是正常导航，页面加载时、提示消失后都能加一层，
+       左滑会先回到这一层，而不是直接关掉整个页面。 */
+    pushExitGuard() {
+      if (location.hash === '#app-home') {
+        this.exitGuardPushed = true;
+        return;
+      }
+      location.hash = '#app-home';
       this.exitGuardPushed = true;
     },
 
@@ -2090,7 +2100,7 @@ const app = createApp({
       if (window.innerWidth >= 768) return;
       if (this.current || this.mobileChat) return;
       if (this.showExitToast) return;      // 提示还在，别把“再滑一次”挡掉
-      if (history.state && history.state.appExitGuard) {
+      if (location.hash === '#app-home') {
         this.exitGuardPushed = true;
         return;
       }
@@ -2112,19 +2122,19 @@ const app = createApp({
       this.armExitGuard();
     },
 
-    handlePopState(e) {
-      const st = e && e.state ? e.state : null;
+    handlePopState() {
+      const hash = location.hash;
       // 内层还在：左滑只关内层，不弹退出提示
       if (this.current || this.mobileChat) {
         this.suppressOverlayHistory = true;
         this.overlayHistoryPushed = false;
-        this.exitGuardPushed = !!(st && st.appExitGuard);
+        this.exitGuardPushed = hash === '#app-home';
         this.current = null;
         this.mobileChat = false;
         return;
       }
-      // 退到了守卫层（例如内层关闭后），保持守卫
-      if (st && st.appExitGuard) {
+      // 落在守卫层（例如内层关闭后），保持守卫
+      if (hash === '#app-home') {
         this.exitGuardPushed = true;
         return;
       }
@@ -2139,7 +2149,7 @@ const app = createApp({
           history.back();
           return;
         }
-        // 第一次滑动：弹提示，并立刻把守卫补回去 —— 提示消失后仍受保护
+        // 第一次滑动：弹提示，并立刻用 hash 把守卫补回去
         this.showExitToast = true;
         this.exitArmedUntil = Date.now() + 3000;
         this.pushExitGuard();
@@ -3036,15 +3046,18 @@ const app = createApp({
     // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
     // 否则昨天聊到一半的问题今天打开是空的。
     this.loadChat(GENERAL_ID);
-    this.exitGuardPushed = !!(history.state && history.state.appExitGuard) || location.hash === '#app-home';
-    this.armExitGuard();
-    // 有些手机浏览器首帧的 innerWidth / 历史还没稳定，再补两次布防
+    this.exitGuardPushed = location.hash === '#app-home';
+    // 关键：等 load 完成后再压守卫。页面还在加载时设置 hash 会和首条历史合并，
+    // 左滑就没有可回的层，直接退出——这正是“刚进首页没操作就退出”的原因。
     this._armExit = () => this.handleFirstTouch();
-    setTimeout(this._armExit, 400);
+    const armAfterLoad = () => setTimeout(this._armExit, 150);
+    if (document.readyState === 'complete') armAfterLoad();
+    else window.addEventListener('load', armAfterLoad, { once: true });
     document.addEventListener('touchstart', this._armExit, { passive: true, capture: true });
     document.addEventListener('pointerdown', this._armExit, { passive: true, capture: true });
     window.addEventListener('resize', this._armExit);
     window.addEventListener('popstate', this.handlePopState);
+    window.addEventListener('hashchange', this.handlePopState);
   },
 
   beforeUnmount() {
@@ -3053,6 +3066,7 @@ const app = createApp({
     document.removeEventListener('pointerdown', this._armExit, true);
     window.removeEventListener('resize', this._armExit);
     window.removeEventListener('popstate', this.handlePopState);
+    window.removeEventListener('hashchange', this.handlePopState);
   }
 });
 
