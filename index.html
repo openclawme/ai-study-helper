@@ -2063,11 +2063,12 @@ const app = createApp({
         this.showExitToast = false;
         this.exitArmedUntil = 0;
         clearTimeout(this.exitToastTimer);
+        const base = location.pathname + location.search;
         if (!this.exitGuardPushed) {
-          history.pushState({ ...(history.state || {}), appExitGuard: true }, '');
+          history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
           this.exitGuardPushed = true;
         }
-        history.pushState({ ...(history.state || {}), appOverlay: true }, '');
+        history.pushState({ ...(history.state || {}), appOverlay: true }, '', base + '#app-overlay');
         this.overlayHistoryPushed = true;
       } else if (!open && this.overlayHistoryPushed) {
         this.overlayHistoryPushed = false;
@@ -2080,8 +2081,12 @@ const app = createApp({
     armExitGuard() {
       if (window.innerWidth >= 768) return;
       if (this.current || this.mobileChat) return;
+      if (this.showExitToast) return;      // 提示还在，别把“再滑一次”挡掉
       if (this.exitGuardPushed) return;
-      history.pushState({ ...(history.state || {}), appExitGuard: true }, '');
+      // 关键：带一个 hash。三端实测，同 URL 的 pushState 在微信/部分手机
+      // WebView 里不会被当成可回退的一层，左滑就直接关掉整个页面了。
+      const base = location.pathname + location.search;
+      history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
       this.exitGuardPushed = true;
     },
 
@@ -3010,13 +3015,20 @@ const app = createApp({
     // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
     // 否则昨天聊到一半的问题今天打开是空的。
     this.loadChat(GENERAL_ID);
-    this.exitGuardPushed = !!(history.state && history.state.appExitGuard);
+    this.exitGuardPushed = !!(history.state && history.state.appExitGuard) || location.hash === '#app-home';
     this.armExitGuard();
+    // 有些手机浏览器首帧的 innerWidth / 历史还没稳定，再补两次布防
+    this._armExit = () => this.armExitGuard();
+    setTimeout(this._armExit, 400);
+    document.addEventListener('touchstart', this._armExit, { once: true, passive: true });
+    window.addEventListener('resize', this._armExit);
     window.addEventListener('popstate', this.handlePopState);
   },
 
   beforeUnmount() {
     clearTimeout(this.exitToastTimer);
+    document.removeEventListener('touchstart', this._armExit);
+    window.removeEventListener('resize', this._armExit);
     window.removeEventListener('popstate', this.handlePopState);
   }
 });
