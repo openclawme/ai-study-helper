@@ -1676,6 +1676,10 @@ const app = createApp({
       /* 手机端：没选中错题时右栏默认是隐藏的（它是 fixed inset-0 的全屏层）。
          这个开关让它能单独被「问 AI 学习问题」这个入口拉起来。桌面端用不到。 */
       mobileChat: false,
+      /* 手机端返回手势：打开详情/自由问答时往历史里压一层，
+         左滑先关这一层回列表；没有内层时浏览器才会回上一页/退出。 */
+      overlayHistoryPushed: false,
+      suppressOverlayHistory: false,
       /* 建议按钮：开聊前给「怎么问」，聊起来后给「追问什么」——
          初三孩子最难的往往不是不会做，而是不知道该问什么 */
       quickAsks: [
@@ -1785,6 +1789,10 @@ const app = createApp({
       // 上一条线程的流式状态跟我们没关系了，别让它把新线程的输入框一直禁用着
       this.chatSending = false;
       this.loadChat(nid);
+      this.syncOverlayHistory();
+    },
+    mobileChat() {
+      this.syncOverlayHistory();
     }
   },
 
@@ -2023,6 +2031,33 @@ const app = createApp({
     /* 返回列表。手机上必须把 mobileChat 一起清掉，否则右栏是全屏层，
        光把 current 置空它还在，人就被困在里面了。 */
     closeDetail() {
+      this.current = null;
+      this.mobileChat = false;
+    },
+
+    /* 手机端：内层（详情/自由问答）打开时压一条历史，关闭时弹掉。
+       左滑触发 popstate 时，如果还有内层，就只关内层，不离开网站。 */
+    syncOverlayHistory() {
+      if (window.innerWidth >= 768) return;
+      if (this.suppressOverlayHistory) {
+        this.suppressOverlayHistory = false;
+        return;
+      }
+      const open = !!(this.current || this.mobileChat);
+      if (open && !this.overlayHistoryPushed) {
+        history.pushState({ ...(history.state || {}), appOverlay: true }, '');
+        this.overlayHistoryPushed = true;
+      } else if (!open && this.overlayHistoryPushed) {
+        this.overlayHistoryPushed = false;
+        history.back();
+      }
+    },
+
+    handlePopState() {
+      // 左滑/浏览器返回：还有内层就关掉内层，停在列表首页
+      if (!(this.current || this.mobileChat)) return;
+      this.suppressOverlayHistory = true;
+      this.overlayHistoryPushed = false;
       this.current = null;
       this.mobileChat = false;
     },
@@ -2908,6 +2943,11 @@ const app = createApp({
     // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
     // 否则昨天聊到一半的问题今天打开是空的。
     this.loadChat(GENERAL_ID);
+    window.addEventListener('popstate', this.handlePopState);
+  },
+
+  beforeUnmount() {
+    window.removeEventListener('popstate', this.handlePopState);
   }
 });
 
