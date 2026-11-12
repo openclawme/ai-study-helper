@@ -106,6 +106,10 @@
   .fade-enter-from, .fade-leave-to { opacity: 0; }
   .spin { animation: sp 1s linear infinite; display: inline-block; }
   @keyframes sp { to { transform: rotate(360deg); } }
+
+  /* 手机端：禁止页面横向 overscroll 触发浏览器前进/后退；局部横滑容器保持可滑 */
+  html, body { overscroll-behavior-x: none; }
+  .overflow-x-auto { overscroll-behavior-x: contain; }
 </style>
 </head>
 <body>
@@ -2111,6 +2115,42 @@ const app = createApp({
       if (!this.exitGuardIndex) this.armExitStack();
     },
 
+    /* 边缘侧滑：iOS Safari/部分 WebView 的原生返回手势。
+       在边缘 24px 的 touchstart 上 preventDefault，先把它挡下来；
+       按钮/输入框等可交互元素放行，避免影响正常点击。
+       第一次横滑只提示；提示窗口内第二次不拦，交给原生返回/历史守卫。 */
+    onEdgeTouchStart(e) {
+      if (window.innerWidth >= 768) return;
+      if (!e.touches || !e.touches.length || !e.cancelable) return;
+      const x = e.touches[0].clientX;
+      if (x > 24 && x < window.innerWidth - 24) return;
+      const t = e.target;
+      if (t && t.closest && t.closest('button,a,input,textarea,select,label,[contenteditable="true"]')) return;
+      if (this.showExitToast || Date.now() < this.exitArmedUntil) return;
+      e.preventDefault();
+      this._edgeTouch = { x: x, y: e.touches[0].clientY };
+    },
+
+    onEdgeTouchMove(e) {
+      if (!this._edgeTouch || !e.touches || !e.touches.length) return;
+      const dx = e.touches[0].clientX - this._edgeTouch.x;
+      const dy = e.touches[0].clientY - this._edgeTouch.y;
+      if (Math.abs(dx) > 26 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+        this._edgeTouch = null;
+        if (!this.showExitToast && Date.now() >= this.exitArmedUntil) {
+          this.showExitToast = true;
+          this.exitArmedUntil = Date.now() + 3000;
+          clearTimeout(this.exitToastTimer);
+          this.exitToastTimer = setTimeout(() => {
+            this.showExitToast = false;
+            this.exitArmedUntil = 0;
+          }, 3000);
+        }
+      }
+    },
+
+    onEdgeTouchEnd() { this._edgeTouch = null; },
+
     handlePopState() {
       // 一次返回会同时触发 popstate + hashchange，必须去重，
       // 否则第二次重复事件会被误判成“提示期间再滑一次”而直接退出。
@@ -3061,6 +3101,10 @@ const app = createApp({
     this._armExit = () => this.armExitStack();
     document.addEventListener('touchstart', this._armExit, { passive: true, capture: true });
     document.addEventListener('pointerdown', this._armExit, { passive: true, capture: true });
+    // 必须在捕获阶段、passive:false，preventDefault 才能挡住原生边缘手势
+    document.addEventListener('touchstart', this.onEdgeTouchStart, { passive: false, capture: true });
+    document.addEventListener('touchmove', this.onEdgeTouchMove, { passive: true, capture: true });
+    document.addEventListener('touchend', this.onEdgeTouchEnd, { passive: true, capture: true });
     window.addEventListener('popstate', this.handlePopState);
     window.addEventListener('hashchange', this.handlePopState);
   },
@@ -3069,6 +3113,9 @@ const app = createApp({
     clearTimeout(this.exitToastTimer);
     document.removeEventListener('touchstart', this._armExit, true);
     document.removeEventListener('pointerdown', this._armExit, true);
+    document.removeEventListener('touchstart', this.onEdgeTouchStart, true);
+    document.removeEventListener('touchmove', this.onEdgeTouchMove, true);
+    document.removeEventListener('touchend', this.onEdgeTouchEnd, true);
     window.removeEventListener('popstate', this.handlePopState);
     window.removeEventListener('hashchange', this.handlePopState);
   }
