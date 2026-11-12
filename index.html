@@ -1093,6 +1093,17 @@
     </div>
   </div>
 
+  <!-- ==================== 首次打开：真实点一下，启用返回保护 ==================== -->
+  <div v-if="showExitIntro" class="fixed inset-0 z-[85] bg-slate-900/55 flex items-center justify-center p-5">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5 text-center">
+      <p class="text-base font-bold text-slate-800">防止误触退出</p>
+      <p class="text-sm text-slate-600 mt-2 leading-relaxed">
+        点一下「开始使用」，之后左滑会先提示，再滑一次才退出。
+      </p>
+      <button class="btn btn-primary w-full py-2.5 text-sm mt-4" @click="startExitProtection">开始使用</button>
+    </div>
+  </div>
+
   <!-- ==================== 首页退出提示 ==================== -->
   <transition name="fade">
     <div v-if="showExitToast"
@@ -1691,6 +1702,8 @@ const app = createApp({
       overlayHistoryPushed: false,
       suppressOverlayHistory: false,
       showExitToast: false,
+      showExitIntro: false,
+      exitGuardIndex: 0,
       exitGuardPushed: false,
       exitArmedUntil: 0,
       exitToastTimer: null,
@@ -2079,69 +2092,81 @@ const app = createApp({
        WebView 里常常不算一层可回退历史，左滑会直接关掉整个页面。 */
     /* 内层下面的守卫：点击打开内层时 pushState 仍有效，用它把 #app-home 垫在下面 */
     pushExitGuardState() {
+      if (this.exitGuardIndex) return;
       const base = location.pathname + location.search;
-      history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
+      history.pushState({ ...(history.state || {}), appExitGuard: 1 }, '', base + '#app-home-1');
+      this.exitGuardIndex = 1;
       this.exitGuardPushed = true;
     },
 
-    /* 首页守卫：系统浏览器/微信往往只在点击手势里认 pushState；
-       location.hash 是正常导航，页面加载时、提示消失后都能加一层，
-       左滑会先回到这一层，而不是直接关掉整个页面。 */
-    pushExitGuard() {
-      if (location.hash === '#app-home') {
-        this.exitGuardPushed = true;
-        return;
-      }
-      location.hash = '#app-home';
-      this.exitGuardPushed = true;
-    },
-
-    armExitGuard() {
+    /* 不能再靠“页面加载时自动压历史”了：系统浏览器只认真实触摸/点击，
+       脚本模拟的 click/touch 不算用户激活，pushState 会被直接忽略。
+       所以首页先请用户点一次「开始使用」，在这个真实手势里连续压 4 层守卫；
+       之后每次左滑都只退一层并提示，提示窗口内再滑才真正离开。 */
+    startExitProtection() {
+      this.showExitIntro = false;
       if (window.innerWidth >= 768) return;
-      if (this.current || this.mobileChat) return;
-      if (this.showExitToast) return;      // 提示还在，别把“再滑一次”挡掉
-      if (location.hash === '#app-home') {
-        this.exitGuardPushed = true;
-        return;
+      if (this.exitGuardIndex) return;
+      const base = location.pathname + location.search;
+      const n = 4;
+      for (let i = 1; i <= n; i++) {
+        history.pushState({ ...(history.state || {}), appExitGuard: i }, '', base + '#app-home-' + i);
       }
-      this.pushExitGuard();
-    },
-
-    /* 触摸/指针按下属于用户手势：有些 WebView 只认手势里压的历史。
-       首页每次手指落下都补一次，已经在守卫上就什么都不做。 */
-    handleFirstTouch() {
-      if (this.showExitToast) return;
-      if (this.current || this.mobileChat) return;
-      this.armExitGuard();
+      this.exitGuardIndex = n;
+      this.exitGuardPushed = true;
     },
 
     cancelExitToast() {
       this.showExitToast = false;
       this.exitArmedUntil = 0;
       clearTimeout(this.exitToastTimer);
-      this.armExitGuard();
+      if (!this.exitGuardIndex && window.innerWidth < 768) this.showExitIntro = true;
     },
 
     handlePopState() {
-      const hash = location.hash;
+      // 一次返回会同时触发 popstate + hashchange，必须去重，
+      // 否则第二次重复事件会被误判成“提示期间再滑一次”而直接退出。
+      const now = Date.now();
+      if (this._lastNavHash === location.hash && now - (this._lastNavAt || 0) < 200) return;
+      this._lastNavHash = location.hash;
+      this._lastNavAt = now;
+      const m = location.hash.match(/^#app-home-(\d+)$/);
+      const idx = m ? parseInt(m[1], 10) : 0;
       // 内层还在：左滑只关内层，不弹退出提示
       if (this.current || this.mobileChat) {
         this.suppressOverlayHistory = true;
         this.overlayHistoryPushed = false;
-        this.exitGuardPushed = hash === '#app-home';
+        this.exitGuardIndex = idx;
+        this.exitGuardPushed = idx > 0;
         this.current = null;
         this.mobileChat = false;
         return;
       }
-      // 落在守卫层（例如内层关闭后），保持守卫
-      if (hash === '#app-home') {
+      // 退到某一层守卫：每次只提示；提示窗口内再滑才放行
+      if (idx > 0) {
+        this.exitGuardIndex = idx;
         this.exitGuardPushed = true;
+        if (this.showExitToast || Date.now() < this.exitArmedUntil) {
+          this.showExitToast = false;
+          this.exitArmedUntil = 0;
+          clearTimeout(this.exitToastTimer);
+          // 从当前守卫层越过首页，退到上一页/退出
+          history.go(-(idx + 1));
+          return;
+        }
+        this.showExitToast = true;
+        this.exitArmedUntil = Date.now() + 3000;
+        clearTimeout(this.exitToastTimer);
+        this.exitToastTimer = setTimeout(() => {
+          this.showExitToast = false;
+          this.exitArmedUntil = 0;
+        }, 3000);
         return;
       }
-      // 守卫被左滑掉
-      if (this.exitGuardPushed) {
+      // 守卫栈用完，落回首页
+      if (this.exitGuardIndex) {
+        this.exitGuardIndex = 0;
         this.exitGuardPushed = false;
-        // 提示还在 / 仍在 3 秒窗口内 = 用户第二次滑动：放行
         if (this.showExitToast || Date.now() < this.exitArmedUntil) {
           this.showExitToast = false;
           this.exitArmedUntil = 0;
@@ -2149,20 +2174,18 @@ const app = createApp({
           history.back();
           return;
         }
-        // 第一次滑动：弹提示，并立刻用 hash 把守卫补回去
         this.showExitToast = true;
         this.exitArmedUntil = Date.now() + 3000;
-        this.pushExitGuard();
         clearTimeout(this.exitToastTimer);
         this.exitToastTimer = setTimeout(() => {
           this.showExitToast = false;
           this.exitArmedUntil = 0;
-          this.armExitGuard();
+          if (window.innerWidth < 768) this.showExitIntro = true;
         }, 3000);
         return;
       }
-      // 没有守卫时（例如刚打开页面的极端情况），补一条守卫
-      if (Date.now() >= this.exitArmedUntil) this.armExitGuard();
+      // 完全没有守卫：手机端请用户点一次「开始使用」再继续
+      if (window.innerWidth < 768) this.showExitIntro = true;
     },
 
     /* 手机端的「问 AI 学习问题」入口。桌面端右栏一直在，用不到这个。 */
@@ -3046,25 +3069,16 @@ const app = createApp({
     // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
     // 否则昨天聊到一半的问题今天打开是空的。
     this.loadChat(GENERAL_ID);
-    this.exitGuardPushed = location.hash === '#app-home';
-    // 关键：等 load 完成后再压守卫。页面还在加载时设置 hash 会和首条历史合并，
-    // 左滑就没有可回的层，直接退出——这正是“刚进首页没操作就退出”的原因。
-    this._armExit = () => this.handleFirstTouch();
-    const armAfterLoad = () => setTimeout(this._armExit, 150);
-    if (document.readyState === 'complete') armAfterLoad();
-    else window.addEventListener('load', armAfterLoad, { once: true });
-    document.addEventListener('touchstart', this._armExit, { passive: true, capture: true });
-    document.addEventListener('pointerdown', this._armExit, { passive: true, capture: true });
-    window.addEventListener('resize', this._armExit);
+    const gm = location.hash.match(/^#app-home-(\d+)$/);
+    this.exitGuardIndex = gm ? parseInt(gm[1], 10) : 0;
+    this.exitGuardPushed = this.exitGuardIndex > 0;
+    this.showExitIntro = window.innerWidth < 768 && !this.exitGuardIndex;
     window.addEventListener('popstate', this.handlePopState);
     window.addEventListener('hashchange', this.handlePopState);
   },
 
   beforeUnmount() {
     clearTimeout(this.exitToastTimer);
-    document.removeEventListener('touchstart', this._armExit, true);
-    document.removeEventListener('pointerdown', this._armExit, true);
-    window.removeEventListener('resize', this._armExit);
     window.removeEventListener('popstate', this.handlePopState);
     window.removeEventListener('hashchange', this.handlePopState);
   }
