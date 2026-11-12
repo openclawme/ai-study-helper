@@ -163,6 +163,11 @@
   <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
   </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 7h16"/><path d="M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7"/>
+    <path d="M6.5 7l.9 12.2a1 1 0 0 0 1 .8h7.2a1 1 0 0 0 1-.8L17.5 7"/>
+    <path d="M10 11v5M14 11v5"/>
+  </symbol>
   <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
     <circle cx="12" cy="12" r="9"/><path d="M10 8.5 16 12l-6 3.5z"/>
   </symbol>
@@ -213,6 +218,10 @@
         <div class="text-indigo-100/70">当前账号</div>
         <div class="font-bold">{{ me }}</div>
       </div>
+      <button v-if="me" @click="openPhone" title="绑定手机号，找回密码用"
+              class="shrink-0 text-xs px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 transition">
+        绑手机
+      </button>
       <button v-if="me" @click="openPw" title="修改密码"
               class="shrink-0 text-xs px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 transition">
         改密码
@@ -258,19 +267,16 @@
           <span class="text-xs text-slate-400">照片 / PDF / Word / 文本</span>
         </div>
 
-        <!-- ⚠️ 必须是**两个** input，不能合成一个。
-             手机的选择器有一条硬规则：**相机拍不出来的类型，就不给相机入口**。
-             所以只要 accept 里带上 .pdf/.doc，系统就直接跳到文件浏览器，
-             「拍照」这个选项根本不会出现 —— 而这恰恰是最主要的用法（孩子拍作业）。
-             实测确认过：accept="image/*" 时会给出拍照/相册；一旦加上 pdf/doc 就只剩选文件。
-             拆开之后：拍照那个只收图片（相机入口回来了），文档那个收全部类型。
-             capture="environment" 不写：写了在 iOS 上会直接进相机、反而没有「从相册选」；
-             不写则系统自己弹「拍照 / 相册 / 浏览」三选一。 -->
+        <!-- ⚠️ 两个 input 必须分开，而且 accept 不能混：
+             图片入口只收 image/*，系统才会给「拍照 / 相册」；
+             文档入口只收 PDF/Word/文本，系统才会打开文件选择器（微信里才有机会选聊天文件）。
+             如果文档入口也带 image/*，两边都会变成图库/拍照，等于没有「选文件」。
+             capture="environment" 不写：写了在 iOS 上会直接进相机、反而没有「从相册选」。 -->
         <div class="flex gap-2">
-          <button class="btn btn-primary flex-1 py-4 text-base shadow-lg shadow-indigo-200 md:hidden"
+          <button class="btn btn-primary flex-1 py-4 text-base shadow-lg shadow-indigo-200"
                   :disabled="uploading" @click="triggerPick('cam')">
             <svg class="w-5 h-5" aria-hidden="true"><use href="#i-camera"/></svg>
-            <span>拍照</span>
+            <span class="md:hidden">拍照</span><span class="hidden md:inline">图片</span>
           </button>
           <button class="btn btn-primary py-4 text-base shadow-lg shadow-indigo-200"
                   :class="uploading ? '' : 'flex-1'"
@@ -280,21 +286,22 @@
             <span v-else><span class="spin">⏳</span> 处理中…</span>
           </button>
         </div>
-        <!-- 只收图片：这样系统才会把「拍照」摆在选项里 -->
+        <!-- 图片入口：只收 image/*，系统才会把「拍照 / 相册」摆在选项里 -->
         <input ref="camInput" type="file" accept="image/*" multiple
                class="hidden" @change="onFileChange">
-        <!-- 收全部类型：PDF / Word / 文本 -->
+        <!-- 文档入口：只收文档，系统才会打开文件选择器，不会跳回拍照/相册 -->
         <input ref="fileInput" type="file" multiple
-               accept="image/*,.pdf,.doc,.docx,.txt,.md,application/pdf"
+               accept=".pdf,.doc,.docx,.txt,.md,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown"
                class="hidden" @change="onFileChange">
 
-        <p class="text-xs text-slate-400 mt-2 leading-relaxed">
-          <b class="text-slate-500">拍照</b>：手机上是单独的按钮，点开就能选「拍照」或「从相册选」。
+        <p class="text-xs text-slate-500 mt-2 leading-relaxed">
+          <b class="text-slate-700">拍照 / 图片</b>：只选图片；手机上点开可选「拍照」或「从相册」。
           上传前自动压缩，原图完整保留手写与红笔批改。<br>
-          <b class="text-slate-500">文件</b>：也可以选 PDF / Word / 纯文本，
-          AI 会<b class="text-slate-500">逐页把整份卷子拆成一道一道的题</b>，
-          一题一条分别归档。<br>
-          科目和题型（错题 / 经典题）都由 AI 判断，认错了在详情页直接改。
+          <b class="text-slate-700">选文件</b>：只选文档（PDF / Word / 纯文本），
+          AI 会<b class="text-slate-700">逐页把整份卷子拆成一道一道的题</b>。
+        </p>
+        <p class="text-[11.5px] text-slate-500 mt-1.5">
+          相机、相册或文件没反应？<button class="text-indigo-600 underline font-semibold" @click="showUploadHelp = true">查看权限设置</button>
         </p>
 
 
@@ -371,6 +378,12 @@
           </select>
           <button class="btn btn-primary text-xs py-2 px-4" @click="openExport"><svg class="w-4 h-4" aria-hidden="true"><use href="#i-file"/></svg> 导出 PDF</button>
         </div>
+        <button @click="openTrash"
+                class="w-full flex items-center justify-center gap-1.5 text-xs py-2 rounded-xl border border-slate-200 bg-white text-slate-600 hover:border-slate-300">
+          <svg class="w-4 h-4" aria-hidden="true"><use href="#i-trash"/></svg>
+          回收站
+          <span v-if="stats.trash" class="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500">{{ stats.trash }}</span>
+        </button>
       </div>
 
       <!-- 选择工具条 -->
@@ -381,6 +394,9 @@
         </label>
         <div class="flex-1"></div>
         <span v-if="selectedIds.length" class="text-xs text-indigo-600 font-semibold">已选 {{ selectedIds.length }} 道</span>
+        <button v-if="selectedIds.length" class="btn btn-danger text-xs py-1.5 px-3" @click="deleteSelected">
+          <svg class="w-4 h-4" aria-hidden="true"><use href="#i-trash"/></svg> 删除
+        </button>
         <button v-if="selectedIds.length" class="btn btn-ghost text-xs py-1.5 px-3" @click="selectedIds = []">清空选择</button>
       </div>
 
@@ -996,6 +1012,129 @@
     </div>
   </div>
 
+  <!-- ==================== 绑定手机号弹窗 ==================== -->
+  <div v-if="showPhone" class="fixed inset-0 z-[70] bg-slate-900/50 flex items-center justify-center p-4"
+       @click.self="showPhone = false">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
+      <div class="flex items-center gap-2 px-5 py-3.5 border-b border-slate-100">
+        <svg class="w-4 h-4 text-slate-500" aria-hidden="true"><use href="#i-lock"/></svg>
+        <h3 class="font-bold text-slate-800 flex-1">绑定手机号</h3>
+        <button @click="showPhone = false" class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭">
+          <svg class="w-5 h-5" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <div class="p-5 space-y-3">
+        <p class="text-[12.5px] leading-relaxed text-slate-500">
+          绑了手机号，忘记密码时可以直接用短信重置。手机号只用于登录验证，不会公开。
+        </p>
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 mb-1.5">手机号</label>
+          <input v-model="bindPhone" type="tel" inputmode="numeric" maxlength="11"
+                 placeholder="11 位手机号" :disabled="bindSent"
+                 class="w-full px-3 py-2 text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-indigo-500 outline-none disabled:opacity-60">
+        </div>
+        <div v-if="bindSent">
+          <label class="block text-xs font-semibold text-slate-500 mb-1.5">验证码</label>
+          <input v-model="bindCode" type="text" inputmode="numeric" maxlength="6"
+                 placeholder="6 位数字"
+                 class="w-full px-3 py-2 text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-indigo-500 outline-none">
+          <p class="text-[11px] text-slate-400 mt-1.5">
+            已发送到 {{ bindPhoneMasked }}，{{ bindTtl }} 分钟内有效。
+          </p>
+        </div>
+        <button v-if="!bindSent" class="btn btn-primary w-full py-2.5 text-sm"
+                :disabled="bindBusy || bindPhone.length !== 11" @click="sendBindCode">
+          <span v-if="bindBusy" class="spin">⏳</span><span>发送验证码</span>
+        </button>
+        <button v-else class="btn btn-primary w-full py-2.5 text-sm"
+                :disabled="bindBusy || bindCode.length !== 6" @click="bindPhoneNow">
+          <span v-if="bindBusy" class="spin">⏳</span><span>确认绑定</span>
+        </button>
+        <button v-if="bindSent" class="w-full py-2 text-xs rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-50"
+                :disabled="bindWait > 0 || bindBusy" @click="sendBindCode">
+          {{ bindWait > 0 ? ('重新发送（' + bindWait + 's）') : '重新发送验证码' }}
+        </button>
+        <p v-if="bindErr" class="text-[12px] text-rose-600 text-center">{{ bindErr }}</p>
+        <p v-if="bindOk" class="text-[12px] text-emerald-600 text-center">{{ bindOk }}</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 上传帮助 / 权限 ==================== -->
+  <div v-if="showUploadHelp" class="fixed inset-0 z-[70] bg-slate-900/50 flex items-end sm:items-center justify-center"
+       @click.self="showUploadHelp = false">
+    <div class="bg-white w-full sm:max-w-lg sm:rounded-2xl rounded-t-2xl shadow-2xl max-h-[88vh] flex flex-col">
+      <div class="flex items-center gap-2 px-5 py-3.5 border-b border-slate-100">
+        <svg class="w-4 h-4 text-slate-500" aria-hidden="true"><use href="#i-file"/></svg>
+        <h3 class="font-bold text-slate-800 flex-1">上传帮助</h3>
+        <button @click="showUploadHelp = false" class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭">
+          <svg class="w-5 h-5" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <div class="flex-1 overflow-y-auto px-5 py-4 space-y-3 text-[13px] leading-relaxed text-slate-600">
+        <p><b class="text-slate-800">照片 / 图片</b>：点「拍照 / 图片」，手机上可选「拍照」或「从相册选择」。</p>
+        <p><b class="text-slate-800">文档 / 微信文件</b>：点「选文件」，只打开文档选择器（PDF / Word / 文本）。如果微信里点「选文件」只出现拍照/相册，可以先把聊天里的文件保存到手机/存储到文件，再回来选；或点微信右上角 ··· → 在浏览器打开。</p>
+        <div class="rounded-xl bg-slate-50 p-3">
+          <p class="font-semibold text-slate-800 mb-1">iPhone 权限</p>
+          <p>设置 → 微信 / 浏览器 → 照片、相机、文件 → 允许。若「文件」App 里找不到聊天文件，先在微信里保存到「文件」。</p>
+        </div>
+        <div class="rounded-xl bg-slate-50 p-3">
+          <p class="font-semibold text-slate-800 mb-1">Android 权限</p>
+          <p>设置 → 应用 → 微信 / 浏览器 → 权限 → 相机、存储/照片和视频 → 允许。</p>
+        </div>
+        <div class="rounded-xl bg-slate-50 p-3">
+          <p class="font-semibold text-slate-800 mb-1">电脑浏览器</p>
+          <p>点地址栏左侧的图标 → 网站设置 → 相机 / 文件 → 允许。图片点「图片」，文档点「选文件」。</p>
+        </div>
+      </div>
+      <div class="px-5 py-3 border-t border-slate-100 flex justify-end">
+        <button class="btn btn-primary text-xs py-2 px-4" @click="showUploadHelp = false">知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 回收站弹窗 ==================== -->
+  <div v-if="showTrash" class="fixed inset-0 z-[70] bg-slate-900/50 flex items-end sm:items-center justify-center"
+       @click.self="showTrash = false">
+    <div class="bg-white w-full sm:max-w-lg sm:rounded-2xl rounded-t-2xl shadow-2xl max-h-[88vh] flex flex-col">
+      <div class="flex items-center gap-2 px-5 py-3.5 border-b border-slate-100">
+        <svg class="w-4 h-4 text-slate-500" aria-hidden="true"><use href="#i-trash"/></svg>
+        <h3 class="font-bold text-slate-800 flex-1">回收站</h3>
+        <button @click="showTrash = false" class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭">
+          <svg class="w-5 h-5" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <div class="px-5 py-2.5 text-[12px] text-slate-500 border-b border-slate-100">
+        删除的题在这里保留 {{ trashKeepDays }} 天，到期自动彻底删除。恢复后照片和答疑都还在。
+      </div>
+      <div class="flex-1 overflow-y-auto p-4 space-y-2">
+        <div v-if="!trashItems.length" class="text-center text-slate-400 text-sm py-10">
+          <svg class="w-10 h-10 mx-auto mb-2 text-slate-300" aria-hidden="true"><use href="#i-trash"/></svg>
+          回收站是空的
+        </div>
+        <div v-for="it in trashItems" :key="it.id"
+             class="flex items-center gap-2.5 p-2.5 rounded-xl border border-slate-200">
+          <img :src="it.thumb_url || it.clean_url || it.orig_url" alt=""
+               class="w-11 h-11 rounded-lg object-cover bg-slate-50 border border-slate-200 shrink-0">
+          <div class="flex-1 min-w-0">
+            <p class="text-sm text-slate-700 line-clamp-1">{{ it.title || '（暂无摘要）' }}</p>
+            <p class="text-[10.5px] text-slate-400 mt-0.5">
+              {{ it.subject }} · {{ (it.deleted_at || '').slice(0, 16) }} 删除 · 还剩 {{ it.days_left }} 天
+            </p>
+          </div>
+          <button class="btn btn-ghost text-xs py-1.5 px-2.5 shrink-0" @click="restoreItem(it)">恢复</button>
+          <button class="btn btn-danger text-xs py-1.5 px-2.5 shrink-0" @click="purgeItem(it)">彻底删除</button>
+        </div>
+      </div>
+      <div class="px-5 py-3 border-t border-slate-100 flex items-center gap-2">
+        <button class="btn btn-ghost text-xs py-2 px-3"
+                :disabled="!trashItems.length || trashBusy" @click="emptyTrash">清空回收站</button>
+        <div class="flex-1"></div>
+        <button class="btn btn-primary text-xs py-2 px-4" @click="showTrash = false">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== 导出 PDF 弹窗 ==================== -->
   <transition name="fade">
     <div v-if="showExport"
@@ -1514,6 +1653,11 @@ const app = createApp({
       stats: { total: 0, by_subject: {} },
       me: '',            // 当前登录的用户名，顶栏显示用
       showPw: false, pwOld: '', pwNew: '', pwBusy: false, mustChangePw: false,
+      showPhone: false, bindPhone: '', bindCode: '', bindBusy: false, bindSent: false,
+      bindPhoneMasked: '', bindTtl: 5, bindWait: 0, bindErr: '', bindOk: '',
+      showUploadHelp: false,
+      /* 回收站 */
+      showTrash: false, trashItems: [], trashBusy: false, trashKeepDays: 30,
       /* 导出弹窗 */
       showExport: false,
       exportOpts: {
@@ -1704,6 +1848,67 @@ const app = createApp({
       } catch (e) {
         this.notify('修改失败：' + netErrMsg(e), 'error');
       } finally { this.pwBusy = false; }
+    },
+
+    /* ---------------- 绑定手机号 ---------------- */
+    openPhone() {
+      this.showPhone = true;
+      this.bindPhone = ''; this.bindCode = ''; this.bindSent = false;
+      this.bindErr = ''; this.bindOk = ''; this.bindWait = 0;
+      if (this._bindTimer) { clearInterval(this._bindTimer); this._bindTimer = null; }
+    },
+
+    startBindCountdown(sec) {
+      if (this._bindTimer) clearInterval(this._bindTimer);
+      this.bindWait = sec;
+      this._bindTimer = setInterval(() => {
+        this.bindWait--;
+        if (this.bindWait <= 0) {
+          clearInterval(this._bindTimer); this._bindTimer = null; this.bindWait = 0;
+        }
+      }, 1000);
+    },
+
+    async sendBindCode() {
+      if (this.bindBusy || this.bindWait > 0) return;
+      const phone = (this.bindPhone || '').trim();
+      if (phone.length !== 11) { this.bindErr = '请填 11 位手机号'; return; }
+      this.bindBusy = true; this.bindErr = ''; this.bindOk = '';
+      try {
+        const r = this.guard(await fetch('/api/phone/bind/request', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone })
+        }));
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        this.bindSent = true;
+        this.bindPhoneMasked = d.phone || phone;
+        this.bindTtl = d.ttl_min || 5;
+        this.startBindCountdown(d.resend_after || 60);
+      } catch (e) {
+        this.bindErr = '发送失败：' + netErrMsg(e);
+      } finally { this.bindBusy = false; }
+    },
+
+    async bindPhoneNow() {
+      if (this.bindBusy) return;
+      const phone = (this.bindPhone || '').trim();
+      const code = (this.bindCode || '').trim();
+      if (code.length !== 6) { this.bindErr = '请输入 6 位验证码'; return; }
+      this.bindBusy = true; this.bindErr = ''; this.bindOk = '';
+      try {
+        const r = this.guard(await fetch('/api/phone/bind/verify', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone, code })
+        }));
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        this.bindOk = '绑定成功：' + (d.phone || phone);
+        this.notify('手机号已绑定');
+        setTimeout(() => { this.showPhone = false; }, 1200);
+      } catch (e) {
+        this.bindErr = netErrMsg(e);
+      } finally { this.bindBusy = false; }
     },
 
     async loadHealth() {
@@ -2555,17 +2760,111 @@ const app = createApp({
 
     /* ---------------- 其他 ---------------- */
     async removeItem(it) {
-      if (!confirm('确定删除这道错题吗？原图与纯净图会一并删除，不可恢复。')) return;
+      if (!confirm('把这道题移进回收站？' + this.trashKeepDays + ' 天内可以恢复。')) return;
       try {
         const r = this.guard(await fetch('/api/mistakes/' + it.id, { method: 'DELETE' }));
         if (!r.ok) throw new Error('HTTP ' + r.status);
         this.selectedIds = this.selectedIds.filter(i => i !== it.id);
         this.current = null;
         await this.loadList();
-        this.notify('已删除');
+        await this.loadStats();
+        this.notify('已移进回收站');
       } catch (e) {
-        this.notify('删除失败：' + e.message, 'error');
+        this.notify('删除失败：' + netErrMsg(e), 'error');
       }
+    },
+
+    /* ---------------- 回收站 ---------------- */
+    async deleteSelected() {
+      const ids = this.selectedIds.slice();
+      if (!ids.length) return;
+      if (!confirm('把选中的 ' + ids.length + ' 道题移进回收站？\n'
+                   + this.trashKeepDays + ' 天内可以恢复。')) return;
+      try {
+        const r = this.guard(await fetch('/api/mistakes/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        }));
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        this.selectedIds = [];
+        this.current = null;
+        await this.loadList();
+        await this.loadStats();
+        this.notify('已移进回收站 ' + ((d && d.deleted) || 0) + ' 道');
+      } catch (e) {
+        this.notify('删除失败：' + netErrMsg(e), 'error');
+      }
+    },
+
+    async openTrash() {
+      this.showTrash = true;
+      await this.loadTrash();
+    },
+
+    async loadTrash() {
+      this.trashBusy = true;
+      try {
+        const r = this.guard(await fetchGet('/api/mistakes/trash'));
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        this.trashItems = (d && d.items) || [];
+        this.trashKeepDays = (d && d.keep_days) || 30;
+      } catch (e) {
+        this.notify('回收站加载失败：' + netErrMsg(e), 'error');
+      } finally { this.trashBusy = false; }
+    },
+
+    async restoreItem(it) {
+      this.trashBusy = true;
+      try {
+        const r = this.guard(await fetch('/api/mistakes/restore', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: [it.id] })
+        }));
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        await this.loadTrash();
+        await this.loadList();
+        await this.loadStats();
+        this.notify('已恢复');
+      } catch (e) {
+        this.notify('恢复失败：' + netErrMsg(e), 'error');
+      } finally { this.trashBusy = false; }
+    },
+
+    async purgeItem(it) {
+      if (!confirm('彻底删除这道题？照片、动画和它的答疑记录会一起删掉，不可恢复。')) return;
+      this.trashBusy = true;
+      try {
+        const r = this.guard(await fetch('/api/mistakes/purge', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: [it.id] })
+        }));
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        await this.loadTrash();
+        await this.loadStats();
+        const errs = (d && d.file_errors) || [];
+        this.notify(errs.length ? ('已删除，但有 ' + errs.length + ' 个文件没删掉') : '已彻底删除',
+                    errs.length ? 'error' : 'ok');
+      } catch (e) {
+        this.notify('删除失败：' + netErrMsg(e), 'error');
+      } finally { this.trashBusy = false; }
+    },
+
+    async emptyTrash() {
+      if (!confirm('清空回收站？里面的题会连同照片、动画和答疑记录一起彻底删除，不可恢复。')) return;
+      this.trashBusy = true;
+      try {
+        const r = this.guard(await fetch('/api/mistakes/trash/empty', { method: 'POST' }));
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        await this.loadTrash();
+        await this.loadStats();
+        this.notify('已清空（' + ((d && d.purged) || 0) + ' 道）');
+      } catch (e) {
+        this.notify('清空失败：' + netErrMsg(e), 'error');
+      } finally { this.trashBusy = false; }
     },
 
     biliLink(it) {

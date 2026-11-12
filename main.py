@@ -50,6 +50,7 @@ from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import cv2
 import httpx2                      # openai SDK 内部用的 http 库（不是 httpx）
@@ -245,6 +246,13 @@ def get_conn() -> sqlite3.Connection:
         if "must_change_pw" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
             # 老数据一律 0：他们的口令是本人设的，没有"被重置"这回事
             conn.execute("ALTER TABLE users ADD COLUMN must_change_pw INTEGER NOT NULL DEFAULT 0")
+        if "phone" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
+            # 老用户一律空串（没绑过手机号），照样能用邮箱找回
+            conn.execute("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+        if "phone_verified_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN phone_verified_at TEXT NOT NULL DEFAULT ''")
+        if "phone" not in {r["name"] for r in conn.execute("PRAGMA table_info(signups)")}:
+            conn.execute("ALTER TABLE signups ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         if "user_id" not in cols:
             # 老库里的题还没有归属。留 0，等第一个注册的账号来认领
             # （见 /api/register）—— 直接猜一个用户塞进去反而更糟。
@@ -258,9 +266,16 @@ def get_conn() -> sqlite3.Connection:
             # 加这列之前**只能**上传照片，所以老数据一律回填「照片」——
             # 这是事实不是猜测。不回填的话，老题在详情页会缺一行来源，看着像丢了数据。
             conn.execute("UPDATE mistakes SET source='照片' WHERE source=''")
+        if "deleted_at" not in cols:
+            # 回收站：空串 = 正常，非空 = 删除时间。老数据一律正常。
+            conn.execute("ALTER TABLE mistakes ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''")
         conn.commit()
-    # 管理后台的两张表：新库老库都要有，且不属于上面那个「5 张表齐不齐」的判断
+    # 回收站索引：老库刚在上面的 else 分支里补完 deleted_at，这里才建得出来
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mistakes_active "
+                 "ON mistakes(user_id, deleted_at)")
+    # 管理后台 / 短信的表：新库老库都要有，且不属于上面那个「5 张表齐不齐」的判断
     _create_admin_tables(conn)
+    _create_sms_tables(conn)
     conn.commit()
     return conn
 
@@ -274,7 +289,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             username   TEXT    NOT NULL UNIQUE,
             pw_hash    TEXT    NOT NULL,            -- pbkdf2_sha256$轮数$盐$哈希
-            email      TEXT    NOT NULL DEFAULT '', -- 找回密码用；注册时已验证过
+            email      TEXT    NOT NULL DEFAULT '', -- 老用户的找回密码用；新注册留空
+            phone      TEXT    NOT NULL DEFAULT '', -- E.164（+86...），注册时已验证
+            phone_verified_at TEXT NOT NULL DEFAULT '',
             created_at TEXT    NOT NULL,
             last_login_at TEXT NOT NULL DEFAULT '',  -- 后台的「活跃度」看这一列
             -- 管理员重置过口令 → 置 1。此时除了改密码/登出，其它接口一律拦住，
@@ -304,9 +321,10 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS signups (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             username   TEXT    NOT NULL UNIQUE,
-            email      TEXT    NOT NULL,
+            email      TEXT    NOT NULL DEFAULT '',  -- 老流程用；手机注册留空
+            phone      TEXT    NOT NULL DEFAULT '',  -- 手机注册：E.164
             pw_hash    TEXT    NOT NULL,   -- 先存哈希，验证通过直接搬进 users，明文密码不落库
-            code_hash  TEXT    NOT NULL,   -- 验证码的哈希，不存明文
+            code_hash  TEXT    NOT NULL DEFAULT '',  -- 老流程存哈希；短信由 PNVS 保管验证码
             expires_at TEXT    NOT NULL,
             attempts   INTEGER NOT NULL DEFAULT 0,
             sent_at    TEXT    NOT NULL,
@@ -331,7 +349,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             source      TEXT    NOT NULL DEFAULT '',-- 来源：照片 / 《期中卷》第 3 页 / 文本文件
             user_id     INTEGER NOT NULL DEFAULT 0, -- 归属账号；0 = 还没认领的老数据
             ai_status   TEXT    NOT NULL DEFAULT '',-- ok / no_key / error:xxx
-            created_at  TEXT    NOT NULL
+            created_at  TEXT    NOT NULL,
+            -- 非空 = 在回收站（存删除时间）。所有「正经」查询都必须带 deleted_at=''
+            deleted_at  TEXT    NOT NULL DEFAULT ''
         )
         """
     )
@@ -339,6 +359,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON mistakes(created_at DESC)")
     # 每个请求都要按 user_id 过滤，这个索引是必须的
     conn.execute("CREATE INDEX IF NOT EXISTS idx_owner ON mistakes(user_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mistakes_active ON mistakes(user_id, deleted_at)")
     # 与 AI 的对话记录（按错题隔离，持久化，关了浏览器也还在）
     conn.execute(
         """
@@ -378,7 +399,37 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     # 列一定存在了，现在才能建索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_owner ON chats(user_id, id)")
     _create_admin_tables(conn)
+    _create_sms_tables(conn)
     conn.commit()
+
+
+def _create_sms_tables(conn) -> None:
+    """
+    短信验证码的发送记录。**无条件执行**（理由同 _create_admin_tables：
+    get_conn 里的表数量判断只数原来 5 张表，新表并进去会把它算乱）。
+
+    一行 = 一次发送。验证码由阿里云 PNVS 生成并保管，我们只记
+    requestId / 有效期 / 试错次数；mock 模式才用 mock_hash 存本地码。
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sms_codes (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          phone      TEXT    NOT NULL,
+          purpose    TEXT    NOT NULL,            -- signup / reset / bind
+          request_id TEXT    NOT NULL DEFAULT '',
+          biz_id     TEXT    NOT NULL DEFAULT '',
+          mock_hash  TEXT    NOT NULL DEFAULT '',
+          created_at TEXT    NOT NULL,
+          expires_at TEXT    NOT NULL,
+          attempts   INTEGER NOT NULL DEFAULT 0,
+          ip         TEXT    NOT NULL DEFAULT '',
+          consumed   INTEGER NOT NULL DEFAULT 0
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_phone "
+                 "ON sms_codes(phone, purpose, created_at DESC)")
+    # 一个手机号只能绑一个账号。部分索引：空串（老用户/未绑定）不参与唯一性。
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone "
+                 "ON users(phone) WHERE phone <> ''")
 
 
 def _create_admin_tables(conn) -> None:
@@ -1482,7 +1533,7 @@ def fetch_for_export(req: ExportReq) -> List[Dict[str, Any]]:
     # ⚠️ 归属过滤无条件加上，且**不参与 scope 分支**。
     # 之前这里没有它：构造一个 scope="selected" 带上别人的 id，
     # 就能把别人的错题导出成 PDF 拿走 —— 多用户下这是最直白的数据泄露。
-    conds, args = ["user_id = ?"], [current_uid()]
+    conds, args = ["user_id = ?", "deleted_at = ''"], [current_uid()]
     if req.scope == "filter":
         # 「当前筛选」= 左边列表正在显示的那些条件，所以要跟列表用同一套筛选，
         # 否则用户筛出「经典题」再点导出，印出来的却混着错题。
@@ -1780,6 +1831,35 @@ SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 SMTP_FROM = os.getenv("SMTP_FROM", "").strip() or SMTP_USER
 MAIL_READY = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
 
+# ── 短信（阿里云号码认证服务 PNVS）──────────────────────────────────────────
+# 为什么用 PNVS 而不是「短信服务」：PNVS 的短信认证用**系统签名 + 系统模板**，
+# 不需要自己申请签名/模板（那要审核 1~2 天），开通服务、拿 AccessKey 就能发。
+#   PNVS_ACCESS_KEY_ID / PNVS_ACCESS_KEY_SECRET  RAM 子账号，只授
+#       dypns:SendSmsVerifyCode / dypns:CheckSmsVerifyCode
+#   PNVS_SIGN_NAME       控制台里的系统签名
+#   PNVS_TEMPLATE_CODE   系统模板号，形如 100001
+#   PNVS_SCHEME_NAME     发送与校验必须一致，默认「默认方案」
+#   PNVS_MOCK=1          不调阿里云，本地模拟（测试用，验证码打进日志）
+# 环境变量两种写法都认：优先 ALIYUN_PNVS_*（部署时用的这套），
+# 再退到 PNVS_*（短名，方便本机测试）。
+PNVS_ACCESS_KEY_ID = (os.getenv("ALIYUN_PNVS_ACCESS_KEY_ID")
+                      or os.getenv("PNVS_ACCESS_KEY_ID") or "").strip()
+PNVS_ACCESS_KEY_SECRET = (os.getenv("ALIYUN_PNVS_ACCESS_KEY_SECRET")
+                          or os.getenv("PNVS_ACCESS_KEY_SECRET") or "").strip()
+PNVS_SIGN_NAME = (os.getenv("ALIYUN_PNVS_SIGN_NAME")
+                  or os.getenv("PNVS_SIGN_NAME") or "").strip()
+PNVS_TEMPLATE_CODE = (os.getenv("ALIYUN_PNVS_TEMPLATE_CODE")
+                      or os.getenv("PNVS_TEMPLATE_CODE") or "").strip()
+PNVS_SCHEME_NAME = (os.getenv("ALIYUN_PNVS_SCHEME_NAME")
+                    or os.getenv("PNVS_SCHEME_NAME") or "默认方案").strip() or "默认方案"
+PNVS_REGION = os.getenv("PNVS_REGION", "cn-hangzhou").strip() or "cn-hangzhou"
+PNVS_MOCK = os.getenv("PNVS_MOCK", "").strip().lower() in ("1", "true", "yes", "on")
+SMS_READY = PNVS_MOCK or bool(PNVS_ACCESS_KEY_ID and PNVS_ACCESS_KEY_SECRET
+                              and PNVS_SIGN_NAME and PNVS_TEMPLATE_CODE)
+SMS_CODE_TTL_SEC = 300        # 和 PNVS 的 ValidTime 对齐（5 分钟）
+SMS_MAX_TRY = 5               # 一个验证码最多试几次
+SMS_DAILY_CAP = int(os.getenv("SMS_DAILY_CAP", "200") or 200)
+
 VERIFY_TTL_MIN = 10           # 验证码有效期
 VERIFY_MAX_TRY = 5            # 一个验证码最多试几次
 VERIFY_RESEND_SEC = 60        # 同一邮箱多久才能重发一次（防轰炸）
@@ -1790,6 +1870,7 @@ VERIFY_RESEND_SEC = 60        # 同一邮箱多久才能重发一次（防轰炸
 SIGNUP_CODE = os.getenv("SIGNUP_CODE", "").strip()
 LOGIN_MAX_FAIL = 8                    # 单 IP 窗口内允许的失败次数
 LOGIN_WINDOW = 600                    # 限流窗口（秒）
+TRASH_KEEP_DAYS = 30                  # 回收站保留天数，到期自动彻底删除
 PBKDF2_ROUNDS = 120_000               # 每次校验约 50ms，本身就是一道暴力破解门槛
 
 # ── 管理后台（/admin） ──────────────────────────────────────────────────────
@@ -2184,6 +2265,238 @@ def mask_email(addr: str) -> str:
         return "***"
 
 
+# ── 手机号 / 短信（阿里云号码认证服务 PNVS）────────────────────────────────
+PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+
+
+def normalize_phone(raw: str) -> Optional[str]:
+    """把用户输入统一成 E.164（+86...）。认不出返回 None。
+
+    接受 13812345678 / +86 138 1234 5678 / 86-138-1234-5678 / 带括号的写法。
+    只支持中国大陆手机号。
+    """
+    s = re.sub(r"[\s\-()（）]", "", (raw or "").strip())
+    if s.startswith("+86"):
+        s = s[3:]
+    elif s.startswith("86") and len(s) == 13:
+        s = s[2:]
+    return "+86" + s if PHONE_RE.match(s) else None
+
+
+def mask_phone(phone: str) -> str:
+    """+8613812345678 → 138****5678。日志、接口返回、后台一律用它。"""
+    s = (phone or "").strip()
+    if s.startswith("+86"):
+        s = s[3:]
+    return s[:3] + "****" + s[-4:] if len(s) == 11 else "***"
+
+
+def _pnvs_phone(phone: str) -> str:
+    """PNVS 的 PhoneNumber 要**国内 11 位号码**，国家码由 CountryCode 单独传。
+
+    ⚠️ 传 "+8613800138000" 会被网关拒掉，报 isp.SYSTEM_ERROR「网元系统异常」——
+    这个错看着像运营商故障，其实是号码格式不对。库里仍然存 E.164，调用前再剥。
+    """
+    s = (phone or "").strip()
+    return s[3:] if s.startswith("+86") else s
+
+
+def _pnvs_encode(s: str) -> str:
+    return quote(str(s), safe="~")
+
+
+def _pnvs_request(action: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """调用阿里云 RPC 接口（HMAC-SHA1 签名），返回解析后的 JSON。"""
+    base = {
+        "AccessKeyId": PNVS_ACCESS_KEY_ID,
+        "Action": action,
+        "Format": "JSON",
+        "RegionId": PNVS_REGION,
+        "SignatureMethod": "HMAC-SHA1",
+        "SignatureNonce": secrets.token_hex(16),
+        "SignatureVersion": "1.0",
+        "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "Version": "2017-05-25",
+    }
+    base.update({k: str(v) for k, v in params.items()})
+    canonical = "&".join(f"{_pnvs_encode(k)}={_pnvs_encode(base[k])}"
+                         for k in sorted(base))
+    to_sign = "GET&%2F&" + _pnvs_encode(canonical)
+    base["Signature"] = base64.b64encode(
+        hmac.new((PNVS_ACCESS_KEY_SECRET + "&").encode(), to_sign.encode(),
+                 hashlib.sha1).digest()).decode()
+    r = httpx2.get("https://dypnsapi.aliyuncs.com/", params=base, timeout=10.0)
+    return r.json()
+
+
+# 把阿里云的英文错误码翻成人话。直接把 Code 抛给用户等于没说。
+PNVS_ERRORS = {
+    "isv.MOBILE_NUMBER_ILLEGAL": "手机号格式不正确，请检查后重试",
+    "isv.BUSINESS_LIMIT_CONTROL": "发送太频繁，请稍后再试",
+    "isv.SMS_TEMPLATE_ILLEGAL": "短信模板不可用，请联系管理员检查配置",
+    "isv.SMS_SIGNATURE_ILLEGAL": "短信签名不可用，请联系管理员检查配置",
+    "isv.AMOUNT_NOT_ENOUGH": "短信余额不足，请联系管理员充值",
+    "isv.OUT_OF_SERVICE": "短信服务未开通或已欠费",
+    "biz.FREQUENCY": "发送太频繁，请稍后再试",
+    "isp.SYSTEM_ERROR": "运营商网关异常，请稍后重试",
+    "UNKNOWN": "短信服务返回未知错误，请稍后重试",
+}
+
+
+def _pnvs_error(d: Dict[str, Any]) -> str:
+    code = str(d.get("Code") or "")
+    return PNVS_ERRORS.get(code) or d.get("Message") or code or "发送失败"
+
+
+def pnvs_send(phone: str, purpose: str, ip: str = "") -> Tuple[bool, str]:
+    """发一条短信验证码，并记一行 sms_codes。返回 (成功, 错误说明)。
+
+    ⚠️ TemplateParam 必须是 {"code": "##code##"}：##code## 是占位符，
+    验证码由阿里云生成并保管。自己写死一个码，CheckSmsVerifyCode 永远不过。
+    """
+    now = datetime.now()
+    expires = (now + timedelta(seconds=SMS_CODE_TTL_SEC)).strftime("%Y-%m-%d %H:%M:%S")
+    mock_hash = ""
+    if PNVS_MOCK:
+        code = "".join(secrets.choice("0123456789") for _ in range(6))
+        mock_hash = _code_hash(f"sms:{phone}:{purpose}", code)
+        request_id, biz_id = "mock-" + secrets.token_hex(8), ""
+        # mock 模式没有真短信，验证码只打进服务器日志，供测试脚本读取
+        print(f"[SMS-MOCK] {mask_phone(phone)} {purpose} code={code}", flush=True)
+    else:
+        try:
+            d = _pnvs_request("SendSmsVerifyCode", {
+                "PhoneNumber": _pnvs_phone(phone),
+                "SignName": PNVS_SIGN_NAME,
+                "TemplateCode": PNVS_TEMPLATE_CODE,
+                "SchemeName": PNVS_SCHEME_NAME,
+                "CountryCode": "86",
+                "CodeLength": "6",
+                "ValidTime": str(SMS_CODE_TTL_SEC),
+                "Interval": str(VERIFY_RESEND_SEC),
+                # min 是短信文案里「N 分钟内有效」那个数字，官方示例要求带上
+                "TemplateParam": json.dumps({"code": "##code##", "min": "5"}),
+            })
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        if d.get("Code") != "OK":
+            return False, _pnvs_error(d)
+        model = d.get("Model") or {}
+        request_id = str(d.get("RequestId") or "")
+        biz_id = str(model.get("BizId") or "")
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO sms_codes (phone, purpose, request_id, biz_id, mock_hash,"
+            " created_at, expires_at, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (phone, purpose, request_id, biz_id, mock_hash,
+             now.strftime("%Y-%m-%d %H:%M:%S"), expires, ip))
+    return True, "已发送"
+
+
+def pnvs_check(phone: str, code: str, purpose: str) -> Tuple[bool, str]:
+    """校验短信验证码。返回 (通过, 失败说明)。
+
+    只认 CheckSmsVerifyCode 返回的 Model.VerifyResult == "PASS" ——
+    接口 Code=OK 只代表调用成功，不代表验证码正确（官方文档明确说明）。
+    """
+    if not code:
+        return False, "请输入验证码"
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT * FROM sms_codes WHERE phone=? AND purpose=? AND consumed=0"
+            " ORDER BY id DESC LIMIT 1", (phone, purpose)).fetchone()
+    if not row:
+        return False, "验证码不正确或已过期，请重新获取"
+    if row["attempts"] >= SMS_MAX_TRY:
+        return False, "这个验证码试错太多次了，请重新获取"
+    if datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.now():
+        return False, "验证码不正确或已过期，请重新获取"
+
+    if PNVS_MOCK:
+        ok = hmac.compare_digest(row["mock_hash"] or "",
+                                 _code_hash(f"sms:{phone}:{purpose}", code))
+    else:
+        try:
+            d = _pnvs_request("CheckSmsVerifyCode", {
+                "PhoneNumber": _pnvs_phone(phone),
+                "VerifyCode": code,
+                "SchemeName": PNVS_SCHEME_NAME,
+                "CountryCode": "86",
+            })
+        except Exception as e:
+            return False, f"短信服务暂时不可用：{type(e).__name__}"
+        ok = ((d.get("Model") or {}).get("VerifyResult") == "PASS")
+
+    with closing(get_conn()) as conn, conn:
+        if ok:
+            conn.execute("UPDATE sms_codes SET consumed=1 WHERE id=?", (row["id"],))
+        else:
+            conn.execute("UPDATE sms_codes SET attempts=attempts+1 WHERE id=?", (row["id"],))
+    return (True, "验证通过") if ok else (False, "验证码不正确或已过期，请重新获取")
+
+
+def sms_throttle(phone: str, ip: str) -> int:
+    """短信发送四道闸。返回还要等几秒；0 = 可以发，并立刻记账。
+
+    同一手机号：60 秒 / 5 次每小时 / 10 次每天
+    同一 IP：10 次每小时 / 30 次每天
+    全站：SMS_DAILY_CAP 条每天（兜底防烧钱）
+    """
+    now = datetime.now()
+    now_s = now.strftime("%Y-%m-%d %H:%M:%S")
+    hour_ago = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    pkey, ikey = "sms:phone:" + phone, "sms:ip:" + ip
+    with closing(get_conn()) as conn, conn:
+        last = conn.execute(
+            "SELECT sent_at FROM mail_log WHERE key=? ORDER BY sent_at DESC LIMIT 1",
+            (pkey,)).fetchone()
+        if last:
+            try:
+                gap = (now - datetime.strptime(
+                    last["sent_at"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                if gap < VERIFY_RESEND_SEC:
+                    return int(VERIFY_RESEND_SEC - gap) + 1
+            except ValueError:
+                pass
+
+        def cnt(key, since):
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM mail_log WHERE key=? AND sent_at>=?",
+                (key, since)).fetchone()["n"]
+
+        if cnt(pkey, hour_ago) >= 5 or cnt(ikey, hour_ago) >= 10:
+            return 3600
+        if cnt(pkey, day_ago) >= 10 or cnt(ikey, day_ago) >= 30:
+            return 86400
+        if cnt("sms:global", day_ago) >= SMS_DAILY_CAP:
+            return 86400
+        for k in (pkey, ikey, "sms:global"):
+            conn.execute("INSERT INTO mail_log (key, sent_at) VALUES (?,?)", (k, now_s))
+    return 0
+
+
+def sms_throttle_undo(phone: str, ip: str) -> None:
+    """发送失败时撤掉刚记的节流行，让用户能立刻重试。
+
+    只删最近 15 秒内的记录：万一有并发，别人刚发成功的那条不会被误删。
+    """
+    cutoff = (datetime.now() - timedelta(seconds=15)).strftime("%Y-%m-%d %H:%M:%S")
+    keys = ("sms:phone:" + phone, "sms:ip:" + ip, "sms:global")
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "DELETE FROM mail_log WHERE key IN (?,?,?) AND sent_at>=?",
+            keys + (cutoff,))
+
+
+def _sms_wait_msg(wait: int) -> str:
+    if wait >= 3600:
+        return f"发送太频繁，请 {max(1, wait // 3600)} 小时后再试"
+    if wait >= 60:
+        return f"发送太频繁，请 {wait // 60} 分钟后再试"
+    return f"验证码刚发过，请 {wait} 秒后再试"
+
+
 def _client_ip(request) -> str:
     """
     真实客户端 IP（登录限流按它分桶）。
@@ -2226,21 +2539,59 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#4f46e5">
-<title>登录 · 我的AI学习助手</title>
+<title>我的AI学习助手 · 错题要弄懂，好题要留住</title>
+<meta name="description" content="错题、经典题拍张照就能录入：自动整理干净，AI 一步一步讲到你懂，同类变式题练到会。每个账号只看到自己的题目、照片和对话。">
+<meta property="og:title" content="我的AI学习助手">
+<meta property="og:description" content="错题要弄懂，好题要留住。拍张照就能录入，AI 讲到懂。">
+<meta property="og:type" content="website">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
   *{box-sizing:border-box}
-  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-       background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:20px;
+  html,body{height:100%}
+  body{margin:0;background:#fff;color:#1e293b;
        font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
-  .card{background:#fff;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.28);
-        width:100%;max-width:380px;padding:32px 26px}
-  .logo{text-align:center;line-height:0}
-  .logo svg{width:60px;height:60px}
-  h1{font-size:19px;text-align:center;margin:14px 0 4px;color:#1e293b}
-  p.sub{text-align:center;color:#94a3b8;font-size:12px;margin:0 0 22px}
+  .shell{display:flex;min-height:100vh}
+
+  /* ── 左边：介绍 ────────────────────────────────────────────────
+     这一栏是给没登录的人看的：说清楚这工具到底解决什么、怎么用。
+     窄屏下整栏折叠成「品牌 + 表单」，见文件末尾的媒体查询。 */
+  .intro{flex:1 1 56%;position:relative;overflow:hidden;display:flex;flex-direction:column;
+         justify-content:center;padding:52px clamp(30px,5.5vw,78px);color:#fff;
+         background:linear-gradient(135deg,#4f46e5 0%,#6d28d9 58%,#7c3aed 100%)}
+  .intro::before,.intro::after{content:"";position:absolute;border-radius:50%;pointer-events:none}
+  .intro::before{width:580px;height:580px;top:-220px;right:-180px;
+                 background:radial-gradient(circle,rgba(255,255,255,.17),transparent 68%)}
+  .intro::after{width:480px;height:480px;bottom:-240px;left:-160px;
+                background:radial-gradient(circle,rgba(255,255,255,.10),transparent 70%)}
+  .intro>*{position:relative;z-index:1}
+  .brand{display:flex;align-items:center;gap:12px;font-size:18px;font-weight:800;letter-spacing:.3px}
+  .brand .mark{width:44px;height:44px;border-radius:12px;background:#fff;display:grid;place-items:center;
+               box-shadow:0 8px 22px rgba(15,23,42,.22)}
+  .brand svg{width:36px;height:36px;display:block}
+  .intro h2{margin:38px 0 16px;font-size:clamp(26px,3.1vw,36px);line-height:1.38;
+            font-weight:800;letter-spacing:.5px}
+  .intro .lead{margin:0 0 34px;max-width:35em;font-size:15px;line-height:1.95;color:rgba(255,255,255,.82)}
+  .feats{list-style:none;margin:0;padding:0;display:grid;gap:17px;max-width:34em}
+  .feats li{display:flex;gap:13px;align-items:flex-start}
+  .feats .ic{flex:0 0 32px;height:32px;border-radius:10px;background:rgba(255,255,255,.16);
+             display:grid;place-items:center;margin-top:1px}
+  .feats .ic svg{width:17px;height:17px}
+  .feats b{display:block;margin-bottom:3px;font-size:14.5px;font-weight:700}
+  .feats span{display:block;font-size:12.8px;line-height:1.7;color:rgba(255,255,255,.72)}
+  .steps{display:flex;gap:10px;margin-top:36px;max-width:34em}
+  .steps div{flex:1;padding:11px 13px;border-radius:12px;
+             background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.15)}
+  .steps b{display:block;margin-bottom:2px;font-size:13px;font-weight:700}
+  .steps span{font-size:11.5px;color:rgba(255,255,255,.66)}
+
+  /* ── 右边：表单 ──────────────────────────────────────────────── */
+  .panel{flex:0 0 44%;display:flex;align-items:center;justify-content:center;
+         padding:40px 28px;background:#fff}
+  .card{width:100%;max-width:392px}
+  h1{margin:0 0 6px;font-size:25px;color:#0f172a;letter-spacing:.3px}
+  p.sub{margin:0 0 24px;color:#94a3b8;font-size:12.5px}
   label{display:block;font-size:13px;color:#475569;font-weight:600;margin-bottom:6px}
   input{width:100%;padding:13px 14px;font-size:16px;border:1.5px solid #e2e8f0;border-radius:11px;
         outline:none;transition:.15s;background:#f8fafc}
@@ -2261,24 +2612,88 @@ LOGIN_PAGE = """<!DOCTYPE html>
   .tabs button.on{background:#fff;color:#4f46e5;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   .tabs button:hover{background:transparent}
   .tabs button.on:hover{background:#fff}
+
+  /* 矮屏笔记本：左边内容压紧一点，别被裁掉 */
+  @media (min-width:881px) and (max-height:730px){
+    .intro h2{font-size:27px;margin:26px 0 12px}
+    .intro .lead{margin-bottom:24px;line-height:1.8}
+    .feats{gap:12px}
+    .steps{margin-top:24px}
+  }
+
+  /* ── 窄屏：介绍收起，只留品牌，表单占满（观感和原来一致）──────── */
+  @media (max-width:880px){
+    body{background:linear-gradient(135deg,#4f46e5,#7c3aed)}
+    .shell{display:block;min-height:0}
+    .intro{display:block;padding:34px 20px 24px;background:none;overflow:visible}
+    .intro::before,.intro::after{display:none}
+    .intro h2,.intro .lead,.feats,.steps{display:none}
+    .brand{justify-content:center;font-size:17px}
+    .brand .mark{width:40px;height:40px;border-radius:11px}
+    .brand svg{width:32px;height:32px}
+    .panel{display:block;padding:0 20px 44px;background:transparent}
+    .card{max-width:420px;margin:0 auto;padding:26px 22px;background:#fff;border-radius:18px;
+          box-shadow:0 18px 50px rgba(0,0,0,.28)}
+  }
+  @media (max-width:380px){ .card{padding:22px 18px} }
 </style></head><body>
-<form class="card" id="f">
-  <div class="logo"><!-- 与 favicon / 顶栏 #i-book 同一枚图标 -->
-    <svg viewBox="0 0 32 32" aria-hidden="true">
-      <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stop-color="#4f46e5"/><stop offset="1" stop-color="#7c3aed"/>
-      </linearGradient></defs>
-      <rect width="32" height="32" rx="7.2" fill="url(#lg)"/>
-      <g fill="none" stroke="#ffffff" stroke-width="1.95"
-         stroke-linecap="round" stroke-linejoin="round"
-         transform="translate(2.6667 2.6667) scale(1.1111)">
-        <path d="M4 19V5.5A2.5 2.5 0 0 1 6.5 3H19a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-2H20"/>
-        <path d="M8 7h7"/>
-      </g>
-    </svg>
-  </div>
-  <h1>我的AI学习助手</h1>
-  <p class="sub" id="sub">登录后看到的是你自己的错题</p>
+<div class="shell">
+  <aside class="intro">
+    <div class="brand">
+      <span class="mark"><!-- 与 favicon / 顶栏 #i-book 同一枚图标 -->
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#4f46e5"/><stop offset="1" stop-color="#7c3aed"/>
+          </linearGradient></defs>
+          <rect width="32" height="32" rx="7.2" fill="url(#lg)"/>
+          <g fill="none" stroke="#ffffff" stroke-width="1.95"
+             stroke-linecap="round" stroke-linejoin="round"
+             transform="translate(2.6667 2.6667) scale(1.1111)">
+            <path d="M4 19V5.5A2.5 2.5 0 0 1 6.5 3H19a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-2H20"/>
+            <path d="M8 7h7"/>
+          </g>
+        </svg>
+      </span>
+      我的AI学习助手
+    </div>
+
+    <h2>错题要弄懂，<br>好题要留住。</h2>
+    <p class="lead">拍一张照就行：做错的题，AI 一步一步讲到你懂，再出同类变式题练到会；遇到值得反复琢磨的经典题，也收进同一个本子。</p>
+
+    <ul class="feats">
+      <li>
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 7.5h3l1.4-2h6.2l1.4 2h3a1 1 0 0 1 1 1v8.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.1"/></svg></span>
+        <div><b>拍照就整理好</b><span>一次可选多张，自动擦掉笔迹和阴影；错题、经典题都能录。</span></div>
+      </li>
+      <li>
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5a2 2 0 0 1-2 2H8.5L4.5 19.5V6a2 2 0 0 1 2-2h11.5a2 2 0 0 1 2 2z"/><path d="M8.5 9h7M8.5 12.5h4.5"/></svg></span>
+        <div><b>讲到你真懂</b><span>不直接甩答案，一步一步拆开讲；哪步没听明白，接着问。</span></div>
+      </li>
+      <li>
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4.5V10h-5.5"/></svg></span>
+        <div><b>练到会为止</b><span>一键生成同类变式题；到期的题会进「今天该复习」，不会存进去就沉底。</span></div>
+      </li>
+      <li>
+        <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10" width="15" height="10" rx="2"/><path d="M8.5 10V7.2a3.5 3.5 0 0 1 7 0V10"/></svg></span>
+        <div><b>只属于你的题库</b><span>错题和经典题放在同一个本子里，每个账号互相看不到。</span></div>
+      </li>
+    </ul>
+
+    <div class="steps">
+      <div><b>1 · 拍照</b><span>拍下题目，自动整理</span></div>
+      <div><b>2 · 听懂</b><span>分步讲解，随时追问</span></div>
+      <div><b>3 · 练会</b><span>变式练习，到期复习</span></div>
+    </div>
+  </aside>
+
+  <main class="panel">
+    <form class="card" id="f">
+      <h1>欢迎回来</h1>
+      <p class="sub" id="sub">错题和经典题，都只属于你</p>
 
   <div class="tabs">
     <button type="button" id="tab-login" class="on">登录</button>
@@ -2299,10 +2714,11 @@ LOGIN_PAGE = """<!DOCTYPE html>
     <input id="p" type="password" autocomplete="current-password"
            inputmode="latin" autocapitalize="off" autocorrect="off" placeholder="请输入密码">
   </div>
-  <div class="field" id="email-field" style="display:none">
-    <label for="em">邮箱</label>
-    <input id="em" type="email" autocomplete="email" inputmode="email"
-           autocapitalize="off" autocorrect="off" placeholder="用于接收验证码和找回密码">
+  <div class="field" id="phone-field" style="display:none">
+    <label for="ph" id="ph-label">手机号</label>
+    <input id="ph" type="tel" autocomplete="tel" inputmode="numeric"
+           autocapitalize="off" autocorrect="off" maxlength="11"
+           placeholder="11 位手机号，只用于登录验证">
   </div>
   <div class="field" id="code-field" style="display:none">
     <label for="cd">验证码</label>
@@ -2329,23 +2745,25 @@ LOGIN_PAGE = """<!DOCTYPE html>
   <button type="submit" id="b">进入</button>
   <div class="err" id="e"></div>
   <div class="tip" id="tip">
-    每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。
+    每个账号只看到自己的题目、照片和对话。<br>还没有账号？点上面的「注册」。
   </div>
-</form>
+    </form>
+  </main>
+</div>
 <script>
   var f=document.getElementById('f'),u=document.getElementById('u'),p=document.getElementById('p'),
-      iv=document.getElementById('iv'),em=document.getElementById('em'),cd=document.getElementById('cd'),
+      iv=document.getElementById('iv'),ph=document.getElementById('ph'),cd=document.getElementById('cd'),
       codeHint=document.getElementById('code-hint'),codeField=document.getElementById('code-field'),
-      emailField=document.getElementById('email-field'),
+      phoneField=document.getElementById('phone-field'),phLabel=document.getElementById('ph-label'),
       b=document.getElementById('b'),e=document.getElementById('e'),
       tip=document.getElementById('tip'),sub=document.getElementById('sub'),
       inviteField=document.getElementById('invite-field'),resetLink=document.getElementById('reset-link'),
       tabLogin=document.getElementById('tab-login'),tabReg=document.getElementById('tab-reg'),
       mode='login';
-  // 邮件服务是否可用。**初始按可用算**，拿到服务端答复才降级 ——
+  // 短信 / 邮件服务是否可用。**初始按可用算**，拿到服务端答复才降级 ——
   // 反过来（默认不可用）会让接口偶发失败时把注册永久锁死。
-  var mailReady = true;
-  var pending = {username:'', email:''};   // 跨步骤要用的中间状态
+  var smsReady = true, mailReady = true;
+  var pending = {username:'', account:''};   // 跨步骤要用的中间状态
   var resendTimer = null;
 
   function show(el, on){ el.style.display = on ? '' : 'none'; }
@@ -2376,17 +2794,18 @@ LOGIN_PAGE = """<!DOCTYPE html>
     // 我上一版在 reset 模式下把两个都禁用了 —— 用户点了「忘记密码」之后
     // 就再也切不回登录，被困在一张重填密码的表单里。标签是出口，出口不能锁。
     tabLogin.disabled = false;
-    tabReg.disabled   = !mailReady;
+    tabReg.disabled   = !smsReady;   // 新注册必须手机验证；邮件救不了
 
     // 字段显隐：**只留这一步真正用得上的**
     // 「重置第一步」只要邮箱。之前把用户名和密码也留着，用户点完「忘记密码」
     // 看到的还是一张登录表单，自然会觉得「点了没反应」。
     show(u.closest('.field'),  !isReset && !isReset2);   // 重置流程里用户名无关
     show(p.closest('.field'),  !isReset);                // 第一步不要密码；第二步当「新密码」
-    show(emailField,           isReg || isReset || isReset2);
+    show(phoneField,           isReg || isReset || isReset2);
     show(codeField,            isVerify || isReset2);
     show(inviteField,          isReg && inviteField.dataset.needed==='1');
-    show(resetLink,            m === 'login' && mailReady);
+    // 找回密码：手机走短信、老用户走邮箱，两条通道任意一条能用就显示入口
+    show(resetLink,            m === 'login' && (smsReady || mailReady));
 
     // 第二步的「密码」其实要填的是新密码，标签得跟着改
     document.querySelector('label[for="p"]').textContent =
@@ -2394,27 +2813,35 @@ LOGIN_PAGE = """<!DOCTYPE html>
     p.setAttribute('autocomplete', (isReg || isReset2) ? 'new-password' : 'current-password');
     if (isReset2) p.value = '';
 
-    u.disabled = isVerify || isReset || isReset2;        // 这几个阶段用户名/邮箱已经定了
-    em.disabled = isReset2;
+    // 同一个输入框：注册时只收手机号；找回时手机号和老邮箱都收
+    phLabel.textContent = isReg ? '手机号' : '手机号 / 邮箱';
+    ph.setAttribute('type', isReg ? 'tel' : 'text');
+    ph.setAttribute('inputmode', isReg ? 'numeric' : 'text');
+    ph.setAttribute('maxlength', isReg ? '11' : '120');
+    ph.placeholder = isReg ? '11 位手机号，只用于登录验证'
+                           : '手机号，或当初注册用的邮箱';
+
+    u.disabled = isVerify || isReset || isReset2;        // 这几个阶段用户名/手机号已经定了
+    ph.disabled = isReset2;
 
     b.textContent = btnText(m);
     sub.textContent = {
-      login:   '登录后看到的是你自己的错题',
-      register:'注册需要邮箱验证，验证通过才算建成',
-      verify:  '验证码已发到你的邮箱',
-      reset:   '输入注册时的邮箱，我们把验证码发过去',
-      reset2:  '输入邮件里的验证码，设置新密码'
+      login:   '错题和经典题，都只属于你',
+      register:'注册需要手机验证，验证通过才算建成',
+      verify:  '验证码已发到你的手机',
+      reset:   '输入手机号或注册邮箱，我们把验证码发过去',
+      reset2:  '输入收到的验证码，设置新密码'
     }[m];
-    // 邮件没配好时，说明必须在**每一次**渲染里都带上 —— 之前在 fetch 回调里
+    // 短信没配好时，说明必须在**每一次**渲染里都带上 —— 之前在 fetch 回调里
     // 直接改 tip.innerHTML，用户一点「登录」就被这里覆盖掉，于是
     // 「为什么注册点不动」变得没有任何解释。
-    tip.innerHTML = !mailReady
-      ? '服务器还没有配置邮件服务，暂时无法注册或找回密码。<br>已有账号仍可正常登录。'
+    tip.innerHTML = !smsReady
+      ? '服务器还没有配置短信服务，暂时无法注册。<br>已有账号仍可登录；老用户仍可用邮箱找回密码。'
       : {
-        login:   '每个账号只看到自己的错题、照片和对话。<br>还没有账号？点上面的「注册」。',
-        register:'用户名注册后不能改。<br>密码至少 6 位。',
-        verify:  '收不到？看看垃圾邮件，或点下面的按钮重新发送。',
-        reset:   '这个邮箱有没有注册过，我们都会给出同样的提示。',
+        login:   '每个账号只看到自己的题目、照片和对话。<br>还没有账号？点上面的「注册」。',
+        register:'用户名注册后不能改。<br>密码至少 6 位；手机号只用于登录验证。',
+        verify:  '收不到？看看手机短信，或点下面的按钮重新发送。',
+        reset:   '这个手机号/邮箱有没有注册过，我们都会给出同样的提示。',
         reset2:  '重置成功后会自动登录，其它设备的登录状态不受影响。'
       }[m];
     e.style.display='none';
@@ -2423,7 +2850,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
   tabLogin.onclick = function(){ setMode('login'); };
   tabReg.onclick   = function(){ setMode('register'); };
   document.getElementById('forgot').onclick = function(ev){
-    ev.preventDefault(); setMode('reset'); em.focus();
+    ev.preventDefault(); setMode('reset'); ph.focus();
   };
 
   /* 重发倒计时。服务端 VERIFY_RESEND_SEC 秒内不让重发，
@@ -2453,14 +2880,14 @@ LOGIN_PAGE = """<!DOCTYPE html>
     try{
       var reg = (mode === 'verify');
       var url = reg ? '/api/register/resend' : '/api/reset/request';
-      var body = reg ? {username: pending.username} : {email: pending.email};
+      var body = reg ? {username: pending.username} : {account: pending.account};
       var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
                                 body: JSON.stringify(body)});
       var d = null; try{ d = await r.json(); } catch(_){}
       if(r.ok){
         codeHint.textContent = reg
-          ? ('新验证码已发送到 ' + (d.email || '') + '，' + d.ttl_min + ' 分钟内有效。')
-          : ((d && d.msg) || '如果这个邮箱注册过，验证码已经发出去了');
+          ? ('新验证码已发送到 ' + (d.phone || '') + '，' + d.ttl_min + ' 分钟内有效。')
+          : ((d && d.msg) || '如果这个账号注册过，验证码已经发出去了');
         cd.value = ''; cd.focus();
         e.style.display = 'none';
         startResendCountdown((d && d.resend_after) || 60);
@@ -2478,16 +2905,18 @@ LOGIN_PAGE = """<!DOCTYPE html>
 
   fetch('/api/signup_policy').then(function(r){ return r.json(); }).then(function(d){
     if(d && d.invite_required){ inviteField.dataset.needed='1'; }
-    fetch('/api/mail_policy').then(function(r2){ return r2.json(); }).then(function(d2){
-      // 只有在**明确得知**「邮件没配好」时才禁用注册。
-      // 写成 `if(!d2.mail_ready)` 是错的：请求失败、接口 404、返回体不是预期结构，
-      // 都会让 mail_ready 是 undefined，于是把注册按钮禁掉 ——
-      // 而禁用的按钮连 onclick 都不触发，用户看到的是「点了没反应」，极难排查。
-      if(d2 && d2.mail_ready === false){
-        mailReady = false;
-        setMode(mode);   // 只改状态，渲染全交给 setMode —— 回调里一个字都不碰 DOM
-      }
-    }).catch(function(){});
+  }).catch(function(){});
+
+  // 短信 / 邮件是否可用。只有在**明确得知** false 时才降级 ——
+  // 写成 `if(!d.sms_ready)` 是错的：请求失败、接口 404、返回体不是预期结构，
+  // 都会让字段是 undefined，于是把注册按钮禁掉 —— 而禁用的按钮连 onclick
+  // 都不触发，用户看到的是「点了没反应」，极难排查。
+  fetch('/api/sms_policy').then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.sms_ready === false){ smsReady = false; setMode(mode); }
+  }).catch(function(){});
+
+  fetch('/api/mail_policy').then(function(r){ return r.json(); }).then(function(d){
+    if(d && d.mail_ready === false){ mailReady = false; setMode(mode); }
   }).catch(function(){});
 
   /* 一个处理器管五种状态：按 mode 选接口和请求体。
@@ -2502,14 +2931,14 @@ LOGIN_PAGE = """<!DOCTYPE html>
         url='/api/login'; body={username:u.value.trim(), password:p.value};
       } else if(mode==='register'){
         url='/api/register';
-        body={username:u.value.trim(), password:p.value, email:em.value.trim(), invite:iv.value.trim()};
+        body={username:u.value.trim(), password:p.value, phone:ph.value.trim(), invite:iv.value.trim()};
       } else if(mode==='verify'){
         url='/api/register/verify'; body={username:pending.username, code:cd.value.trim()};
       } else if(mode==='reset'){
-        url='/api/reset/request'; body={email:em.value.trim()};
+        url='/api/reset/request'; body={account:ph.value.trim()};
       } else {
         url='/api/reset/do';
-        body={email:pending.email, code:cd.value.trim(), new:p.value};
+        body={account:pending.account, code:cd.value.trim(), new:p.value};
       }
       var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
                                 body:JSON.stringify(body)});
@@ -2518,13 +2947,13 @@ LOGIN_PAGE = """<!DOCTYPE html>
         if(mode==='register'){
           pending.username = u.value.trim().toLowerCase();
           setMode('verify');
-          codeHint.textContent = '验证码已发送到 ' + (d.email || em.value) + '，'
+          codeHint.textContent = '验证码已发送到 ' + (d.phone || ph.value) + '，'
                                + d.ttl_min + ' 分钟内有效。';
           cd.value=''; cd.focus();
           startResendCountdown(d.resend_after || 60);
         } else if(mode==='reset'){
-          pending.email = em.value.trim();
-          codeHint.textContent = (d && d.msg) || '如果这个邮箱注册过，验证码已经发出去了';
+          pending.account = ph.value.trim();
+          codeHint.textContent = (d && d.msg) || '如果这个账号注册过，验证码已经发出去了';
           setMode('reset2');
           cd.value=''; cd.focus();
           startResendCountdown((d && d.resend_after) || 60);
@@ -3209,6 +3638,11 @@ async def lifespan(app: FastAPI):
     os.makedirs(CLEAN_DIR, exist_ok=True)
     os.makedirs(THUMB_DIR, exist_ok=True)
     init_db()
+    # 启动时清一次过期回收站（之后每小时最多一次，挂在列表/回收站接口上）
+    try:
+        _purge_expired_trash(force=True)
+    except Exception as e:      # 清理失败绝不能挡住启动
+        print(f"  ⚠️  回收站清理失败（不影响启动）：{e}", flush=True)
 
     # 初始化会话签名密钥。口令不再有全局的 —— 每个账号存自己的哈希。
     global _secret, _admin_pw_hash
@@ -3290,7 +3724,7 @@ app = FastAPI(title="我的AI学习助手", version="1.0.0", lifespan=lifespan)
 # 才知道要不要显示邀请码输入框。漏了它，配了邀请码也不会出现那个框。
 PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/api/register/resend", "/api/reset/request", "/api/reset/do",
-                "/api/signup_policy", "/api/mail_policy",
+                "/api/signup_policy", "/api/mail_policy", "/api/sms_policy",
                 # 管理后台：页面本身要能打开（否则登录表单都加载不出来），
                 # 登录/登出接口也要能不带 Cookie 调。数据接口在下面单独把关。
                 "/admin", "/api/admin/login", "/api/admin/logout",
@@ -3373,7 +3807,7 @@ class LoginReq(BaseModel):
 class RegisterReq(BaseModel):
     username: str = ""
     password: str = ""
-    email: str = ""
+    phone: str = ""        # 11 位手机号；服务端统一成 +86
     invite: str = ""       # 只有设了 SIGNUP_CODE 时才需要填
 
 
@@ -3383,13 +3817,24 @@ class VerifyReq(BaseModel):
 
 
 class ResetReq(BaseModel):
-    email: str = ""
+    account: str = ""      # 手机号或注册邮箱
+    email: str = ""        # 兼容旧前端
 
 
 class ResetDoReq(BaseModel):
+    account: str = ""
     email: str = ""
     code: str = ""
     new: str = ""
+
+
+class BindPhoneReq(BaseModel):
+    phone: str = ""
+
+
+class BindPhoneVerifyReq(BaseModel):
+    phone: str = ""
+    code: str = ""
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
@@ -3473,10 +3918,10 @@ def _send_code(to: str, username: str, code: str, purpose: str) -> Tuple[bool, s
 @app.post("/api/register")
 def api_register(req: RegisterReq, request: Request):
     """
-    注册第一步：校验资料 → 发验证码。**这一步不创建账号。**
+    注册第一步：校验资料 → 发短信验证码。**这一步不创建账号。**
 
     账号要等验证码验过才写进 users（见 /api/register/verify）。
-    这样「邮箱是真的」就成了注册的前提 —— 对一个跑在公网、
+    这样「手机号是真的」就成了注册的前提 —— 对一个跑在公网、
     背后挂着计费 API key 的服务来说，这是最有效的一道防机器人门槛。
     """
     ip = _client_ip(request)
@@ -3485,16 +3930,16 @@ def api_register(req: RegisterReq, request: Request):
     if SIGNUP_CODE and not hmac.compare_digest((req.invite or "").strip(), SIGNUP_CODE):
         _record_fail(ip)
         raise HTTPException(403, "邀请码不正确")
-    if not MAIL_READY:
-        raise HTTPException(503, "服务器还没有配置邮件服务，暂时无法注册。请联系管理员。")
+    if not SMS_READY:
+        raise HTTPException(503, "服务器还没有配置短信服务，暂时无法注册。请联系管理员。")
 
     name = (req.username or "").strip().lower()
-    email = (req.email or "").strip()
+    phone = normalize_phone(req.phone or "")
     pw = req.password or ""
     if not USERNAME_RE.match(name):
         raise HTTPException(400, "用户名需 3~20 位，只能是字母、数字、下划线或连字符，且以字母或数字开头")
-    if not EMAIL_RE.match(email) or len(email) > 120:
-        raise HTTPException(400, "邮箱格式不正确")
+    if not phone:
+        raise HTTPException(400, "手机号格式不正确，请填 11 位中国大陆手机号")
     if len(pw) < MIN_PW_LEN:
         raise HTTPException(400, f"密码至少 {MIN_PW_LEN} 位")
     if len(pw) > 200:
@@ -3505,30 +3950,30 @@ def api_register(req: RegisterReq, request: Request):
         if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
             _record_fail(ip)
             raise HTTPException(409, "这个用户名已经被注册了")
-        if conn.execute("SELECT 1 FROM users WHERE email=? AND email!=''",
-                        (email,)).fetchone():
+        if conn.execute("SELECT 1 FROM users WHERE phone=?", (phone,)).fetchone():
             _record_fail(ip)
-            raise HTTPException(409, "这个邮箱已经注册过了")
-    # 重发节流：不然这个接口就是个免费的邮件轰炸机
-    wait = mail_throttle("signup:" + name)
-    if wait:
-        raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+            raise HTTPException(409, "这个手机号已经注册过了")
 
-    code = "".join(secrets.choice("0123456789") for _ in range(6))
-    ok, msg = _send_code(email, name, code, "signup")
+    # 四道闸（手机号 / IP / 全站日上限）都在 sms_throttle 里
+    wait = sms_throttle(phone, ip)
+    if wait:
+        raise HTTPException(429, _sms_wait_msg(wait))
+
+    ok, msg = pnvs_send(phone, "signup", ip)
     if not ok:
-        raise HTTPException(502, f"验证码发送失败：{msg}")
+        sms_throttle_undo(phone, ip)      # 发失败了别让用户干等 60 秒
+        raise HTTPException(502, f"短信发送失败：{msg}")
 
     with closing(get_conn()) as conn, conn:
         conn.execute("DELETE FROM signups WHERE username=?", (name,))
         conn.execute(
-            "INSERT INTO signups (username, email, pw_hash, code_hash, expires_at, sent_at, ip)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (name, email, hash_password(pw), _code_hash(name, code),
-             (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+            "INSERT INTO signups (username, email, phone, pw_hash, code_hash,"
+            " expires_at, sent_at, ip) VALUES (?,?,?,?,?,?,?,?)",
+            (name, "", phone, hash_password(pw), "",
+             (now + timedelta(seconds=SMS_CODE_TTL_SEC)).strftime("%Y-%m-%d %H:%M:%S"),
              now.strftime("%Y-%m-%d %H:%M:%S"), ip))
-    return {"ok": True, "need_code": True, "email": mask_email(email),
-            "ttl_min": VERIFY_TTL_MIN, "resend_after": VERIFY_RESEND_SEC}
+    return {"ok": True, "need_code": True, "phone": mask_phone(phone),
+            "ttl_min": max(1, SMS_CODE_TTL_SEC // 60), "resend_after": VERIFY_RESEND_SEC}
 
 
 class ResendReq(BaseModel):
@@ -3540,19 +3985,19 @@ def api_register_resend(req: ResendReq, request: Request):
     """
     重新发送注册验证码。
 
-    **为什么需要这个接口**：验证码 10 分钟过期，过期后用户看到的是
-    「请重新获取」—— 光有提示没有出口，他就只能点回「注册」把密码和邮箱
-    重填一遍。这个接口只凭用户名就能重发，因为要用的资料（邮箱、口令哈希）
+    **为什么需要这个接口**：验证码过期后用户看到的是「请重新获取」——
+    光有提示没有出口，他就只能点回「注册」把密码和手机号重填一遍。
+    这个接口只凭用户名就能重发，因为要用的资料（手机号、口令哈希）
     服务端本来就存着，没必要让客户端再交一次。
 
-    只能发给「待验证记录里那个邮箱」，改不了收件地址 —— 否则它就成了
-    一个任意发信接口。
+    只能发给「待验证记录里那个手机号」，改不了收件号码 —— 否则它就成了
+    一个任意发短信接口。
     """
     ip = _client_ip(request)
     if _login_locked(ip):
         raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
-    if not MAIL_READY:
-        raise HTTPException(503, "服务器还没有配置邮件服务")
+    if not SMS_READY:
+        raise HTTPException(503, "服务器还没有配置短信服务")
     name = (req.username or "").strip().lower()
 
     with closing(get_conn()) as conn:
@@ -3560,26 +4005,28 @@ def api_register_resend(req: ResendReq, request: Request):
     # 不区分「没这条记录」和「用户名不对」：这条接口是公开的
     if not row:
         raise HTTPException(404, "没有待验证的注册，请重新填写注册信息")
+    phone = row["phone"] or ""
+    if not phone:
+        raise HTTPException(409, "这次注册是在旧版发起的，请重新注册")
 
-    wait = mail_throttle("signup:" + name)
+    wait = sms_throttle(phone, ip)
     if wait:
-        raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+        raise HTTPException(429, _sms_wait_msg(wait))
 
-    code = "".join(secrets.choice("0123456789") for _ in range(6))
-    ok, msg = _send_code(row["email"], name, code, "signup")
+    ok, msg = pnvs_send(phone, "signup", ip)
     if not ok:
-        raise HTTPException(502, f"验证码发送失败：{msg}")
+        sms_throttle_undo(phone, ip)
+        raise HTTPException(502, f"短信发送失败：{msg}")
 
     now = datetime.now()
     with closing(get_conn()) as conn, conn:
         # 重发等于作废旧码，并把试错次数清零（否则用户试错几次后重发也没用）
         conn.execute(
-            "UPDATE signups SET code_hash=?, expires_at=?, sent_at=?, attempts=0 WHERE id=?",
-            (_code_hash(name, code),
-             (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+            "UPDATE signups SET expires_at=?, sent_at=?, attempts=0 WHERE id=?",
+            ((now + timedelta(seconds=SMS_CODE_TTL_SEC)).strftime("%Y-%m-%d %H:%M:%S"),
              now.strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
-    return {"ok": True, "email": mask_email(row["email"]), "ttl_min": VERIFY_TTL_MIN,
-            "resend_after": VERIFY_RESEND_SEC}
+    return {"ok": True, "phone": mask_phone(phone),
+            "ttl_min": max(1, SMS_CODE_TTL_SEC // 60), "resend_after": VERIFY_RESEND_SEC}
 
 
 @app.post("/api/register/verify")
@@ -3598,26 +4045,39 @@ def api_register_verify(req: VerifyReq, request: Request):
     if not row or not code:
         _record_fail(ip)
         raise bad
+    phone = row["phone"] or ""
+    if not phone:
+        # 旧版发起的邮箱注册：没有手机号，没法走 PNVS，让用户重新注册一次
+        _record_fail(ip)
+        raise bad
     if row["attempts"] >= VERIFY_MAX_TRY:
         _record_fail(ip)
         raise HTTPException(429, "这个验证码试错太多次了，请重新获取")
     if datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.now():
         _record_fail(ip)
         raise bad
-    if not hmac.compare_digest(row["code_hash"], _code_hash(name, code)):
+
+    ok, why = pnvs_check(phone, code, "signup")
+    if not ok:
         with closing(get_conn()) as conn, conn:
             conn.execute("UPDATE signups SET attempts = attempts + 1 WHERE id=?", (row["id"],))
         _record_fail(ip)
-        raise bad
+        raise HTTPException(429 if "试错太多次" in why else 400, why)
 
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(get_conn()) as conn, conn:
-        # 抢在并发之前再确认一次用户名没被占（两个请求同时验同一个码）
+        # 抢在并发之前再确认一次用户名/手机号没被占（两个请求同时验同一个码）
         if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
             conn.execute("DELETE FROM signups WHERE id=?", (row["id"],))
             raise HTTPException(409, "这个用户名已经被注册了")
-        cur = conn.execute(
-            "INSERT INTO users (username, pw_hash, email, created_at) VALUES (?,?,?,?)",
-            (name, row["pw_hash"], row["email"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        try:
+            cur = conn.execute(
+                "INSERT INTO users (username, pw_hash, email, phone, phone_verified_at,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (name, row["pw_hash"], "", phone, now_s, now_s))
+        except sqlite3.IntegrityError:
+            conn.execute("DELETE FROM signups WHERE id=?", (row["id"],))
+            raise HTTPException(409, "这个手机号已经注册过了")
         uid = int(cur.lastrowid)
         conn.execute("DELETE FROM signups WHERE id=?", (row["id"],))
         # 第一个注册的账号认领升级上来的老数据
@@ -3635,45 +4095,71 @@ def api_register_verify(req: VerifyReq, request: Request):
 @app.post("/api/reset/request")
 def api_reset_request(req: ResetReq, request: Request):
     """
-    发重置验证码。
+    发重置验证码。输入可以填手机号，也可以填老用户当初的注册邮箱。
 
-    ⚠️ 无论这个邮箱是否注册过，**返回完全一样**。否则这个接口就成了
-    「查某个邮箱有没有注册」的免费查询器。
+    ⚠️ 无论这个账号是否注册过，**返回完全一样**。否则这个接口就成了
+    「查某个号有没有注册」的免费查询器。
     """
     ip = _client_ip(request)
     if _login_locked(ip):
         raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
-    if not MAIL_READY:
-        raise HTTPException(503, "服务器还没有配置邮件服务，暂时无法重置密码。请联系管理员。")
 
-    email = (req.email or "").strip()
-    generic = {"ok": True, "msg": "如果这个邮箱注册过，验证码已经发出去了"}
-    if not EMAIL_RE.match(email):
-        raise HTTPException(400, "邮箱格式不正确")
+    account = (req.account or req.email or "").strip()
+    if not account:
+        raise HTTPException(400, "请输入手机号或注册邮箱")
 
-    with closing(get_conn()) as conn:
-        u = conn.execute("SELECT id, username FROM users WHERE email=? AND email!=''",
-                         (email,)).fetchone()
-    wait = mail_throttle("reset:" + email)
-    if wait:
-        raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+    phone = normalize_phone(account)
+    if phone:
+        if not SMS_READY:
+            raise HTTPException(503, "服务器还没有配置短信服务，暂时无法重置密码。请联系管理员。")
+        with closing(get_conn()) as conn:
+            u = conn.execute("SELECT id, username FROM users WHERE phone=?",
+                             (phone,)).fetchone()
+        generic = {"ok": True, "channel": "sms",
+                   "msg": "如果这个手机号注册过，验证码已经发出去了"}
+        # 不管号在不在都记账：不然它就成了枚举手机号的工具
+        wait = sms_throttle(phone, ip)
+        if wait:
+            raise HTTPException(429, _sms_wait_msg(wait))
+        if u:
+            ok, msg = pnvs_send(phone, "reset", ip)
+            if not ok:
+                sms_throttle_undo(phone, ip)
+                raise HTTPException(502, f"短信发送失败：{msg}")
+        return generic
 
-    if u:
-        code = "".join(secrets.choice("0123456789") for _ in range(6))
-        ok, msg = _send_code(email, u["username"], code, "reset")
-        if not ok:
-            # 发信失败要让本人知道，不然他会一直等一封永远不来的邮件
-            raise HTTPException(502, f"验证码发送失败：{msg}")
-        now = datetime.now()
-        with closing(get_conn()) as conn, conn:
-            conn.execute("DELETE FROM signups WHERE username=? AND ip='reset'", (email,))
-            conn.execute(
-                "INSERT INTO signups (username, email, pw_hash, code_hash, expires_at, sent_at, ip)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (email, email, "", _code_hash(email, code),
-                 (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
-                 now.strftime("%Y-%m-%d %H:%M:%S"), "reset"))
-    return generic
+    if EMAIL_RE.match(account):
+        # 老用户：仍走原来的邮箱流程
+        if not MAIL_READY:
+            raise HTTPException(503, "服务器还没有配置邮件服务，暂时无法重置密码。请联系管理员。")
+        email = account
+        generic = {"ok": True, "channel": "email",
+                   "msg": "如果这个邮箱注册过，验证码已经发出去了"}
+        with closing(get_conn()) as conn:
+            u = conn.execute("SELECT id, username FROM users WHERE email=? AND email!=''",
+                             (email,)).fetchone()
+        wait = mail_throttle("reset:" + email)
+        if wait:
+            raise HTTPException(429, f"验证码刚发过，请 {wait} 秒后再试")
+
+        if u:
+            code = "".join(secrets.choice("0123456789") for _ in range(6))
+            ok, msg = _send_code(email, u["username"], code, "reset")
+            if not ok:
+                # 发信失败要让本人知道，不然他会一直等一封永远不来的邮件
+                raise HTTPException(502, f"验证码发送失败：{msg}")
+            now = datetime.now()
+            with closing(get_conn()) as conn, conn:
+                conn.execute("DELETE FROM signups WHERE username=? AND ip='reset'", (email,))
+                conn.execute(
+                    "INSERT INTO signups (username, email, phone, pw_hash, code_hash,"
+                    " expires_at, sent_at, ip) VALUES (?,?,?,?,?,?,?,?)",
+                    (email, email, "", "", _code_hash(email, code),
+                     (now + timedelta(minutes=VERIFY_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+                     now.strftime("%Y-%m-%d %H:%M:%S"), "reset"))
+        return generic
+
+    raise HTTPException(400, "请输入正确的手机号或邮箱")
 
 
 @app.post("/api/reset/do")
@@ -3681,11 +4167,36 @@ def api_reset_do(req: ResetDoReq, request: Request):
     ip = _client_ip(request)
     if _login_locked(ip):
         raise HTTPException(429, f"尝试次数过多，请 {LOGIN_WINDOW // 60} 分钟后再试")
-    email = (req.email or "").strip()
+    account = (req.account or req.email or "").strip()
     code = (req.code or "").strip()
     new = req.new or ""
     if len(new) < MIN_PW_LEN:
         raise HTTPException(400, f"新密码至少 {MIN_PW_LEN} 位")
+    if len(new) > 200:
+        raise HTTPException(400, "密码太长了")
+
+    # ── 手机号通道：交给 PNVS 校验 ────────────────────────────────────
+    phone = normalize_phone(account)
+    if phone:
+        with closing(get_conn()) as conn:
+            u = conn.execute("SELECT id FROM users WHERE phone=?", (phone,)).fetchone()
+        bad = HTTPException(400, "验证码不正确或已过期，请重新获取")
+        if not u:
+            _record_fail(ip)
+            raise bad
+        ok, why = pnvs_check(phone, code, "reset")
+        if not ok:
+            _record_fail(ip)
+            raise HTTPException(429 if "试错太多次" in why else 400, why)
+        with closing(get_conn()) as conn, conn:
+            conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(new), u["id"]))
+        _clear_fails(ip)
+        return _session_response(int(u["id"]), {"username": ""})
+
+    # ── 邮箱通道：老用户，沿用本地验证码 ──────────────────────────────
+    if not EMAIL_RE.match(account):
+        raise HTTPException(400, "请输入正确的手机号或邮箱")
+    email = account
 
     with closing(get_conn()) as conn:
         row = conn.execute("SELECT * FROM signups WHERE username=? AND ip='reset'",
@@ -3709,6 +4220,124 @@ def api_reset_do(req: ResetDoReq, request: Request):
     _clear_fails(ip)
     # 重置成功直接给会话：他已经证明了对邮箱的控制权，没必要再输一遍
     return _session_response(int(u["id"]), {"username": ""})
+
+
+@app.post("/api/phone/bind/request")
+def api_bind_phone_request(req: BindPhoneReq, request: Request):
+    """登录后绑定/更换手机号，第一步：发短信。"""
+    uid = current_uid()
+    ip = _client_ip(request)
+    if not SMS_READY:
+        raise HTTPException(503, "服务器还没有配置短信服务")
+    phone = normalize_phone(req.phone or "")
+    if not phone:
+        raise HTTPException(400, "手机号格式不正确")
+    with closing(get_conn()) as conn:
+        if conn.execute("SELECT 1 FROM users WHERE phone=? AND id<>?",
+                        (phone, uid)).fetchone():
+            raise HTTPException(409, "这个手机号已经被其他账号绑定了")
+    wait = sms_throttle(phone, ip)
+    if wait:
+        raise HTTPException(429, _sms_wait_msg(wait))
+    ok, msg = pnvs_send(phone, "bind", ip)
+    if not ok:
+        sms_throttle_undo(phone, ip)
+        raise HTTPException(502, f"短信发送失败：{msg}")
+    return {"ok": True, "phone": mask_phone(phone),
+            "ttl_min": max(1, SMS_CODE_TTL_SEC // 60),
+            "resend_after": VERIFY_RESEND_SEC}
+
+
+@app.post("/api/phone/bind/verify")
+def api_bind_phone_verify(req: BindPhoneVerifyReq):
+    """第二步：验码 → 写入 users.phone。"""
+    uid = current_uid()
+    phone = normalize_phone(req.phone or "")
+    code = (req.code or "").strip()
+    if not phone:
+        raise HTTPException(400, "手机号格式不正确")
+    ok, why = pnvs_check(phone, code, "bind")
+    if not ok:
+        raise HTTPException(400, why)
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(get_conn()) as conn, conn:
+        try:
+            conn.execute("UPDATE users SET phone=?, phone_verified_at=? WHERE id=?",
+                         (phone, now_s, uid))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "这个手机号已经被其他账号绑定了")
+    return {"ok": True, "phone": mask_phone(phone)}
+
+
+@app.get("/paper.poster", include_in_schema=False)
+def paper_poster():
+    """答辩海报（PDF，297×611mm 长图），可直接打印或送去喷绘。"""
+    path = os.path.join(PAPER_DIR, "海报.pdf")
+    if not os.path.exists(path):
+        raise HTTPException(404, "海报还没生成")
+    return FileResponse(
+        path, media_type="application/pdf",
+        filename="我的AI学习助手-海报.pdf",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/paper.poster.png", include_in_schema=False)
+def paper_poster_png():
+    """海报图片版（2400×4710），方便发群里或插进 PPT。"""
+    path = os.path.join(PAPER_DIR, "海报.png")
+    if not os.path.exists(path):
+        raise HTTPException(404, "海报还没生成")
+    return FileResponse(
+        path, media_type="image/png",
+        filename="我的AI学习助手-海报.png",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/paper.board", include_in_schema=False)
+def paper_board():
+    """科创大赛展板（900×1200mm 竖版 PDF，3:4），可直接送印。"""
+    path = os.path.join(PAPER_DIR, "展板.pdf")
+    if not os.path.exists(path):
+        raise HTTPException(404, "展板还没生成")
+    return FileResponse(
+        path, media_type="application/pdf",
+        filename="我的AI学习助手-科创大赛展板.pdf",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/paper.board.print", include_in_schema=False)
+def paper_board_print():
+    """科创大赛展板送印版（900×1200mm + 四边 3mm 出血，含 TrimBox）。"""
+    path = os.path.join(PAPER_DIR, "展板-出血3mm.pdf")
+    if not os.path.exists(path):
+        raise HTTPException(404, "出血版展板还没生成")
+    return FileResponse(
+        path, media_type="application/pdf",
+        filename="我的AI学习助手-科创大赛展板-出血3mm.pdf",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/paper.board.png", include_in_schema=False)
+def paper_board_png():
+    """展板图片版（2245×3179），发群里或插入文档用。"""
+    path = os.path.join(PAPER_DIR, "展板.png")
+    if not os.path.exists(path):
+        raise HTTPException(404, "展板还没生成")
+    return FileResponse(
+        path, media_type="image/png",
+        filename="我的AI学习助手-科创大赛展板.png",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/api/sms_policy")
+def sms_policy():
+    """登录页用它决定要不要禁用「注册」——和 mail_policy 一个套路。"""
+    return {"sms_ready": SMS_READY, "mock": PNVS_MOCK}
 
 
 @app.get("/api/mail_policy")
@@ -3877,6 +4506,61 @@ def paper_docx():
     )
 
 
+@app.get("/paper.pptx", include_in_schema=False)
+def paper_pptx():
+    """
+    答辩 PPT，下载到电脑或手机上看。
+
+    和论文 Word 版一样**不公开**（不在 PUBLIC_PATHS 里）：没登录会被 302 到
+    /login。想公开的话，把路径加进 PUBLIC_PATHS 即可。
+    """
+    path = os.path.join(PAPER_DIR, "答辩.pptx")
+    if not os.path.exists(path):
+        raise HTTPException(404, "答辩 PPT 还没生成，先在 ~/paper 里跑一次 mkppt.py")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename="我的AI学习助手-答辩.pptx",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/paper.script", include_in_schema=False)
+def paper_script():
+    """
+    答辩演讲稿（Word 版，每页 PPT 一段、分开页），方便打印或手机上打开。
+
+    和论文 / PPT 一样不公开（不在 PUBLIC_PATHS 里）。
+    """
+    path = os.path.join(PAPER_DIR, "演讲稿.docx")
+    if not os.path.exists(path):
+        raise HTTPException(404, "演讲稿还没生成，先在 ~/paper 里跑一次 mkdocx_speech.py")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename="我的AI学习助手-答辩演讲稿.docx",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
+@app.get("/paper.qa", include_in_schema=False)
+def paper_qa():
+    """
+    答辩问答准备（20 个评委可能问的问题 + 应答要点），Word 版。
+
+    和论文 / PPT / 演讲稿一样不公开（不在 PUBLIC_PATHS 里）。
+    """
+    path = os.path.join(PAPER_DIR, "答辩问答.docx")
+    if not os.path.exists(path):
+        raise HTTPException(404, "问答准备还没生成，先在 ~/paper 里生成 答辩问答.docx")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename="我的AI学习助手-答辩问答.docx",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
+
 @app.get("/paper/versions", include_in_schema=False)
 def paper_version_list():
     """
@@ -3978,8 +4662,9 @@ def serve_animation(name: str):
             own = conn.execute("SELECT 1 FROM chats WHERE anim_url=? AND user_id=?",
                                (f"/anim/{name}", current_uid())).fetchone()
         else:
-            own = conn.execute("SELECT 1 FROM mistakes WHERE id=? AND user_id=?",
-                               (mid, current_uid())).fetchone()
+            own = conn.execute(
+                "SELECT 1 FROM mistakes WHERE id=? AND user_id=? AND deleted_at=''",
+                (mid, current_uid())).fetchone()
     if not own:
         raise HTTPException(404, "动画不存在")
     path = os.path.join(ANIM_DIR, name)
@@ -4323,10 +5008,13 @@ def admin_overview():
         week_ago = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
         app_info = {
             "users": one("SELECT COUNT(*) FROM users"),
-            "mistakes": one("SELECT COUNT(*) FROM mistakes"),
+            # 统计口径：只算正常题；回收站单独一行显示
+            "mistakes": one("SELECT COUNT(*) FROM mistakes WHERE deleted_at=''"),
+            "trash": one("SELECT COUNT(*) FROM mistakes WHERE deleted_at<>''"),
             "chats": one("SELECT COUNT(*) FROM chats"),
             "ai_ready": api_key_ready(),
-            "last_upload_at": one("SELECT COALESCE(MAX(created_at),'') FROM mistakes"),
+            "last_upload_at": one(
+                "SELECT COALESCE(MAX(created_at),'') FROM mistakes WHERE deleted_at=''"),
         }
         llm = {
             "today": one("SELECT COALESCE(SUM(calls),0) FROM llm_usage WHERE day=?", (today,)),
@@ -4354,7 +5042,8 @@ def admin_overview():
 def admin_users():
     with closing(get_conn()) as conn:
         rows = conn.execute(
-            "SELECT id, username, email, created_at, last_login_at FROM users ORDER BY id"
+            "SELECT id, username, email, phone, created_at, last_login_at"
+            " FROM users ORDER BY id"
         ).fetchall()
         per, orphans = _scan_static_by_owner(conn)
         n_users = len(rows)
@@ -4370,10 +5059,15 @@ def admin_users():
                                "total": 0, "files": 0})
             out.append({
                 "id": uid, "username": r["username"], "email": r["email"],
+                "phone": mask_phone(r["phone"] or ""),
                 "created_at": r["created_at"], "last_login_at": r["last_login_at"],
                 "last_activity": last_act,
-                "mistakes": conn.execute("SELECT COUNT(*) FROM mistakes WHERE user_id=?",
-                                         (uid,)).fetchone()[0],
+                "mistakes": conn.execute(
+                    "SELECT COUNT(*) FROM mistakes WHERE user_id=? AND deleted_at=''",
+                    (uid,)).fetchone()[0],
+                "trash": conn.execute(
+                    "SELECT COUNT(*) FROM mistakes WHERE user_id=? AND deleted_at<>''",
+                    (uid,)).fetchone()[0],
                 "chats": conn.execute("SELECT COUNT(*) FROM chats WHERE user_id=?",
                                       (uid,)).fetchone()[0],
                 "storage": st,
@@ -4413,7 +5107,7 @@ def admin_llm(days: int = 30):
 @app.get("/api/admin/users/{uid}/delete_preview")
 def admin_delete_preview(uid: int):
     with closing(get_conn()) as conn:
-        row = conn.execute("SELECT id, username, email FROM users WHERE id=?",
+        row = conn.execute("SELECT id, username, email, phone FROM users WHERE id=?",
                            (uid,)).fetchone()
         if not row:
             raise HTTPException(404, "用户不存在")
@@ -4425,7 +5119,8 @@ def admin_delete_preview(uid: int):
         per, _ = _scan_static_by_owner(conn)
         st = per.get(uid, {"total": 0, "files": 0, "origin": 0, "clean": 0,
                            "thumb": 0, "anim": 0})
-    return {"user": {"id": uid, "username": row["username"], "email": row["email"]},
+    return {"user": {"id": uid, "username": row["username"], "email": row["email"],
+                     "phone": mask_phone(row["phone"] or "")},
             "will_delete": {"mistakes": n_mis, "chats": n_chat,
                             "files": st["files"], "bytes": st["total"],
                             "by_dir": {k: st[k] for k in ("origin", "clean", "thumb", "anim")}},
@@ -4548,6 +5243,7 @@ def list_mistakes(subject: Optional[str] = None, order: str = "time_desc",
                   q: Optional[str] = None, kind: Optional[str] = None,
                   due: bool = False, limit: int = 500):
     """题目列表。支持科目 / 题型 / 待复习筛选、关键词搜索、三种排序。"""
+    _purge_expired_trash()        # 顺带清一次过期回收站（每小时最多一次）
     where, args = [], []
     if due:
         # 到期的（含从没排过复习的老数据）
@@ -4567,6 +5263,8 @@ def list_mistakes(subject: Optional[str] = None, order: str = "time_desc",
     # 归属过滤永远在最前面：后面无论怎么拼 where 都跑不掉
     where.insert(0, "user_id = ?")
     args.insert(0, current_uid())
+    # 回收站里的题不出现在列表里
+    where.insert(0, "deleted_at = ''")
 
     sql = "SELECT * FROM mistakes"
     if where:
@@ -4590,17 +5288,24 @@ def stats():
     with closing(get_conn()) as conn:
         uid = current_uid()
         rows = conn.execute(
-            "SELECT subject, COUNT(*) AS n FROM mistakes WHERE user_id=? GROUP BY subject",
+            "SELECT subject, COUNT(*) AS n FROM mistakes"
+            " WHERE user_id=? AND deleted_at='' GROUP BY subject",
             (uid,)).fetchall()
         total = conn.execute(
-            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id=?", (uid,)).fetchone()["n"]
+            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id=? AND deleted_at=''",
+            (uid,)).fetchone()["n"]
+        trash = conn.execute(
+            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id=? AND deleted_at<>''",
+            (uid,)).fetchone()["n"]
         krows = conn.execute(
-            "SELECT kind, COUNT(*) AS n FROM mistakes WHERE user_id=? GROUP BY kind",
+            "SELECT kind, COUNT(*) AS n FROM mistakes"
+            " WHERE user_id=? AND deleted_at='' GROUP BY kind",
             (uid,)).fetchall()
         # 科目 × 题型 的交叉计数。只给「各题型总数」是不够的：筛了「语文」之后，
         # 题型按钮上还挂着全库的数字，看起来就像筛选没生效。
         xrows = conn.execute(
-            "SELECT subject, kind, COUNT(*) AS n FROM mistakes WHERE user_id=? GROUP BY subject, kind",
+            "SELECT subject, kind, COUNT(*) AS n FROM mistakes"
+            " WHERE user_id=? AND deleted_at='' GROUP BY subject, kind",
             (uid,)
         ).fetchall()
     # 本周问 AI 的次数：报告建议每周 1~2 次效果最好，多了要温和提醒
@@ -4610,11 +5315,11 @@ def stats():
         asked = c2.execute(
             # chats 没有 user 列，归属靠 join 到 mistakes
             "SELECT COUNT(*) AS n FROM chats c JOIN mistakes m ON m.id = c.mistake_id"
-            " WHERE m.user_id = ? AND c.role='user' AND c.created_at >= ?",
+            " WHERE m.user_id = ? AND m.deleted_at='' AND c.role='user' AND c.created_at >= ?",
             (uid, week_ago)).fetchone()["n"]
     with closing(get_conn()) as c2:
         due_count = c2.execute(
-            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id = ?"
+            "SELECT COUNT(*) AS n FROM mistakes WHERE user_id = ? AND deleted_at=''"
             " AND (review_due_at = '' OR review_due_at <= ?)",
             (uid, _today())).fetchone()["n"]
     by_kind = {k: 0 for k in KINDS}
@@ -4624,7 +5329,8 @@ def stats():
     for r in xrows:
         d = by_subject_kind.setdefault(r["subject"], {k: 0 for k in KINDS})
         d[norm_kind(r["kind"])] += r["n"]
-    return {"total": total, "by_subject": {r["subject"]: r["n"] for r in rows},
+    return {"total": total, "trash": trash,
+            "by_subject": {r["subject"]: r["n"] for r in rows},
             "by_kind": by_kind, "by_subject_kind": by_subject_kind,
             "due": due_count, "week_asked": asked}
 
@@ -4693,7 +5399,8 @@ def serve_thumb(mid: int):
     """列表卡片用的小图。归属校验跟大图一样。"""
     with closing(get_conn()) as conn:
         row = conn.execute(
-            "SELECT orig_path, clean_path FROM mistakes WHERE id=? AND user_id=?",
+            "SELECT orig_path, clean_path FROM mistakes"
+            " WHERE id=? AND user_id=? AND deleted_at=''",
             (mid, current_uid())).fetchone()
     if not row:
         raise HTTPException(404, "不存在")
@@ -4726,7 +5433,8 @@ def serve_media(kind: str, mid: int):
         raise HTTPException(404, "不存在")
     with closing(get_conn()) as conn:
         row = conn.execute(
-            "SELECT orig_path, clean_path FROM mistakes WHERE id=? AND user_id=?",
+            "SELECT orig_path, clean_path FROM mistakes"
+            " WHERE id=? AND user_id=? AND deleted_at=''",
             (mid, current_uid())).fetchone()
     if not row:
         raise HTTPException(404, "不存在")
@@ -4952,7 +5660,8 @@ def record_review(mid: int, req: ReviewReq):
 
     with closing(get_conn()) as conn, conn:
         row = conn.execute(
-            "SELECT review_stage FROM mistakes WHERE id=? AND user_id=?",
+            "SELECT review_stage FROM mistakes"
+            " WHERE id=? AND user_id=? AND deleted_at=''",
             (mid, current_uid())).fetchone()
         if not row:
             raise HTTPException(404, "错题不存在")
@@ -5020,24 +5729,105 @@ def update_mistake(mid: int, req: SubjectReq):
     return {"ok": True, "id": mid, "subject": req.subject, "kind": req.kind}
 
 
-# ---------------------------- 路由：删除错题 ---------------------------------
+# ---------------------------- 路由：删除 / 回收站 -----------------------------
+class MistakeIdsReq(BaseModel):
+    ids: List[int] = Field(default_factory=list)
+
+
 @app.delete("/api/mistakes/{mid}")
 def delete_mistake(mid: int):
+    """单条删除 = 移进回收站（30 天内可恢复），不再直接删文件。"""
     with closing(get_conn()) as conn, conn:
-        row = owned_mistake(conn, mid)
-        if not row:
+        if not owned_mistake(conn, mid):
             raise HTTPException(404, "错题不存在")
-        for rel in (row["orig_path"], row["clean_path"]):
-            if rel:
-                p = os.path.join(STATIC_DIR, rel)
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-        drop_thumb(mid)
-        conn.execute("DELETE FROM mistakes WHERE id = ?", (mid,))
-    return {"ok": True, "deleted": mid}
+        conn.execute("UPDATE mistakes SET deleted_at=? WHERE id=?",
+                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
+    return {"ok": True, "deleted": mid, "trash": True}
+
+
+@app.post("/api/mistakes/delete")
+def delete_mistakes(req: MistakeIdsReq):
+    """批量删除 = 批量移进回收站。别人的 id 直接忽略（不报错、不泄露）。"""
+    ids = [int(i) for i in (req.ids or [])][:500]
+    if not ids:
+        return {"ok": True, "deleted": 0}
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n = 0
+    with closing(get_conn()) as conn, conn:
+        for mid in ids:
+            n += conn.execute(
+                "UPDATE mistakes SET deleted_at=?"
+                " WHERE id=? AND user_id=? AND deleted_at=''",
+                (now_s, mid, current_uid())).rowcount
+    return {"ok": True, "deleted": n}
+
+
+@app.post("/api/mistakes/restore")
+def restore_mistakes(req: MistakeIdsReq):
+    ids = [int(i) for i in (req.ids or [])][:500]
+    n = 0
+    with closing(get_conn()) as conn, conn:
+        for mid in ids:
+            n += conn.execute(
+                "UPDATE mistakes SET deleted_at=''"
+                " WHERE id=? AND user_id=? AND deleted_at<>''",
+                (mid, current_uid())).rowcount
+    return {"ok": True, "restored": n}
+
+
+@app.post("/api/mistakes/purge")
+def purge_mistakes(req: MistakeIdsReq):
+    """彻底删除 —— 只允许删回收站里的题，文件和对话一起清。"""
+    ids = [int(i) for i in (req.ids or [])][:500]
+    gone, errors = 0, []
+    with closing(get_conn()) as conn, conn:
+        for mid in ids:
+            row = conn.execute(
+                "SELECT * FROM mistakes WHERE id=? AND user_id=? AND deleted_at<>''",
+                (mid, current_uid())).fetchone()
+            if not row:
+                continue      # 不在回收站（或不是自己的）→ 忽略
+            errors += _purge_mistake(conn, row)
+            gone += 1
+    return {"ok": True, "purged": gone, "file_errors": errors}
+
+
+@app.get("/api/mistakes/trash")
+def list_trash():
+    """回收站列表：按删除时间倒序，带剩余天数。"""
+    _purge_expired_trash()
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM mistakes WHERE user_id=? AND deleted_at<>''"
+            " ORDER BY deleted_at DESC, id DESC LIMIT 500",
+            (current_uid(),)).fetchall()
+    now = datetime.now()
+    items = []
+    for r in rows:
+        it = row_to_item(r)
+        try:
+            left = TRASH_KEEP_DAYS - (now - datetime.strptime(
+                r["deleted_at"], "%Y-%m-%d %H:%M:%S")).days
+        except ValueError:
+            left = TRASH_KEEP_DAYS
+        it["deleted_at"] = r["deleted_at"]
+        it["days_left"] = max(0, left)
+        items.append(it)
+    return {"items": items, "total": len(items), "keep_days": TRASH_KEEP_DAYS}
+
+
+@app.post("/api/mistakes/trash/empty")
+def empty_trash():
+    """清空回收站：彻底删除本人的所有已删题。"""
+    purged, errors = 0, []
+    with closing(get_conn()) as conn, conn:
+        rows = conn.execute(
+            "SELECT * FROM mistakes WHERE user_id=? AND deleted_at<>''",
+            (current_uid(),)).fetchall()
+        for r in rows:
+            errors += _purge_mistake(conn, r)
+            purged += 1
+    return {"ok": True, "purged": purged, "file_errors": errors}
 
 
 # ---------------------------- 路由：AI 对话答疑 ------------------------------
@@ -5177,7 +5967,76 @@ def owned_mistake(conn, mid: int):
     它的归属完全靠所属错题，直接按 mistake_id 查会读到别人的对话。
     """
     return conn.execute(
-        "SELECT * FROM mistakes WHERE id=? AND user_id=?", (mid, current_uid())).fetchone()
+        "SELECT * FROM mistakes WHERE id=? AND user_id=? AND deleted_at=''",
+        (mid, current_uid())).fetchone()
+
+
+def owned_mistake_any(conn, mid: int):
+    """回收站用：不管是否已删除，只要是本人的题就返回。"""
+    return conn.execute(
+        "SELECT * FROM mistakes WHERE id=? AND user_id=?",
+        (mid, current_uid())).fetchone()
+
+
+def _purge_mistake(conn, row) -> List[str]:
+    """
+    彻底删除一道题：照片 / 缩略图 / 动画 + 它的对话 + 数据库行。
+
+    返回删不掉的文件说明 —— 不学 drop_thumb 那样静默吞掉，用户点了「彻底删除」
+    就得知道有没有真的删干净。
+    """
+    mid = int(row["id"])
+    failed: List[str] = []
+    for rel in (row["orig_path"], row["clean_path"]):
+        p = _safe_static_path(rel)
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError as e:
+                failed.append(f"{os.path.basename(p)}: {e}")
+    t = thumb_path(mid)
+    if os.path.exists(t):
+        try:
+            os.remove(t)
+        except OSError as e:
+            failed.append(f"thumb_{mid}.jpg: {e}")
+    try:
+        for fn in os.listdir(ANIM_DIR):
+            if fn.startswith(f"anim_m{mid}_"):
+                try:
+                    os.remove(os.path.join(ANIM_DIR, fn))
+                except OSError as e:
+                    failed.append(f"{fn}: {e}")
+    except OSError:
+        pass
+    conn.execute("DELETE FROM chats WHERE mistake_id=?", (mid,))
+    conn.execute("DELETE FROM mistakes WHERE id=?", (mid,))
+    return failed
+
+
+_last_trash_sweep = 0.0
+
+
+def _purge_expired_trash(force: bool = False) -> int:
+    """把回收站里超过 TRASH_KEEP_DAYS 天的题彻底删掉。每小时最多扫一次。"""
+    global _last_trash_sweep
+    now = time.time()
+    if not force and now - _last_trash_sweep < 3600:
+        return 0
+    _last_trash_sweep = now
+    cutoff = (datetime.now() - timedelta(days=TRASH_KEEP_DAYS)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    n = 0
+    with closing(get_conn()) as conn, conn:
+        rows = conn.execute(
+            "SELECT * FROM mistakes WHERE deleted_at<>'' AND deleted_at < ?",
+            (cutoff,)).fetchall()
+        for r in rows:
+            _purge_mistake(conn, r)
+            n += 1
+    if n:
+        print(f"  回收站清理：彻底删除 {n} 道超过 {TRASH_KEEP_DAYS} 天的题", flush=True)
+    return n
 
 
 def _chat_rows(mid: int) -> List[Dict[str, Any]]:
@@ -5447,8 +6306,9 @@ def reclean_all() -> None:
     """
     init_db()
     with closing(get_conn()) as conn:
-        rows = conn.execute("SELECT id, orig_path, clean_path FROM mistakes WHERE user_id=?",
-                            (current_uid(),)).fetchall()
+        rows = conn.execute(
+            "SELECT id, orig_path, clean_path FROM mistakes"
+            " WHERE user_id=? AND deleted_at=''", (current_uid(),)).fetchall()
     if not rows:
         print("数据库里还没有错题。")
         return

@@ -272,7 +272,9 @@
 
     box.appendChild(statCard(
       '数据', o.app.users + ' 个账号',
-      '错题 ' + o.app.mistakes + ' 道　对话 ' + o.app.chats + ' 条' +
+      '错题 ' + o.app.mistakes + ' 道' +
+      (o.app.trash ? '（回收站 ' + o.app.trash + ' 道）' : '') +
+      '　对话 ' + o.app.chats + ' 条' +
       '　AI ' + (o.app.ai_ready ? '可用' : '未配置') +
       '　最后上传 ' + fmtT(o.app.last_upload_at)));
   }
@@ -288,6 +290,7 @@
       t.style.cssText = 'font-size:15px;font-weight:700';
       name.appendChild(t);
       name.appendChild(el('div', 'sub', u.email || '（没填邮箱）'));
+      name.appendChild(el('div', 'sub', u.phone ? ('手机 ' + u.phone) : '（未绑定手机号）'));
       top.appendChild(name);
       var acts = el('div');
       acts.style.cssText = 'display:flex;gap:7px;flex:none';
@@ -303,7 +306,9 @@
       c.appendChild(top);
 
       var m = el('div', 'mini');
-      m.textContent = '错题 ' + u.mistakes + ' 道　对话 ' + u.chats + ' 条　占用 ' + fmtB(u.storage.total) +
+      m.textContent = '错题 ' + u.mistakes + ' 道' +
+        (u.trash ? '（回收站 ' + u.trash + ' 道）' : '') +
+        '　对话 ' + u.chats + ' 条　占用 ' + fmtB(u.storage.total) +
         '（' + u.storage.files + ' 个文件）';
       c.appendChild(m);
       var m2 = el('div', 'mini');

@@ -112,6 +112,15 @@ nano ~/.cuoti.env
 ```bash
 # 原来的照抄
 DEEPSEEK_API_KEY=sk-xxxx
+
+# 短信注册（阿里云号码认证服务 PNVS）—— 新注册用手机号
+ALIYUN_PNVS_ACCESS_KEY_ID=...
+ALIYUN_PNVS_ACCESS_KEY_SECRET=...
+ALIYUN_PNVS_SIGN_NAME=系统签名
+ALIYUN_PNVS_TEMPLATE_CODE=100001
+ALIYUN_PNVS_SCHEME_NAME=默认方案
+
+# 老用户找回密码仍走邮箱（可选，但要兼容老账号就留着）
 SMTP_HOST=smtp.qq.com
 SMTP_PORT=465
 SMTP_USER=你的邮箱
