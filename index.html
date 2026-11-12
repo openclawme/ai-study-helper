@@ -1093,6 +1093,16 @@
     </div>
   </div>
 
+  <!-- ==================== 首页退出提示 ==================== -->
+  <transition name="fade">
+    <div v-if="showExitToast"
+         class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[80] bg-slate-900/90 text-white
+                rounded-full px-4 py-2.5 shadow-2xl flex items-center gap-3 text-sm">
+      <span>再滑一次退出</span>
+      <button class="text-indigo-200 font-semibold" @click="cancelExitToast">取消</button>
+    </div>
+  </transition>
+
   <!-- ==================== 回收站弹窗 ==================== -->
   <div v-if="showTrash" class="fixed inset-0 z-[70] bg-slate-900/50 flex items-end sm:items-center justify-center"
        @click.self="showTrash = false">
@@ -1680,6 +1690,10 @@ const app = createApp({
          左滑先关这一层回列表；没有内层时浏览器才会回上一页/退出。 */
       overlayHistoryPushed: false,
       suppressOverlayHistory: false,
+      showExitToast: false,
+      exitGuardPushed: false,
+      exitArmedUntil: 0,
+      exitToastTimer: null,
       /* 建议按钮：开聊前给「怎么问」，聊起来后给「追问什么」——
          初三孩子最难的往往不是不会做，而是不知道该问什么 */
       quickAsks: [
@@ -2045,6 +2059,14 @@ const app = createApp({
       }
       const open = !!(this.current || this.mobileChat);
       if (open && !this.overlayHistoryPushed) {
+        // 内层下面先垫一层首页守卫，这样关掉内层不会直接退出
+        this.showExitToast = false;
+        this.exitArmedUntil = 0;
+        clearTimeout(this.exitToastTimer);
+        if (!this.exitGuardPushed) {
+          history.pushState({ ...(history.state || {}), appExitGuard: true }, '');
+          this.exitGuardPushed = true;
+        }
         history.pushState({ ...(history.state || {}), appOverlay: true }, '');
         this.overlayHistoryPushed = true;
       } else if (!open && this.overlayHistoryPushed) {
@@ -2053,13 +2075,58 @@ const app = createApp({
       }
     },
 
-    handlePopState() {
-      // 左滑/浏览器返回：还有内层就关掉内层，停在列表首页
-      if (!(this.current || this.mobileChat)) return;
-      this.suppressOverlayHistory = true;
-      this.overlayHistoryPushed = false;
-      this.current = null;
-      this.mobileChat = false;
+    /* 首页守卫：手机端首页压一条只有状态、不改 URL 的历史。
+       第一次左滑/返回只弹提示；再滑一次才真正离开。 */
+    armExitGuard() {
+      if (window.innerWidth >= 768) return;
+      if (this.current || this.mobileChat) return;
+      if (this.exitGuardPushed) return;
+      history.pushState({ ...(history.state || {}), appExitGuard: true }, '');
+      this.exitGuardPushed = true;
+    },
+
+    cancelExitToast() {
+      this.showExitToast = false;
+      this.exitArmedUntil = 0;
+      clearTimeout(this.exitToastTimer);
+      this.armExitGuard();
+    },
+
+    handlePopState(e) {
+      const st = e && e.state ? e.state : null;
+      // 内层还在：左滑只关内层，不弹退出提示
+      if (this.current || this.mobileChat) {
+        this.suppressOverlayHistory = true;
+        this.overlayHistoryPushed = false;
+        this.exitGuardPushed = !!(st && st.appExitGuard);
+        this.current = null;
+        this.mobileChat = false;
+        return;
+      }
+      // 退到了守卫层（例如内层关闭后），保持守卫
+      if (st && st.appExitGuard) {
+        this.exitGuardPushed = true;
+        return;
+      }
+      // 首页守卫被左滑掉：第一次只提示；提示窗口内再滑一次就放行
+      if (this.exitGuardPushed) {
+        this.exitGuardPushed = false;
+        if (Date.now() < this.exitArmedUntil) {
+          this.showExitToast = false;
+          return;
+        }
+        this.showExitToast = true;
+        this.exitArmedUntil = Date.now() + 3000;
+        clearTimeout(this.exitToastTimer);
+        this.exitToastTimer = setTimeout(() => {
+          this.showExitToast = false;
+          this.exitArmedUntil = 0;
+          this.armExitGuard();
+        }, 3000);
+        return;
+      }
+      // 没有守卫时（例如刚打开页面的极端情况），补一条守卫
+      if (Date.now() >= this.exitArmedUntil) this.armExitGuard();
     },
 
     /* 手机端的「问 AI 学习问题」入口。桌面端右栏一直在，用不到这个。 */
@@ -2943,10 +3010,13 @@ const app = createApp({
     // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
     // 否则昨天聊到一半的问题今天打开是空的。
     this.loadChat(GENERAL_ID);
+    this.exitGuardPushed = !!(history.state && history.state.appExitGuard);
+    this.armExitGuard();
     window.addEventListener('popstate', this.handlePopState);
   },
 
   beforeUnmount() {
+    clearTimeout(this.exitToastTimer);
     window.removeEventListener('popstate', this.handlePopState);
   }
 });
