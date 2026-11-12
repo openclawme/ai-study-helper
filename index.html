@@ -1093,17 +1093,6 @@
     </div>
   </div>
 
-  <!-- ==================== 首次打开：真实点一下，启用返回保护 ==================== -->
-  <div v-if="showExitIntro" class="fixed inset-0 z-[85] bg-slate-900/55 flex items-center justify-center p-5">
-    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5 text-center">
-      <p class="text-base font-bold text-slate-800">防止误触退出</p>
-      <p class="text-sm text-slate-600 mt-2 leading-relaxed">
-        点一下「开始使用」，之后左滑会先提示，再滑一次才退出。
-      </p>
-      <button class="btn btn-primary w-full py-2.5 text-sm mt-4" @click="startExitProtection">开始使用</button>
-    </div>
-  </div>
-
   <!-- ==================== 首页退出提示 ==================== -->
   <transition name="fade">
     <div v-if="showExitToast"
@@ -1702,7 +1691,6 @@ const app = createApp({
       overlayHistoryPushed: false,
       suppressOverlayHistory: false,
       showExitToast: false,
-      showExitIntro: false,
       exitGuardIndex: 0,
       exitGuardPushed: false,
       exitArmedUntil: 0,
@@ -2099,16 +2087,16 @@ const app = createApp({
       this.exitGuardPushed = true;
     },
 
-    /* 不能再靠“页面加载时自动压历史”了：系统浏览器只认真实触摸/点击，
-       脚本模拟的 click/touch 不算用户激活，pushState 会被直接忽略。
-       所以首页先请用户点一次「开始使用」，在这个真实手势里连续压 4 层守卫；
-       之后每次左滑都只退一层并提示，提示窗口内再滑才真正离开。 */
-    startExitProtection() {
-      this.showExitIntro = false;
+    /* 系统浏览器只认真实触摸/点击，脚本模拟不算用户激活。
+       所以在第一次真实触摸/点击里静默压 6 层守卫；
+       之后每次左滑只退一层并提示，提示窗口内再滑才真正离开。 */
+    armExitStack() {
       if (window.innerWidth >= 768) return;
+      if (this.current || this.mobileChat) return;
+      if (this.showExitToast) return;
       if (this.exitGuardIndex) return;
       const base = location.pathname + location.search;
-      const n = 4;
+      const n = 6;
       for (let i = 1; i <= n; i++) {
         history.pushState({ ...(history.state || {}), appExitGuard: i }, '', base + '#app-home-' + i);
       }
@@ -2120,7 +2108,7 @@ const app = createApp({
       this.showExitToast = false;
       this.exitArmedUntil = 0;
       clearTimeout(this.exitToastTimer);
-      if (!this.exitGuardIndex && window.innerWidth < 768) this.showExitIntro = true;
+      if (!this.exitGuardIndex) this.armExitStack();
     },
 
     handlePopState() {
@@ -2180,12 +2168,10 @@ const app = createApp({
         this.exitToastTimer = setTimeout(() => {
           this.showExitToast = false;
           this.exitArmedUntil = 0;
-          if (window.innerWidth < 768) this.showExitIntro = true;
         }, 3000);
         return;
       }
-      // 完全没有守卫：手机端请用户点一次「开始使用」再继续
-      if (window.innerWidth < 768) this.showExitIntro = true;
+      // 完全没有守卫：等下一次真实触摸时再静默补上
     },
 
     /* 手机端的「问 AI 学习问题」入口。桌面端右栏一直在，用不到这个。 */
@@ -3072,13 +3058,17 @@ const app = createApp({
     const gm = location.hash.match(/^#app-home-(\d+)$/);
     this.exitGuardIndex = gm ? parseInt(gm[1], 10) : 0;
     this.exitGuardPushed = this.exitGuardIndex > 0;
-    this.showExitIntro = window.innerWidth < 768 && !this.exitGuardIndex;
+    this._armExit = () => this.armExitStack();
+    document.addEventListener('touchstart', this._armExit, { passive: true, capture: true });
+    document.addEventListener('pointerdown', this._armExit, { passive: true, capture: true });
     window.addEventListener('popstate', this.handlePopState);
     window.addEventListener('hashchange', this.handlePopState);
   },
 
   beforeUnmount() {
     clearTimeout(this.exitToastTimer);
+    document.removeEventListener('touchstart', this._armExit, true);
+    document.removeEventListener('pointerdown', this._armExit, true);
     window.removeEventListener('popstate', this.handlePopState);
     window.removeEventListener('hashchange', this.handlePopState);
   }
