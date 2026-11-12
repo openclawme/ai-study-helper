@@ -2078,16 +2078,31 @@ const app = createApp({
 
     /* 首页守卫：手机端首页压一条只有状态、不改 URL 的历史。
        第一次左滑/返回只弹提示；再滑一次才真正离开。 */
+    /* 真正往历史里压退出守卫。带 hash：同 URL 的 pushState 在微信/手机
+       WebView 里常常不算一层可回退历史，左滑会直接关掉整个页面。 */
+    pushExitGuard() {
+      const base = location.pathname + location.search;
+      history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
+      this.exitGuardPushed = true;
+    },
+
     armExitGuard() {
       if (window.innerWidth >= 768) return;
       if (this.current || this.mobileChat) return;
       if (this.showExitToast) return;      // 提示还在，别把“再滑一次”挡掉
-      if (this.exitGuardPushed) return;
-      // 关键：带一个 hash。三端实测，同 URL 的 pushState 在微信/部分手机
-      // WebView 里不会被当成可回退的一层，左滑就直接关掉整个页面了。
-      const base = location.pathname + location.search;
-      history.pushState({ ...(history.state || {}), appExitGuard: true }, '', base + '#app-home');
-      this.exitGuardPushed = true;
+      if (history.state && history.state.appExitGuard) {
+        this.exitGuardPushed = true;
+        return;
+      }
+      this.pushExitGuard();
+    },
+
+    /* 触摸/指针按下属于用户手势：有些 WebView 只认手势里压的历史。
+       首页每次手指落下都补一次，已经在守卫上就什么都不做。 */
+    handleFirstTouch() {
+      if (this.showExitToast) return;
+      if (this.current || this.mobileChat) return;
+      this.armExitGuard();
     },
 
     cancelExitToast() {
@@ -2113,15 +2128,21 @@ const app = createApp({
         this.exitGuardPushed = true;
         return;
       }
-      // 首页守卫被左滑掉：第一次只提示；提示窗口内再滑一次就放行
+      // 守卫被左滑掉
       if (this.exitGuardPushed) {
         this.exitGuardPushed = false;
-        if (Date.now() < this.exitArmedUntil) {
+        // 提示还在 / 仍在 3 秒窗口内 = 用户第二次滑动：放行
+        if (this.showExitToast || Date.now() < this.exitArmedUntil) {
           this.showExitToast = false;
+          this.exitArmedUntil = 0;
+          clearTimeout(this.exitToastTimer);
+          history.back();
           return;
         }
+        // 第一次滑动：弹提示，并立刻把守卫补回去 —— 提示消失后仍受保护
         this.showExitToast = true;
         this.exitArmedUntil = Date.now() + 3000;
+        this.pushExitGuard();
         clearTimeout(this.exitToastTimer);
         this.exitToastTimer = setTimeout(() => {
           this.showExitToast = false;
@@ -3018,16 +3039,18 @@ const app = createApp({
     this.exitGuardPushed = !!(history.state && history.state.appExitGuard) || location.hash === '#app-home';
     this.armExitGuard();
     // 有些手机浏览器首帧的 innerWidth / 历史还没稳定，再补两次布防
-    this._armExit = () => this.armExitGuard();
+    this._armExit = () => this.handleFirstTouch();
     setTimeout(this._armExit, 400);
-    document.addEventListener('touchstart', this._armExit, { once: true, passive: true });
+    document.addEventListener('touchstart', this._armExit, { passive: true, capture: true });
+    document.addEventListener('pointerdown', this._armExit, { passive: true, capture: true });
     window.addEventListener('resize', this._armExit);
     window.addEventListener('popstate', this.handlePopState);
   },
 
   beforeUnmount() {
     clearTimeout(this.exitToastTimer);
-    document.removeEventListener('touchstart', this._armExit);
+    document.removeEventListener('touchstart', this._armExit, true);
+    document.removeEventListener('pointerdown', this._armExit, true);
     window.removeEventListener('resize', this._armExit);
     window.removeEventListener('popstate', this.handlePopState);
   }
