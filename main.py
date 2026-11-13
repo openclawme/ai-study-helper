@@ -131,8 +131,13 @@ AI_PROFILES: Dict[str, Dict[str, Any]] = {
     # 普通答疑：快是第一位。实测 low 不会掉质量（正文反而更长）。
     "chat": {
         "reasoning_effort": os.getenv("AI_REASONING_EFFORT", "low"),
-        "deadline": int(os.getenv("AI_DEADLINE_SEC", "180")),        # 3 分钟
+        "deadline": int(os.getenv("AI_DEADLINE_SEC", "180")),        # 3 分钟硬上限
         "idle": int(os.getenv("AI_IDLE_SEC", "45")),
+        # 只思考、迟迟不吐正文时的「软时限」：到点不再干等，改用不思考的
+        # 快速模式重答一次。线上出现过连续想几分钟、180 秒还没出正文的情况，
+        # 孩子盯着屏幕只换来一句「没写出内容」，体验比慢一点更糟。
+        "fallback_after": int(os.getenv("AI_FALLBACK_AFTER_SEC", "75")),
+        "fallback_deadline": int(os.getenv("AI_FALLBACK_DEADLINE_SEC", "45")),
     },
     # 生成动画：效果第一位。不限制思考（留空 = 用模型默认），时限放宽到 10 分钟。
     # 10 分钟不是「够用」的估计，而是「再久就一定是卡住了」的上限——
@@ -485,8 +490,16 @@ def norm_kind(v: Any, default: str = "mistake") -> str:
     return default
 
 
-def _think_kwargs(profile: str = "chat") -> Dict[str, Any]:
-    """限制思考的采样参数。空值就不传，交回服务端默认（anim 档就是这么放的）。"""
+def _think_kwargs(profile: str = "chat", fast: bool = False) -> Dict[str, Any]:
+    """
+    限制思考的采样参数。空值就不传，交回服务端默认（anim 档就是这么放的）。
+
+    fast=True 用于「正常模式迟迟不吐正文」后的兜底：reasoning_effort=none
+    让模型直接作答。兜底模式实测几秒内就开始出正文；
+    只在兜底时用，正常问答仍走 low，避免牺牲需要多步推理的题。
+    """
+    if fast:
+        return {"reasoning_effort": "none"}
     eff = _profile(profile)["reasoning_effort"]
     return {"reasoning_effort": eff} if eff else {}
 
@@ -3507,10 +3520,19 @@ def call_tutor_stream(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]
     messages = build_tutor_messages(it, history, question, mode, material)
     parts: List[str] = []
     last_err = "未知错误"
-    started = time.time()
-    _dl, _idle = _profile(profile)["deadline"], _profile(profile)["idle"]
+    cfg = _profile(profile)
     for attempt in range(1, 3):
+        # 第二次尝试：chat 档改用「不思考」的快速模式兜底。
+        # 第一次可能是想太久；再原样重试一次大概率还是想太久。
+        fast = (profile == "chat" and attempt == 2)
+        _dl = cfg.get("fallback_deadline", cfg["deadline"]) if fast else cfg["deadline"]
+        _idle = cfg["idle"]
+        # 软时限只用于第一次尝试：只思考、不吐正文超过 fallback_after 秒，
+        # 就不等到 180 秒硬时限，直接换快速模式。动画档不配这个键，不降级。
+        _soft = cfg.get("fallback_after") if (attempt == 1 and not fast) else None
         parts = []
+        started = time.time()
+        retry_fast = False
         try:
             stream = _client().chat.completions.create(
                 model=MODEL_NAME,
@@ -3526,7 +3548,7 @@ def call_tutor_stream(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]
                 # 「多久没收到新数据就报错」——这才是卡死该有的兜底。
                 timeout=httpx2.Timeout(connect=10.0, read=float(_idle),
                                        write=30.0, pool=10.0),
-                **_think_kwargs(profile),
+                **_think_kwargs(profile, fast=fast),
             )
             _llm_tick("chat")
             parser = AnimFenceParser()
@@ -3543,6 +3565,13 @@ def call_tutor_stream(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]
                         yield {"type": "deadline",
                                "text": f"已经跑了 {span}，超过上限，已中断"}
                         return
+                    # 软时限：还在思考、正文一个字都没出来。与其让孩子干等，
+                    # 不如马上用不思考的快速模式重来一次。
+                    if _soft and not parts and now - started > _soft:
+                        yield {"type": "reasoning",
+                               "text": "（思考时间较长，正在改用快速模式重新回答…）"}
+                        retry_fast = True
+                        break
                     # 看门狗：连接没断但一个字都不来，判定卡死
                     if now - last_chunk > _idle:
                         yield {"type": "deadline",
@@ -3565,6 +3594,8 @@ def call_tutor_stream(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]
                                 yield {"type": "delta", "text": clean}
                         if anim:
                             yield {"type": "anim", "title": anim["title"], "html": anim["html"]}
+                if retry_fast:
+                    continue
                 tail_plain, anim = parser.close()
                 flushed = msf.feed(tail_plain or "", final=True)
                 if flushed:
@@ -3603,6 +3634,8 @@ def call_tutor(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]], ques
 
     last_err = "未知错误"
     for attempt in range(1, 3):
+        # 和流式路径一致：第一次超时/空返回后，第二次改用不思考的快速模式。
+        fast = (profile == "chat" and attempt == 2)
         try:
             resp = _client().chat.completions.create(
                 model=MODEL_NAME,
@@ -3610,7 +3643,7 @@ def call_tutor(it: Optional[Dict[str, Any]], history: List[Dict[str, Any]], ques
                 temperature=0.6,
                 max_tokens=CHAT_MAX_TOKENS,
                 timeout=AI_HTTP_TIMEOUT,
-                **_think_kwargs(profile),
+                **_think_kwargs(profile, fast=fast),
             )
             _llm_tick("chat")
             ch = resp.choices[0]
