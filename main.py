@@ -30,6 +30,8 @@ import hashlib
 import hmac
 import io
 import html
+import queue
+import contextvars
 import json
 import os
 import re
@@ -5449,14 +5451,127 @@ def serve_media(kind: str, mid: int):
 
 
 # ---------------------------- 路由：上传错题 ---------------------------------
+# =============================================================================
+# 照片上传后台队列
+# 请求只做「校验 + 压缩 + 入队」并立刻返回 job_id；AI 拆题、去红笔、落库
+# 都在单线程后台跑，前台可以继续浏览、复习、问答，不被 30 秒的 AI 卡住。
+# =============================================================================
+UPLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
+_UPLOAD_JOBS_LOCK = threading.Lock()
+_UPLOAD_QUEUE: "queue.Queue" = queue.Queue()
+_UPLOAD_WORKER_LOCK = threading.Lock()
+_UPLOAD_WORKER_STARTED = False
+
+
+def _job_update(job_id: str, **kw) -> None:
+    with _UPLOAD_JOBS_LOCK:
+        job = UPLOAD_JOBS.get(job_id)
+        if job:
+            job.update(kw)
+
+
+def _process_upload_job(job_id: str, image_path: str, subject: str) -> None:
+    try:
+        with open(image_path, "rb") as f:
+            norm_bytes = f.read()
+        _job_update(job_id, status="processing", message="AI 正在判断这张图里有几道题…")
+        problems = None
+        if api_key_ready():
+            try:
+                problems = call_split_page({"kind": "image", "raw": norm_bytes},
+                                           prompt=_SPLIT_PROMPT_PLAIN)
+            except Exception:
+                problems = None
+        items: List[Dict[str, Any]] = []
+        clean_any = False
+        fixed_from = None
+        if problems is not None:
+            if not problems:
+                _job_update(job_id, status="error",
+                            error="这张图里没有识别到题目，换一张或确认照片拍全、拍清楚")
+                return
+            total = len(problems)
+            for i, p in enumerate(problems, 1):
+                tag = p["tag"]
+                m = re.match(r"^\s*(语文|数学|英语|物理|化学|历史|道德与法治)\s*[-－—]", tag or "")
+                final_subject = m.group(1) if m else subject
+                if fixed_from is None and m and m.group(1) != subject:
+                    fixed_from = subject
+                it, clean_ok = _persist_item(
+                    raw_image=norm_bytes,
+                    ai={"_status": "ok", "kind": p["kind"], "tag": tag,
+                        "analysis": p["analysis"], "clean_text": p["clean_text"]},
+                    subject=final_subject, source="照片")
+                items.append(it)
+                clean_any = clean_any or clean_ok
+                _job_update(job_id, progress=i, total=total,
+                            message=f"拆出 {total} 道，已保存 {i}/{total}")
+        else:
+            # 拆题失败：退回单题识别，保证后台任务总有结果
+            ai = call_deepseek(image_path, subject)
+            final_subject, fixed_from = subject, None
+            m = re.match(r"^\s*(语文|数学|英语|物理|化学|历史|道德与法治)\s*[-－—]", ai["tag"] or "")
+            if m and m.group(1) != subject:
+                final_subject, fixed_from = m.group(1), subject
+            it, clean_ok = _persist_item(raw_image=norm_bytes, ai=ai,
+                                         subject=final_subject, source="照片")
+            items = [it]
+            clean_any = clean_ok
+        _job_update(job_id, status="done", items=items, split_count=len(items),
+                    clean_image_ok=clean_any, subject_fixed_from=fixed_from,
+                    message="完成", progress=len(items), total=len(items))
+    except Exception as e:
+        _job_update(job_id, status="error", error=f"{type(e).__name__}: {e}")
+
+
+def _upload_worker() -> None:
+    while True:
+        job_id, path, subject, ctx = _UPLOAD_QUEUE.get()
+        try:
+            ctx.run(_process_upload_job, job_id, path, subject)
+        except Exception as e:
+            _job_update(job_id, status="error", error=f"{type(e).__name__}: {e}")
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            _UPLOAD_QUEUE.task_done()
+
+
+def _ensure_upload_worker() -> None:
+    global _UPLOAD_WORKER_STARTED
+    with _UPLOAD_WORKER_LOCK:
+        if not _UPLOAD_WORKER_STARTED:
+            threading.Thread(target=_upload_worker, daemon=True, name="photo-upload").start()
+            _UPLOAD_WORKER_STARTED = True
+
+
+@app.get("/api/upload/jobs/{job_id}", include_in_schema=False)
+def upload_job_status(job_id: str):
+    """后台照片任务状态。只能看自己的任务。"""
+    with _UPLOAD_JOBS_LOCK:
+        job = UPLOAD_JOBS.get(job_id)
+        if not job or job.get("uid") != current_uid():
+            raise HTTPException(404, "任务不存在")
+        snap = dict(job)
+    items = snap.get("items") or []
+    return {
+        "status": snap.get("status"), "message": snap.get("message"),
+        "items": items, "item": items[0] if items else None,
+        "split_count": snap.get("split_count", len(items)),
+        "clean_image_ok": snap.get("clean_image_ok", False),
+        "subject_fixed_from": snap.get("subject_fixed_from"),
+        "error": snap.get("error", ""),
+        "progress": snap.get("progress", 0), "total": snap.get("total", 0),
+    }
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
     """
-    双轨制 AI 错题处理主流程：
-      1. 版本A：原图标准化落盘 static/origin/original_[id].jpg（保留手写 + 红笔批改）
-      2. 版本B-图片：OpenCV 去红笔 + 白纸化 -> static/clean/clean_[id].jpg
-      3. 版本B-文字 + 考点 + 变式题 + 解析：deepseek-flash 一次多模态调用产出
-      4. 全部写入 SQLite 并返回
+    照片上传：只做校验、压缩、入队，立刻返回 job_id。
+    AI 拆题/落库在后台队列里跑，前台不阻塞。
     """
     if subject not in SUBJECTS:
         raise HTTPException(400, f"科目必须是：{'、'.join(SUBJECTS)}")
@@ -5466,81 +5581,29 @@ async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
     if len(raw) > 40 * 1024 * 1024:
         raise HTTPException(400, "图片过大（>40MB），请用手机默认相机压缩后再传")
 
-    # 先把图交给 AI（AI 才是「看过这张图」的一方），再统一落库。
-    # 落库这一步和文档上传共用 _persist_item —— 两条路各写一遍的话，
-    # 以后加字段（比如这次的 source）必然漏掉一边。
-    with tempfile.TemporaryDirectory(prefix="up_") as td:
-        tmp_img = os.path.join(td, "in.jpg")
-        try:
-            normalize_and_save(raw, tmp_img)
-        except Exception as e:
-            raise HTTPException(400, f"图片解析失败，请换一张 JPG/PNG 图片重试（{e}）")
-        with open(tmp_img, "rb") as f:
-            norm_bytes = f.read()
-
-    # 先让 AI 把这张图当成一页来拆题：一张照片里可能印着好几道题。
-    # 图片本身**不裁**——位置范围不可靠，宁可每条共用整张原图；
-    # 拆不出来（AI 失败）就退回原来的单题识别。
-    problems = None
-    if api_key_ready():
-        try:
-            problems = call_split_page({"kind": "image", "raw": norm_bytes},
-                                       prompt=_SPLIT_PROMPT_PLAIN)
-        except Exception:
-            problems = None
-
-    if problems is not None:
-        if not problems:
-            raise HTTPException(400, "这张图里没有识别到题目，换一张或确认照片拍全、拍清楚")
-        items = []
-        clean_any = False
-        fixed_from = None
-        for p in problems:
-            tag = p["tag"]
-            m = re.match(r"^\s*(语文|数学|英语|物理|化学|历史|道德与法治)\s*[-－—]", tag or "")
-            final_subject = m.group(1) if m else subject
-            if fixed_from is None and m and m.group(1) != subject:
-                fixed_from = subject
-            try:
-                it, clean_ok = _persist_item(
-                    raw_image=norm_bytes,
-                    ai={"_status": "ok", "kind": p["kind"], "tag": tag,
-                        "analysis": p["analysis"], "clean_text": p["clean_text"]},
-                    subject=final_subject, source="照片")
-            except Exception as e:
-                raise HTTPException(400, f"图片保存失败：{e}")
-            items.append(it)
-            clean_any = clean_any or clean_ok
-        return {
-            "ok": True,
-            "item": items[0],
-            "items": items,
-            "split_count": len(items),
-            "clean_image_ok": clean_any,
-            "subject_fixed_from": fixed_from,
-        }
-
-    # 拆题失败：退回原来的单题识别，保证上传永远有结果
-    ai = call_deepseek(tmp_img, subject)
-    final_subject, fixed_from = subject, None
-    m = re.match(r"^\s*(语文|数学|英语|物理|化学|历史|道德与法治)\s*[-－—]", ai["tag"] or "")
-    if m and m.group(1) != subject:
-        final_subject, fixed_from = m.group(1), subject
-
+    job_id = secrets.token_hex(8)
+    job_path = os.path.join(tempfile.gettempdir(), f"gcl_upload_{job_id}.jpg")
     try:
-        it, clean_ok = _persist_item(raw_image=norm_bytes, ai=ai,
-                                     subject=final_subject, source="照片")
+        normalize_and_save(raw, job_path)
     except Exception as e:
-        raise HTTPException(400, f"图片保存失败：{e}")
+        try:
+            os.unlink(job_path)
+        except OSError:
+            pass
+        raise HTTPException(400, f"图片解析失败，请换一张 JPG/PNG 图片重试（{e}）")
 
-    return {
-        "ok": True,
-        "item": it,
-        "items": [it],
-        "split_count": 1,
-        "clean_image_ok": clean_ok,         # 去红笔是否真的成功（失败时版本B复用原图）
-        "subject_fixed_from": fixed_from,   # 非空表示 AI 纠正了归档科目
-    }
+    with _UPLOAD_JOBS_LOCK:
+        UPLOAD_JOBS[job_id] = {
+            "id": job_id, "uid": current_uid(), "status": "queued",
+            "message": "已收到，排队处理中…", "created_at": time.time(),
+            "items": [], "split_count": 0, "clean_image_ok": False,
+            "subject_fixed_from": None, "error": "", "progress": 0, "total": 0,
+        }
+    _ensure_upload_worker()
+    ctx = contextvars.copy_context()
+    _UPLOAD_QUEUE.put((job_id, job_path, subject, ctx))
+    return {"ok": True, "job_id": job_id, "status": "queued",
+            "message": "已收到，后台处理中；好了会自动出现在列表"}
 
 
 # ---------------------------- 路由：上传文档（PDF/Word/文本）--------------------

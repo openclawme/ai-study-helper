@@ -319,6 +319,9 @@
             <p class="text-xs text-slate-500 mt-1.5">{{ uploadMsg }}</p>
           </div>
         </transition>
+        <p v-if="bgJobs.length" class="text-[11.5px] text-indigo-600 mt-2">
+          后台处理中 {{ bgJobs.length }} 张，处理完会自动出现在列表…
+        </p>
       </div>
 
       <!-- 自由问答入口。只在手机端出现：桌面端右栏一直在，本来就能直接问。
@@ -1652,6 +1655,7 @@ const app = createApp({
       authExpired: false,
       uploadPct: 0,
       uploadMsg: '',
+      bgJobs: [],
       exporting: false,
       /* 归档科目由 AI 从图片识别（后端看 tag 前缀），认得不对可以在详情页改。
          上传前不再需要用户手选，所以这里只有一份可选列表给「改科目」用。 */
@@ -2354,28 +2358,27 @@ const app = createApp({
       if (imgs.length) await this.uploadImages(imgs);
     },
 
-    /* 批量图片：**串行**压缩 + 上传。
-       刻意不并发 —— 每张都要调一次 AI（10~30 秒），并发会把接口打满、
-       还可能触发限流；串行反而更稳，进度也看得清。 */
+    /* 批量图片：**串行**压缩 + 提交，提交后立即返回，不在这里等 AI。
+       每张图变成一个后台任务（job），由后端排队识别、拆题；前台只负责
+       轮询进度，用户可以继续用其它功能。 */
     async uploadImages(files) {
       const n = files.length;
-      let ok = 0, last = null, totalItems = 0;
+      let submitted = 0;
       const failed = [];
       this.uploading = true;
       try {
         for (let i = 0; i < n; i++) {
-          // 只选了一张时不加前缀，和以前的行为一模一样
           const tag = n > 1 ? `第 ${i + 1}/${n} 张：` : '';
           this.uploadPct = 0;
-          this.uploadMsg = tag + '正在压缩图片…';
+          this.uploadMsg = tag + '正在压缩并提交…';
           try {
             const blob = await this.compress(files[i]);
-            last = await this.doUpload(blob, tag);
-            ok++;
-            totalItems += (last.items && last.items.length) || 1;
+            const res = await this.doUpload(blob, tag);
+            if (!res.job_id) throw new Error('后台任务创建失败');
+            this.bgJobs.push({ id: res.job_id, label: tag });
+            submitted++;
           } catch (err) {
             if (this.authExpired) return;
-            // 单张失败不能拖垮整批：记下来接着传下一张
             failed.push((files[i].name || `第 ${i + 1} 张`) + '：' + err.message);
           }
         }
@@ -2384,36 +2387,90 @@ const app = createApp({
         this.uploadPct = 0;
         this.uploadMsg = '';
       }
-
-      await this.loadList();
-
-      if (n === 1 && last) {
-        const created = last.items || [last.item];
-        if (created.length > 1) {
-          // 一张图拆出多道题：不自动跳详情，让人先在列表里看到拆出来的几条
-          this.notify(`这张图里有 ${created.length} 道题，已拆成 ${created.length} 条`);
-        } else {
-          // 单张单题：行为和以前一致 —— 直接打开详情
-          const it = this.items.find(x => x.id === last.item.id) || last.item;
-          this.openDetail(it);
-          if (last.subject_fixed_from) {
-            this.notify(`科目已自动纠正：你选的是「${last.subject_fixed_from}」，`
-                        + `AI 从图上认出是「${last.item.subject}」`);
-          } else if (last.item.ai_ok) {
-            this.notify('AI 解析完成：' + (last.item.tag || '已生成考点'));
-          } else {
-            this.notify('图片已保存，但 AI 未完成：' + (last.item.ai_status || '未知原因'), 'error');
-          }
-        }
-      } else if (ok) {
-        // 多张：不自动跳详情，让人先在列表里看到新传的这几张
-        this.notify(`已归档 ${ok} 张` + (totalItems > ok ? `，共 ${totalItems} 道题` : '')
-                    + (failed.length ? `，${failed.length} 张失败` : ''));
+      if (submitted) {
+        this.notify(`已提交 ${submitted} 张，后台处理中；你可以继续用，好了会自动出现`);
+        this.pollBgJobs();
       }
-
       if (failed.length) {
         this.notify('这些没传上去 —— ' + failed.join('；'), 'error');
       }
+    },
+
+    /* 轮询后台任务：不阻塞任何操作；每完成一张就刷新列表并提示 */
+    pollBgJobs() {
+      if (this._bgTimer) return;
+      const tick = async () => {
+        this._bgTimer = null;
+        if (!this.bgJobs.length) return;
+        for (const job of [...this.bgJobs]) {
+          try {
+            const r = await fetch(`/api/upload/jobs/${job.id}`, { cache: 'no-store' });
+            if (r.status === 401) {
+              this.authExpired = true;
+              location.href = '/login';
+              return;
+            }
+            if (!r.ok) {
+              this.bgJobs = this.bgJobs.filter(x => x.id !== job.id);
+              this.notify('后台任务丢了，请重新上传', 'error');
+              continue;
+            }
+            const d = await r.json();
+            if (d.status === 'done') {
+              this.bgJobs = this.bgJobs.filter(x => x.id !== job.id);
+              await this.loadList();
+              const cnt = (d.items || []).length;
+              if (cnt > 1) this.notify(`一张图拆成了 ${cnt} 道题`);
+              else if (cnt === 1) this.notify('已归档 1 道题');
+              else this.notify('后台处理完成，但没有新增题目', 'error');
+            } else if (d.status === 'error') {
+              this.bgJobs = this.bgJobs.filter(x => x.id !== job.id);
+              this.notify(d.error || '后台处理失败', 'error');
+            }
+          } catch (e) {
+            /* 网络抖动，下一轮再试 */
+          }
+        }
+        if (this.bgJobs.length) this._bgTimer = setTimeout(tick, 2500);
+      };
+      this._bgTimer = setTimeout(tick, 1500);
+    },
+
+    doUpload(blob, label = '') {
+      return new Promise((resolve, reject) => {
+        const fd = new FormData();
+        fd.append('file', blob, 'photo.jpg');
+        // 只是个提示：后端以 AI 从 tag 认出的科目为准（认错可在详情页改）
+        fd.append('subject', this.activeSubject === '全部' ? '数学' : this.activeSubject);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/upload');
+        xhr.timeout = 180000;
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            this.uploadPct = Math.round(ev.loaded / ev.total * 92);
+          }
+        };
+        xhr.upload.onload = () => {
+          this.uploadPct = 95;
+          this.uploadMsg = label + '已提交，后台处理中…';
+        };
+        xhr.onload = () => {
+          this.uploadPct = 100;
+          if (xhr.status === 401) {
+            this.authExpired = true;
+            location.href = '/login';
+            reject(new Error('登录已过期'));
+            return;
+          }
+          let data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+          if (xhr.status >= 200 && xhr.status < 300 && data && data.job_id) resolve(data);
+          else reject(new Error((data && (data.detail || data.message)) || ('HTTP ' + xhr.status)));
+        };
+        xhr.onerror = () => reject(new Error('网络错误，请确认手机与电脑在同一 WiFi'));
+        xhr.ontimeout = () => reject(new Error('请求超时（提交较慢，可稍后在列表中查看）'));
+        xhr.send(fd);
+      });
     },
 
     /* 手机原图 5~12MB，先等比压到 2000px / JPEG，局域网秒传，也省 AI token */
@@ -2450,44 +2507,6 @@ const app = createApp({
         img.onload = () => resolve(img);
         img.onerror = () => reject(bad());
         img.src = URL.createObjectURL(file);
-      });
-    },
-
-    /* 用 XHR 拿真实上传进度；服务器端 AI 解析阶段用「AI 解析中」提示 */
-    doUpload(blob, label = '') {
-      return new Promise((resolve, reject) => {
-        const fd = new FormData();
-        fd.append('file', blob, 'photo.jpg');
-        // 只是个提示：后端以 AI 从 tag 认出的科目为准（认错可在详情页改）
-        fd.append('subject', this.activeSubject === '全部' ? '数学' : this.activeSubject);
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/upload');
-        xhr.timeout = 180000;
-        xhr.upload.onprogress = (ev) => {
-          if (ev.lengthComputable) {
-            this.uploadPct = Math.round(ev.loaded / ev.total * 92);
-          }
-        };
-        xhr.upload.onload = () => {
-          this.uploadPct = 95;
-          this.uploadMsg = label + 'AI 正在判断这张图里有几道题、提取题干…（约 10~30 秒）';
-        };
-        xhr.onload = () => {
-          this.uploadPct = 100;
-          if (xhr.status === 401) {
-            this.authExpired = true;
-            location.href = '/login';
-            reject(new Error('登录已过期'));
-            return;
-          }
-          let data = null;
-          try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
-          if (xhr.status >= 200 && xhr.status < 300 && data && data.item) resolve(data);
-          else reject(new Error((data && (data.detail || data.message)) || ('HTTP ' + xhr.status)));
-        };
-        xhr.onerror = () => reject(new Error('网络错误，请确认手机与电脑在同一 WiFi'));
-        xhr.ontimeout = () => reject(new Error('请求超时（AI 处理较慢，可稍后在列表中查看结果）'));
-        xhr.send(fd);
       });
     },
 
