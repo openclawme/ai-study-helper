@@ -300,6 +300,7 @@
 
         <p class="text-xs text-slate-500 mt-2 leading-relaxed">
           <b class="text-slate-700">拍照 / 图片</b>：只选图片；手机上点开可选「拍照」或「从相册」。
+          一张图里有多道题会自动拆成多条；图片不裁切，整张原图共用。
           上传前自动压缩，原图完整保留手写与红笔批改。<br>
           <b class="text-slate-700">选文件</b>：只选文档（PDF / Word / 纯文本），
           AI 会<b class="text-slate-700">逐页把整份卷子拆成一道一道的题</b>。
@@ -2358,7 +2359,7 @@ const app = createApp({
        还可能触发限流；串行反而更稳，进度也看得清。 */
     async uploadImages(files) {
       const n = files.length;
-      let ok = 0, last = null;
+      let ok = 0, last = null, totalItems = 0;
       const failed = [];
       this.uploading = true;
       try {
@@ -2371,6 +2372,7 @@ const app = createApp({
             const blob = await this.compress(files[i]);
             last = await this.doUpload(blob, tag);
             ok++;
+            totalItems += (last.items && last.items.length) || 1;
           } catch (err) {
             if (this.authExpired) return;
             // 单张失败不能拖垮整批：记下来接着传下一张
@@ -2386,20 +2388,27 @@ const app = createApp({
       await this.loadList();
 
       if (n === 1 && last) {
-        // 单张：行为和以前一致 —— 直接打开详情
-        const it = this.items.find(x => x.id === last.item.id) || last.item;
-        this.openDetail(it);
-        if (last.subject_fixed_from) {
-          this.notify(`科目已自动纠正：你选的是「${last.subject_fixed_from}」，`
-                      + `AI 从图上认出是「${last.item.subject}」`);
-        } else if (last.item.ai_ok) {
-          this.notify('AI 解析完成：' + (last.item.tag || '已生成考点'));
+        const created = last.items || [last.item];
+        if (created.length > 1) {
+          // 一张图拆出多道题：不自动跳详情，让人先在列表里看到拆出来的几条
+          this.notify(`这张图里有 ${created.length} 道题，已拆成 ${created.length} 条`);
         } else {
-          this.notify('图片已保存，但 AI 未完成：' + (last.item.ai_status || '未知原因'), 'error');
+          // 单张单题：行为和以前一致 —— 直接打开详情
+          const it = this.items.find(x => x.id === last.item.id) || last.item;
+          this.openDetail(it);
+          if (last.subject_fixed_from) {
+            this.notify(`科目已自动纠正：你选的是「${last.subject_fixed_from}」，`
+                        + `AI 从图上认出是「${last.item.subject}」`);
+          } else if (last.item.ai_ok) {
+            this.notify('AI 解析完成：' + (last.item.tag || '已生成考点'));
+          } else {
+            this.notify('图片已保存，但 AI 未完成：' + (last.item.ai_status || '未知原因'), 'error');
+          }
         }
       } else if (ok) {
         // 多张：不自动跳详情，让人先在列表里看到新传的这几张
-        this.notify(`已归档 ${ok} 张` + (failed.length ? `，${failed.length} 张失败` : ''));
+        this.notify(`已归档 ${ok} 张` + (totalItems > ok ? `，共 ${totalItems} 道题` : '')
+                    + (failed.length ? `，${failed.length} 张失败` : ''));
       }
 
       if (failed.length) {
@@ -2461,7 +2470,7 @@ const app = createApp({
         };
         xhr.upload.onload = () => {
           this.uploadPct = 95;
-          this.uploadMsg = label + 'AI 正在识别考点、擦除手写、生成变式题…（约 10~30 秒）';
+          this.uploadMsg = label + 'AI 正在判断这张图里有几道题、提取题干…（约 10~30 秒）';
         };
         xhr.onload = () => {
           this.uploadPct = 100;

@@ -737,15 +737,14 @@ _SPLIT_LOCATE_RULE = r"""
    - **宁可多留，不可切掉**：不确定时把范围往大取一整格。
    - 一道题跨越多条刻度线时，取最外圈的两条。"""
 
-if DOC_AUTO_CROP:
-    SPLIT_PROMPT = (_SPLIT_BODY
-                    + "你必须对每道题完成下面 4 件事，外加第 5 件「定位」，并严格以 json 输出：\n\n"
-                    + _EXTRACT_RULES + _SPLIT_LOCATE_RULE
-                    + "\n" + (_SPLIT_JSON_HEAD % ',\n      "top": 20,\n      "bottom": 45'))
-else:
-    SPLIT_PROMPT = (_SPLIT_BODY
-                    + "你必须对每道题完成下面 4 件事，并严格以 json 输出：\n\n"
-                    + _EXTRACT_RULES + "\n" + (_SPLIT_JSON_HEAD % ""))
+_SPLIT_PROMPT_CROP = (_SPLIT_BODY
+                     + "你必须对每道题完成下面 4 件事，外加第 5 件「定位」，并严格以 json 输出：\n\n"
+                     + _EXTRACT_RULES + _SPLIT_LOCATE_RULE
+                     + "\n" + (_SPLIT_JSON_HEAD % ',\n      "top": 20,\n      "bottom": 45'))
+_SPLIT_PROMPT_PLAIN = (_SPLIT_BODY
+                      + "你必须对每道题完成下面 4 件事，并严格以 json 输出：\n\n"
+                      + _EXTRACT_RULES + "\n" + (_SPLIT_JSON_HEAD % ""))
+SPLIT_PROMPT = _SPLIT_PROMPT_CROP if DOC_AUTO_CROP else _SPLIT_PROMPT_PLAIN
 
 JSON_HINT = """
 请以 json 格式输出，结构如下（严格遵守，不要加注释）：
@@ -1092,10 +1091,11 @@ def crop_page(page_jpeg: bytes, top: Any, bottom: Any) -> bytes:
         return page_jpeg
 
 
-def call_split_page(page: Dict[str, Any]) -> List[Dict[str, Any]]:
+def call_split_page(page: Dict[str, Any], prompt: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     把一页拆成若干道题。返回 [{"kind","tag","analysis","clean_text","top","bottom"}, ...]。
     失败抛异常，由调用方决定是跳过这一页还是整体报错。
+    prompt 可覆盖系统提示：照片拆题固定用纯拆题版，不掺定位，避免模型把整页均分。
     """
     if page["kind"] == "text":
         user_text = ("下面这一页的**文字**来自一个文本文件，请按系统要求拆成一道一道的题目。\n"
@@ -1112,7 +1112,7 @@ def call_split_page(page: Dict[str, Any]) -> List[Dict[str, Any]]:
              "image_url": {"url": bytes_to_data_uri(shot), "detail": "high"}},
         ]
 
-    messages = [{"role": "system", "content": SPLIT_PROMPT},
+    messages = [{"role": "system", "content": prompt or SPLIT_PROMPT},
                 {"role": "user", "content": content}]
 
     last_err = "未知错误"
@@ -5475,12 +5475,53 @@ async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
             normalize_and_save(raw, tmp_img)
         except Exception as e:
             raise HTTPException(400, f"图片解析失败，请换一张 JPG/PNG 图片重试（{e}）")
-        ai = call_deepseek(tmp_img, subject)
         with open(tmp_img, "rb") as f:
             norm_bytes = f.read()
 
-    # AI 的科目判断比用户手选更可信：前端在「全部」筛选下上传时科目会默认成某一种，
-    # 很容易把语文题归到数学，这里若标签形如「语文-xxx」且与所选不符，就按 AI 的纠正过来。
+    # 先让 AI 把这张图当成一页来拆题：一张照片里可能印着好几道题。
+    # 图片本身**不裁**——位置范围不可靠，宁可每条共用整张原图；
+    # 拆不出来（AI 失败）就退回原来的单题识别。
+    problems = None
+    if api_key_ready():
+        try:
+            problems = call_split_page({"kind": "image", "raw": norm_bytes},
+                                       prompt=_SPLIT_PROMPT_PLAIN)
+        except Exception:
+            problems = None
+
+    if problems is not None:
+        if not problems:
+            raise HTTPException(400, "这张图里没有识别到题目，换一张或确认照片拍全、拍清楚")
+        items = []
+        clean_any = False
+        fixed_from = None
+        for p in problems:
+            tag = p["tag"]
+            m = re.match(r"^\s*(语文|数学|英语|物理|化学|历史|道德与法治)\s*[-－—]", tag or "")
+            final_subject = m.group(1) if m else subject
+            if fixed_from is None and m and m.group(1) != subject:
+                fixed_from = subject
+            try:
+                it, clean_ok = _persist_item(
+                    raw_image=norm_bytes,
+                    ai={"_status": "ok", "kind": p["kind"], "tag": tag,
+                        "analysis": p["analysis"], "clean_text": p["clean_text"]},
+                    subject=final_subject, source="照片")
+            except Exception as e:
+                raise HTTPException(400, f"图片保存失败：{e}")
+            items.append(it)
+            clean_any = clean_any or clean_ok
+        return {
+            "ok": True,
+            "item": items[0],
+            "items": items,
+            "split_count": len(items),
+            "clean_image_ok": clean_any,
+            "subject_fixed_from": fixed_from,
+        }
+
+    # 拆题失败：退回原来的单题识别，保证上传永远有结果
+    ai = call_deepseek(tmp_img, subject)
     final_subject, fixed_from = subject, None
     m = re.match(r"^\s*(语文|数学|英语|物理|化学|历史|道德与法治)\s*[-－—]", ai["tag"] or "")
     if m and m.group(1) != subject:
@@ -5495,6 +5536,8 @@ async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
     return {
         "ok": True,
         "item": it,
+        "items": [it],
+        "split_count": 1,
         "clean_image_ok": clean_ok,         # 去红笔是否真的成功（失败时版本B复用原图）
         "subject_fixed_from": fixed_from,   # 非空表示 AI 纠正了归档科目
     }
