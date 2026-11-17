@@ -2630,12 +2630,14 @@ const app = createApp({
             if (d.status === 'done') {
               this.bgJobs = this.bgJobs.filter(x => x.id !== job.id);
               await this.loadList();
+              this.loadQuota();
               const cnt = (d.items || []).length;
               if (cnt > 1) this.notify(`一张图拆成了 ${cnt} 道题`);
               else if (cnt === 1) this.notify('已归档 1 道题');
               else this.notify('后台处理完成，但没有新增题目', 'error');
             } else if (d.status === 'error') {
               this.bgJobs = this.bgJobs.filter(x => x.id !== job.id);
+              this.loadQuota();
               this.notify(d.error || '后台处理失败', 'error');
             }
           } catch (e) {
