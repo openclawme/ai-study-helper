@@ -60,9 +60,14 @@ Windows 包已用上述身份生成：
 
 Partner Center 的 `InAppOfferToken` 必须与代码里的 SKU 一致：
 
-- `gcl_pro_monthly`
-- `gcl_pro_max_monthly`
-- `gcl_boost`
+- `gcl_pro_monthly`（Store ID `9PK4GLJ88T9Q`）
+- `gcl_pro_max_monthly`（Store ID `9N3N2MNDT9J5`）
+- `gcl_boost`（Store ID `9P8RSXV8TR0V`）
+
+⚠️ **Store ID 不是 Digital Goods API 的 `itemId`**。API 用的是 Partner Center 里
+add-on 的 **Product ID / In-app offer token**（开发者填的字符串）。上面三个 `gcl_*`
+是代码期望的 token；如果 Partner Center 实际生成的是别的字符串，需要把它们替换到
+`STORE_SKUS` 里，网页更新即可，不用重新打 MSIX。
 
 **安全说明**：Microsoft Store 的 Digital Goods API 不提供唯一交易号，当前服务端以
 客户端 `listPurchases` + 购买回调入账。正式收费前建议在 Microsoft 侧增加服务端校验，
