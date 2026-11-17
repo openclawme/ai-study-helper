@@ -2562,6 +2562,11 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="application-name" content="我的AI学习助手">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="AI学习助手">
+<script src="/pwa.js" defer></script>
 <style>
   *{box-sizing:border-box}
   html,body{height:100%}
@@ -3764,7 +3769,12 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 # 登录/登出接口也要能不带 Cookie 调。数据接口在下面单独把关。
                 "/admin", "/api/admin/login", "/api/admin/logout",
                 "/favicon.ico", "/favicon.svg", "/favicon-192.png",
-                "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"}
+                "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
+                # PWA：manifest / Service Worker / 离线页 / 安装图标必须免登录，
+                # 否则浏览器在登录前拿不到它们，商店和「安装应用」都会失败。
+                "/manifest.webmanifest", "/sw.js", "/pwa.js", "/offline.html",
+                "/pwa-icon-192.png", "/pwa-icon-512.png",
+                "/pwa-icon-maskable-512.png"}
 
 
 @app.middleware("http")
@@ -4459,6 +4469,43 @@ def site_icon(request: Request):
         raise HTTPException(404, "图标缺失")
     return FileResponse(path, media_type=media,
                         headers={"Cache-Control": "public, max-age=604800"})
+
+
+# ---------------------------- 路由：PWA 资源 ---------------------------------
+# manifest、Service Worker、离线页、安装图标。全部在 PUBLIC_PATHS 里：
+# 浏览器检查可安装性时还没登录，必须能匿名拿到这些文件。
+_PWA_FILES = {
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json",
+                              {"Cache-Control": "public, max-age=3600"}),
+    "/sw.js": ("sw.js", "application/javascript; charset=utf-8",
+               {"Cache-Control": "no-cache, no-store, must-revalidate",
+                "Service-Worker-Allowed": "/"}),
+    "/pwa.js": ("pwa.js", "application/javascript; charset=utf-8",
+                {"Cache-Control": "public, max-age=300"}),
+    "/offline.html": ("offline.html", "text/html; charset=utf-8",
+                      {"Cache-Control": "no-cache"}),
+    "/pwa-icon-192.png": ("pwa-icon-192.png", "image/png",
+                          {"Cache-Control": "public, max-age=604800"}),
+    "/pwa-icon-512.png": ("pwa-icon-512.png", "image/png",
+                          {"Cache-Control": "public, max-age=604800"}),
+    "/pwa-icon-maskable-512.png": ("pwa-icon-maskable-512.png", "image/png",
+                                   {"Cache-Control": "public, max-age=604800"}),
+}
+
+
+@app.get("/manifest.webmanifest", include_in_schema=False)
+@app.get("/sw.js", include_in_schema=False)
+@app.get("/pwa.js", include_in_schema=False)
+@app.get("/offline.html", include_in_schema=False)
+@app.get("/pwa-icon-192.png", include_in_schema=False)
+@app.get("/pwa-icon-512.png", include_in_schema=False)
+@app.get("/pwa-icon-maskable-512.png", include_in_schema=False)
+def pwa_file(request: Request):
+    name, media, headers = _PWA_FILES[request.url.path]
+    path = os.path.join(STATIC_DIR, name)
+    if not os.path.exists(path):
+        raise HTTPException(404, "PWA 资源缺失")
+    return FileResponse(path, media_type=media, headers=headers)
 
 
 # ---------------------------- 路由：论文 -------------------------------------
