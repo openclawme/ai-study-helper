@@ -185,10 +185,12 @@ INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "历史", "道德与法治"]
 
-# ── Windows Store 版额度（主站不启用）────────────────────────────────────
-# 只有请求落在 STORE_HOST 上（或测试时主动进 /store 拿到 cookie）才算 Store 版；
-# 主站 goodgoodstudy.cc 不做任何额度拦截，现有 Web 行为完全不变。
-STORE_HOST = (os.getenv("STORE_HOST", "store.goodgoodstudy.cc") or "").strip().lower()
+# ── 额度与 Windows Store 内购 ─────────────────────────────────────────────
+# 账号、额度和会员状态是全局的：网页版和 Store 版登录同一个账号，共享同一份额度。
+# Windows Store 只是**购买入口**——Store 安装版里能拉起微软收银台；网页版额度用完时
+# 提示用户去 Store 版用同一账号购买，买完网页端自动同步。
+# QUOTA_ENFORCED=0 只用于临时压测/回滚，正式环境保持 1。
+QUOTA_ENFORCED = os.getenv("QUOTA_ENFORCED", "1").strip().lower() in ("1", "true", "yes", "on")
 STORE_PLAN_QUOTAS: Dict[str, Dict[str, int]] = {
     "free":    {"q": 5,   "chat": 20,  "anim": 2},
     "pro":     {"q": 200, "chat": 200, "anim": 10},
@@ -290,6 +292,7 @@ def get_conn() -> sqlite3.Connection:
             ("boost_q", "INTEGER NOT NULL DEFAULT 0"),
             ("boost_chat", "INTEGER NOT NULL DEFAULT 0"),
             ("boost_anim", "INTEGER NOT NULL DEFAULT 0"),
+            ("store_grandfathered", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if _col not in u_cols:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {_col} {_ddl}")
@@ -352,7 +355,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             store_anim_used INTEGER NOT NULL DEFAULT 0,
             boost_q         INTEGER NOT NULL DEFAULT 0,
             boost_chat      INTEGER NOT NULL DEFAULT 0,
-            boost_anim      INTEGER NOT NULL DEFAULT 0
+            boost_anim      INTEGER NOT NULL DEFAULT 0,
+            -- 上线额度前就存在的老账号：一次性送 Pro 一年，避免突然被锁
+            store_grandfathered INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -538,23 +543,20 @@ def _create_store_tables(conn) -> None:
 def init_db() -> None:
     with closing(get_conn()) as conn:
         _create_schema(conn)
+        _grandfather_existing_users(conn)
 
 
 # =============================================================================
-# Store 版额度（主站不启用）
+# 额度与 Store 内购（全局）
 # =============================================================================
 
-def is_store_mode(request: Request) -> bool:
+def quota_enforced() -> bool:
     """
-    只有 Store 版才走额度：
-      · 正式：请求 Host 是 store.goodgoodstudy.cc
-      · 本地测试：先访问 /store 拿到 gcl_store=1 的 cookie
-    主站 goodgoodstudy.cc 永远返回 False，现有 Web 用户完全不受影响。
+    额度对所有账号生效，不分网页版/Store 版。
+    Windows Store 只是支付入口：Store 安装版能调 Digital Goods API；
+    网页版额度用完时引导去 Store 版用同一账号购买。
     """
-    host = (request.url.hostname or "").lower()
-    if STORE_HOST and host == STORE_HOST.split(":")[0]:
-        return True
-    return request.cookies.get("gcl_store") == "1"
+    return QUOTA_ENFORCED
 
 
 def _now_s() -> str:
@@ -717,6 +719,25 @@ def quota_add_boost(uid: int, sku: Dict[str, Any]) -> None:
             "UPDATE users SET boost_q=boost_q+?, boost_chat=boost_chat+?,"
             " boost_anim=boost_anim+? WHERE id=?",
             (int(sku.get("q", 0)), int(sku.get("chat", 0)), int(sku.get("anim", 0)), uid))
+
+
+def _grandfather_existing_users(conn: sqlite3.Connection) -> None:
+    """
+    额度上线前的老账号一次性送 Pro 一年，避免某天打开突然只能免费 5 道。
+    只跑一次：store_grandfathered 置 1 后不会再送。
+    """
+    if not quota_enforced():
+        return
+    cutoff = "2026-11-17 00:00:00"
+    now = datetime.now()
+    exp = (now + timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "UPDATE users SET plan='pro', plan_expires_at=?, quota_period=?,"
+        " store_q_used=0, store_chat_used=0, store_anim_used=0,"
+        " store_grandfathered=1"
+        " WHERE store_grandfathered=0 AND created_at < ? AND plan='free'",
+        (exp, _quota_period(), cutoff))
+    conn.commit()
 
 
 # 题目分两类。错题是本应用的主体，经典题是「好题收藏」——
@@ -4021,9 +4042,7 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/manifest.webmanifest", "/sw.js", "/pwa.js", "/offline.html",
                 "/pwa-icon-192.png", "/pwa-icon-512.png",
                 "/pwa-icon-maskable-512.png",
-                "/store-list-1366.png", "/store-detail-1366.png",
-                # 测试/入口：访问一次 /store 就进入 Store 额度模式（主站 / 不碰）
-                "/store"}
+                "/store-list-1366.png", "/store-detail-1366.png"}
 
 
 @app.middleware("http")
@@ -4161,19 +4180,6 @@ def _session_response(uid: int, extra: Optional[Dict[str, Any]] = None) -> JSONR
         max_age=SESSION_TTL, httponly=True, samesite="lax", path="/",
         secure=COOKIE_SECURE,
     )
-    return resp
-
-
-@app.get("/store", include_in_schema=False)
-def store_entry():
-    """
-    进入 Store 额度模式的测试/备用入口。
-    正式 Store 版直接走 store.goodgoodstudy.cc（Host 判定），不需要这个跳转；
-    本地或临时测试访问 /store 一次，就能拿到 gcl_store=1 的 cookie。
-    """
-    resp = RedirectResponse("/", status_code=302)
-    resp.set_cookie("gcl_store", "1", max_age=365 * 24 * 3600,
-                    httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return resp
 
 
@@ -4716,9 +4722,9 @@ class StoreSyncReq(BaseModel):
 
 @app.get("/api/quota")
 def api_quota(request: Request):
-    """Store 版查额度；主站返回 store_mode=false，前端什么都不显示。"""
+    """全局额度快照：网页版和 Store 版读同一份账号额度。"""
     uid = current_uid()
-    if not is_store_mode(request):
+    if not quota_enforced():
         return {"store_mode": False}
     return {"store_mode": True, "quota": quota_snapshot(uid)}
 
@@ -4730,8 +4736,8 @@ def store_purchase(req: StorePurchaseReq, request: Request):
     listPurchases + 客户端回调为准，服务端记流水并授予权益。
     正式上线前应在 Microsoft 侧增加服务端校验（见 STORE.md）。
     """
-    if not is_store_mode(request):
-        raise HTTPException(404, "当前不是 Store 版")
+    if not quota_enforced():
+        raise HTTPException(404, "额度功能未启用")
     sku = STORE_SKUS.get((req.sku or "").strip())
     if not sku:
         raise HTTPException(400, "未知商品")
@@ -4757,8 +4763,8 @@ def store_sync(req: StoreSyncReq, request: Request):
     客户端启动时把 listPurchases 的结果同步过来。
     只恢复订阅；加量包已经在购买回调里入账，不能在这里重复加。
     """
-    if not is_store_mode(request):
-        raise HTTPException(404, "当前不是 Store 版")
+    if not quota_enforced():
+        raise HTTPException(404, "额度功能未启用")
     uid = current_uid()
     seen: set = set()
     for item in (req.items or []):
@@ -6016,7 +6022,7 @@ async def upload(request: Request, file: UploadFile = File(...), subject: str = 
 
     uid = current_uid()
     receipt = None
-    if is_store_mode(request):
+    if quota_enforced():
         receipt = quota_take(uid, "q")
         if not receipt:
             return JSONResponse(
@@ -6075,7 +6081,7 @@ async def upload_doc(request: Request, file: UploadFile = File(...), subject: st
         raise HTTPException(503, "后端未配置 DEEPSEEK_API_KEY，无法识别题目")
 
     fname = file.filename or "未命名"
-    store_mode = is_store_mode(request)
+    store_mode = quota_enforced()
     doc_uid = current_uid()
 
     def gen():
@@ -6200,7 +6206,7 @@ def make_variant(mid: int, request: Request, force: bool = False):
 
     uid = current_uid()
     receipt = None
-    if is_store_mode(request):
+    if quota_enforced():
         receipt = quota_take(uid, "chat")
         if not receipt:
             raise HTTPException(402, "AI 讲解额度已用完，请升级 Pro / Pro Max 或购买加量包")
@@ -6654,7 +6660,7 @@ def post_chat(req: ChatReq, request: Request):
     it, history, msg, mode = _load_chat_context(req)
     uid = current_uid()
     receipt = None
-    if is_store_mode(request):
+    if quota_enforced():
         receipt = quota_take(uid, "anim" if req.want_anim else "chat")
         if not receipt:
             raise HTTPException(402, "额度已用完，请升级 Pro / Pro Max 或购买加量包")
@@ -6695,7 +6701,7 @@ def chat_stream(req: ChatReq, request: Request):
 
     uid = current_uid()
     quota_receipt = None
-    if is_store_mode(request):
+    if quota_enforced():
         quota_receipt = quota_take(uid, "anim" if req.want_anim else "chat")
         if not quota_receipt:
             kind = "动画" if req.want_anim else "AI 讲解"

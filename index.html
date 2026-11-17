@@ -1706,7 +1706,7 @@ const app = createApp({
       uploadPct: 0,
       uploadMsg: '',
       bgJobs: [],
-      /* Windows Store 版额度/内购。主站 storeMode 永远 false，不显示任何 UI。 */
+      /* 全局额度/内购：网页版和 Store 版共享账号额度；购买只在 Store 安装版里可用。 */
       storeMode: false,
       quota: null,
       payOpen: false,
@@ -1857,7 +1857,7 @@ const app = createApp({
       if (!this.current) return this.chatMsgs.length ? this.generalFollowUps : this.generalAsks;
       return this.chatMsgs.length ? this.followUps : this.quickAsks;
     },
-    /* Store 版额度摘要；主站永远不渲染（storeMode=false）。 */
+    /* 额度摘要；QUOTA_ENFORCED=0 或未登录时不渲染。 */
     quotaText() {
       if (!this.quota || !this.quota.total) return '额度';
       const t = this.quota.total;
@@ -1930,7 +1930,7 @@ const app = createApp({
           this._storeSynced = true;
           this.syncStorePurchases();
         }
-      } catch (e) { /* 主站/离线：忽略 */ }
+      } catch (e) { /* 未登录/离线：忽略 */ }
     },
 
     async syncStorePurchases() {
@@ -1954,7 +1954,7 @@ const app = createApp({
     },
 
     quotaGuard(kind) {
-      if (!this.storeMode) return true;   // 主站：保持原来的无限使用
+      if (!this.storeMode) return true;   // 额度未启用（QUOTA_ENFORCED=0）时不拦截
       const t = this.quota && this.quota.total;
       if (!t) { this.loadQuota(); return true; }  // 额度还没拉到，交给服务端兜底
       if ((t[kind] || 0) <= 0) {
@@ -1974,7 +1974,7 @@ const app = createApp({
       this.storeAvailable = false;
       this.storeMsg = '';
       if (!('getDigitalGoodsService' in window) || !window.PaymentRequest) {
-        this.storeMsg = '内购只在从 Microsoft Store 安装的版本里可用。请安装 Store 版后打开。';
+        this.storeMsg = '网页版不能直接购买。请从 Microsoft Store 安装版用同一账号登录后购买，买完网页端会自动同步。';
         return;
       }
       try {
@@ -1988,7 +1988,7 @@ const app = createApp({
         this.storeAvailable = Object.keys(map).length > 0;
         if (!this.storeAvailable) this.storeMsg = '商店商品还没配置好，请稍后再试。';
       } catch (e) {
-        this.storeMsg = '当前不是 Microsoft Store 安装版，无法购买。请从 Microsoft Store 安装后使用。';
+        this.storeMsg = '当前不是 Microsoft Store 安装版。请安装 Store 版，用同一账号登录后购买，网页端会自动同步。';
       }
     },
 

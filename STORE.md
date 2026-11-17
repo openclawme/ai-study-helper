@@ -17,18 +17,14 @@
   - `static/store-list-1366.png`
   - `static/store-detail-1366.png`
 
-## Store 版额度（只影响 Store 域名）
+## 额度 / 付费（全局，账号通用）
 
-- 主站 `https://goodgoodstudy.cc` **不启用额度**，现有 Web 行为不变。
-- Store 版使用独立域名 `https://store.goodgoodstudy.cc`，代码按 Host 判定。
-- 本地测试：访问一次 `http://127.0.0.1:8000/store` 设置 `gcl_store=1` cookie。
-- 需要给 `store` 加一条 DNS A 记录指向线上服务器，并在 Caddy 里加：
-  ```
-  store.goodgoodstudy.cc {
-      reverse_proxy 127.0.0.1:8000
-      request_body { max_size 50MB }
-  }
-  ```
+- 额度绑定**账号**，网页版和 Store 版登录同一个账号，共享同一份额度。
+- Windows Store 只是**购买入口**：Store 安装版能拉起微软收银台；网页版额度用完时
+  提示去 Store 版用同一账号购买，买完网页端自动同步。
+- Store 包直接使用主域名 `https://goodgoodstudy.cc`，**不需要 `store` 子域名/DNS**。
+- `QUOTA_ENFORCED=0` 可临时关闭额度做压测/回滚；正式环境保持 1。
+- 上线前已存在的老账号会一次性送 Pro 一年（`store_grandfathered` 标记）。
 
 额度：
 
