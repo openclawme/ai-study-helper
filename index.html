@@ -1024,6 +1024,8 @@
       </div>
       <div v-if="storeMsg" class="mx-5 mb-3 rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
         {{ storeMsg }}
+        <a :href="storeLink" target="_blank" rel="noopener"
+           class="block mt-2 font-semibold text-indigo-600 hover:underline">打开 Microsoft Store 页面 →</a>
       </div>
       <p class="px-5 pb-5 text-[11px] leading-relaxed text-slate-400">
         订阅由 Microsoft Store 管理，可随时在 Store 账户里取消；加量包不随会员到期清零。
@@ -1863,6 +1865,7 @@ const app = createApp({
       const t = this.quota.total;
       return `题目 ${t.q} · 讲解 ${t.chat} · 动画 ${t.anim}`;
     },
+    storeLink() { return 'https://apps.microsoft.com/detail/9P41XLJWDL44'; },
     payPlans() {
       return [
         { sku: 'gcl_pro_monthly', name: 'Pro', fallback: '¥29.9/月',

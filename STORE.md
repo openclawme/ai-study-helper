@@ -17,6 +17,25 @@
   - `static/store-list-1366.png`
   - `static/store-detail-1366.png`
 
+## Partner Center 身份（已拿到）
+
+```text
+Package/Identity/Name: 16388WzzT.AI
+Package/Identity/Publisher: CN=D8EFFF52-B354-4D66-80F6-88043D7B12CF
+PublisherDisplayName: WzzT
+Package Family Name: 16388WzzT.AI_4ze4wsqskfapc
+Store ID: 9P41XLJWDL44
+Store 链接: https://apps.microsoft.com/detail/9P41XLJWDL44
+```
+
+Windows 包已用上述身份生成：
+
+- `~/boardtool/storepkg/pwabuilder-windows.zip`（约 8 MB）
+- 内含 `我的AI学习助手.msixbundle`（提交 Store 用）
+- `我的AI学习助手.sideload.msix` + `install.ps1`（本地测试用；无单独证书文件，
+  安装脚本用 `pwainstaller.exe`，Windows 需允许旁加载/开发者模式）
+- `classic.appxbundle`（老 Windows）
+
 ## 额度 / 付费（全局，账号通用）
 
 - 额度绑定**账号**，网页版和 Store 版登录同一个账号，共享同一份额度。
