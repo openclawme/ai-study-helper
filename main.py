@@ -185,6 +185,23 @@ INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "历史", "道德与法治"]
 
+# ── Windows Store 版额度（主站不启用）────────────────────────────────────
+# 只有请求落在 STORE_HOST 上（或测试时主动进 /store 拿到 cookie）才算 Store 版；
+# 主站 goodgoodstudy.cc 不做任何额度拦截，现有 Web 行为完全不变。
+STORE_HOST = (os.getenv("STORE_HOST", "store.goodgoodstudy.cc") or "").strip().lower()
+STORE_PLAN_QUOTAS: Dict[str, Dict[str, int]] = {
+    "free":    {"q": 5,   "chat": 20,  "anim": 2},
+    "pro":     {"q": 200, "chat": 200, "anim": 10},
+    "pro_max": {"q": 500, "chat": 500, "anim": 25},
+}
+STORE_PLAN_LABELS = {"free": "免费版", "pro": "Pro", "pro_max": "Pro Max"}
+# SKU 必须与 Partner Center 里 add-on 的 InAppOfferToken 完全一致。
+STORE_SKUS: Dict[str, Dict[str, Any]] = {
+    "gcl_pro_monthly":     {"kind": "subscription", "plan": "pro", "days": 31},
+    "gcl_pro_max_monthly": {"kind": "subscription", "plan": "pro_max", "days": 31},
+    "gcl_boost":           {"kind": "boost", "q": 100, "chat": 100, "anim": 5},
+}
+
 # 启动即建目录（用户要求启动时 os.makedirs；此处提前建好，保证 mount 不报错）
 for _d in (STATIC_DIR, ORIGIN_DIR, CLEAN_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -258,6 +275,24 @@ def get_conn() -> sqlite3.Connection:
             conn.execute("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         if "phone_verified_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
             conn.execute("ALTER TABLE users ADD COLUMN phone_verified_at TEXT NOT NULL DEFAULT ''")
+        # ── Store 版额度列（只给 Store 模式用；主站不读）──────────────────
+        u_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        for _col, _ddl in (
+            ("plan", "TEXT NOT NULL DEFAULT 'free'"),
+            ("plan_expires_at", "TEXT NOT NULL DEFAULT ''"),
+            ("quota_period", "TEXT NOT NULL DEFAULT ''"),
+            ("free_q_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("free_chat_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("free_anim_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("store_q_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("store_chat_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("store_anim_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("boost_q", "INTEGER NOT NULL DEFAULT 0"),
+            ("boost_chat", "INTEGER NOT NULL DEFAULT 0"),
+            ("boost_anim", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if _col not in u_cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {_col} {_ddl}")
         if "phone" not in {r["name"] for r in conn.execute("PRAGMA table_info(signups)")}:
             conn.execute("ALTER TABLE signups ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         if "user_id" not in cols:
@@ -280,9 +315,10 @@ def get_conn() -> sqlite3.Connection:
     # 回收站索引：老库刚在上面的 else 分支里补完 deleted_at，这里才建得出来
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mistakes_active "
                  "ON mistakes(user_id, deleted_at)")
-    # 管理后台 / 短信的表：新库老库都要有，且不属于上面那个「5 张表齐不齐」的判断
+    # 管理后台 / 短信 / Store 订单：新库老库都要有，且不属于上面那个「5 张表齐不齐」的判断
     _create_admin_tables(conn)
     _create_sms_tables(conn)
+    _create_store_tables(conn)
     conn.commit()
     return conn
 
@@ -303,7 +339,20 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             last_login_at TEXT NOT NULL DEFAULT '',  -- 后台的「活跃度」看这一列
             -- 管理员重置过口令 → 置 1。此时除了改密码/登出，其它接口一律拦住，
             -- 逼他先把临时口令换成自己的。改完自动清 0。
-            must_change_pw INTEGER NOT NULL DEFAULT 0
+            must_change_pw INTEGER NOT NULL DEFAULT 0,
+            -- Store 版额度。主站不读这些列，所以对 Web 完全无影响。
+            plan            TEXT    NOT NULL DEFAULT 'free',  -- free / pro / pro_max
+            plan_expires_at TEXT    NOT NULL DEFAULT '',      -- 空 = 免费版
+            quota_period    TEXT    NOT NULL DEFAULT '',      -- 会员额度所属月份 YYYY-MM
+            free_q_used     INTEGER NOT NULL DEFAULT 0,
+            free_chat_used  INTEGER NOT NULL DEFAULT 0,
+            free_anim_used  INTEGER NOT NULL DEFAULT 0,
+            store_q_used    INTEGER NOT NULL DEFAULT 0,
+            store_chat_used INTEGER NOT NULL DEFAULT 0,
+            store_anim_used INTEGER NOT NULL DEFAULT 0,
+            boost_q         INTEGER NOT NULL DEFAULT 0,
+            boost_chat      INTEGER NOT NULL DEFAULT 0,
+            boost_anim      INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -407,6 +456,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_owner ON chats(user_id, id)")
     _create_admin_tables(conn)
     _create_sms_tables(conn)
+    _create_store_tables(conn)
     conn.commit()
 
 
@@ -468,9 +518,205 @@ def _create_admin_tables(conn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adminlog_ts ON admin_log(ts DESC)")
 
 
+def _create_store_tables(conn) -> None:
+    """Microsoft Store 购买流水。只有 Store 版会写，主站不碰。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS store_orders (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id        INTEGER NOT NULL,
+          sku            TEXT    NOT NULL,
+          purchase_token TEXT    NOT NULL DEFAULT '',
+          kind           TEXT    NOT NULL,          -- subscription / boost
+          status         TEXT    NOT NULL DEFAULT 'granted',
+          created_at     TEXT    NOT NULL,
+          raw            TEXT    NOT NULL DEFAULT ''
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_store_orders_u "
+                 "ON store_orders(user_id, id DESC)")
+
+
 def init_db() -> None:
     with closing(get_conn()) as conn:
         _create_schema(conn)
+
+
+# =============================================================================
+# Store 版额度（主站不启用）
+# =============================================================================
+
+def is_store_mode(request: Request) -> bool:
+    """
+    只有 Store 版才走额度：
+      · 正式：请求 Host 是 store.goodgoodstudy.cc
+      · 本地测试：先访问 /store 拿到 gcl_store=1 的 cookie
+    主站 goodgoodstudy.cc 永远返回 False，现有 Web 用户完全不受影响。
+    """
+    host = (request.url.hostname or "").lower()
+    if STORE_HOST and host == STORE_HOST.split(":")[0]:
+        return True
+    return request.cookies.get("gcl_store") == "1"
+
+
+def _now_s() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _quota_period() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+
+def _plan_is_active(row: sqlite3.Row) -> bool:
+    if (row["plan"] or "free") not in ("pro", "pro_max"):
+        return False
+    exp = (row["plan_expires_at"] or "").strip()
+    return bool(exp) and exp >= _now_s()
+
+
+def _quota_refresh(conn: sqlite3.Connection, uid: int) -> sqlite3.Row:
+    """
+    读用户额度行，并做两件自愈：
+      · 会员到期 -> 降回免费版
+      · 会员进入新的自然月 -> 把 store_*_used 清零
+    必须在事务里调用。
+    """
+    row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "用户不存在")
+    if (row["plan"] or "free") != "free" and not _plan_is_active(row):
+        conn.execute("UPDATE users SET plan='free', plan_expires_at='' WHERE id=?", (uid,))
+        row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if _plan_is_active(row):
+        period = _quota_period()
+        if (row["quota_period"] or "") != period:
+            conn.execute(
+                "UPDATE users SET store_q_used=0, store_chat_used=0, store_anim_used=0,"
+                " quota_period=? WHERE id=?", (period, uid))
+            row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return row
+
+
+def quota_snapshot(uid: int) -> Dict[str, Any]:
+    """给前端的额度快照。total 是三类额度各自还能用多少次。"""
+    with closing(get_conn()) as conn, conn:
+        row = _quota_refresh(conn, uid)
+        plan = row["plan"] if _plan_is_active(row) else "free"
+        pq = STORE_PLAN_QUOTAS.get(plan, STORE_PLAN_QUOTAS["free"])
+        free = {
+            "q": max(0, STORE_PLAN_QUOTAS["free"]["q"] - int(row["free_q_used"] or 0)),
+            "chat": max(0, STORE_PLAN_QUOTAS["free"]["chat"] - int(row["free_chat_used"] or 0)),
+            "anim": max(0, STORE_PLAN_QUOTAS["free"]["anim"] - int(row["free_anim_used"] or 0)),
+        }
+        plan_rem = {
+            "q": max(0, pq["q"] - int(row["store_q_used"] or 0)),
+            "chat": max(0, pq["chat"] - int(row["store_chat_used"] or 0)),
+            "anim": max(0, pq["anim"] - int(row["store_anim_used"] or 0)),
+        } if plan != "free" else {"q": 0, "chat": 0, "anim": 0}
+        boost = {"q": int(row["boost_q"] or 0),
+                 "chat": int(row["boost_chat"] or 0),
+                 "anim": int(row["boost_anim"] or 0)}
+        total = {k: free[k] + plan_rem[k] + boost[k] for k in ("q", "chat", "anim")}
+        return {
+            "plan": plan, "plan_label": STORE_PLAN_LABELS.get(plan, plan),
+            "plan_expires_at": row["plan_expires_at"] or "",
+            "period": row["quota_period"] or "",
+            "free": free, "plan_quota": plan_rem, "boost": boost, "total": total,
+            "limits": {"free": STORE_PLAN_QUOTAS["free"], "plan": pq},
+        }
+
+
+def quota_take(uid: int, kind: str) -> Optional[Dict[str, Any]]:
+    """
+    扣 1 次额度。顺序：免费额度 -> 当月会员额度 -> 加量包。
+    返回 {"kind","source","period"} 作为退款凭证；没额度返回 None。
+    """
+    if kind not in ("q", "chat", "anim"):
+        raise ValueError(kind)
+    used_col = {"q": "free_q_used", "chat": "free_chat_used", "anim": "free_anim_used"}[kind]
+    plan_col = {"q": "store_q_used", "chat": "store_chat_used", "anim": "store_anim_used"}[kind]
+    boost_col = {"q": "boost_q", "chat": "boost_chat", "anim": "boost_anim"}[kind]
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = _quota_refresh(conn, uid)
+            plan = row["plan"] if _plan_is_active(row) else "free"
+            pq = STORE_PLAN_QUOTAS.get(plan, STORE_PLAN_QUOTAS["free"])
+            if int(row[used_col] or 0) < STORE_PLAN_QUOTAS["free"][kind]:
+                conn.execute(f"UPDATE users SET {used_col}={used_col}+1 WHERE id=?", (uid,))
+                conn.commit()
+                return {"kind": kind, "source": "free", "period": ""}
+            if plan != "free" and int(row[plan_col] or 0) < pq[kind]:
+                conn.execute(f"UPDATE users SET {plan_col}={plan_col}+1 WHERE id=?", (uid,))
+                conn.commit()
+                return {"kind": kind, "source": "plan", "period": _quota_period()}
+            if int(row[boost_col] or 0) > 0:
+                conn.execute(f"UPDATE users SET {boost_col}={boost_col}-1 WHERE id=?", (uid,))
+                conn.commit()
+                return {"kind": kind, "source": "boost", "period": ""}
+            conn.rollback()
+            return None
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def quota_refund(uid: int, receipt: Optional[Dict[str, Any]]) -> None:
+    """AI 调用失败/没产出时把额度还回去。退款失败不能影响主流程。"""
+    if not receipt:
+        return
+    kind = receipt.get("kind"); source = receipt.get("source")
+    if kind not in ("q", "chat", "anim") or source not in ("free", "plan", "boost"):
+        return
+    used_col = {"q": "free_q_used", "chat": "free_chat_used", "anim": "free_anim_used"}[kind]
+    plan_col = {"q": "store_q_used", "chat": "store_chat_used", "anim": "store_anim_used"}[kind]
+    boost_col = {"q": "boost_q", "chat": "boost_chat", "anim": "boost_anim"}[kind]
+    try:
+        with closing(get_conn()) as conn, conn:
+            if source == "plan" and receipt.get("period") != _quota_period():
+                return  # 跨月了，旧周期的扣减不能退到新周期
+            if source == "boost":
+                conn.execute(f"UPDATE users SET {boost_col}={boost_col}+1 WHERE id=?", (uid,))
+            else:
+                col = used_col if source == "free" else plan_col
+                conn.execute(f"UPDATE users SET {col}=MAX(0, {col}-1) WHERE id=?", (uid,))
+    except Exception:
+        pass
+
+
+def quota_set_plan(uid: int, plan: str, days: int = 31, extend: bool = True) -> None:
+    """
+    购买/同步订阅后授予会员。
+    extend=True（购买）：续期；
+    extend=False（启动时 listPurchases 同步）：只确认状态，不天天把到期日往后推。
+    """
+    if plan not in ("pro", "pro_max"):
+        return
+    with closing(get_conn()) as conn, conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            return
+        active_same = _plan_is_active(row) and row["plan"] == plan
+        if active_same and not extend:
+            return
+        new_exp = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        if active_same:
+            old_exp = row["plan_expires_at"] or ""
+            if old_exp > new_exp:
+                new_exp = old_exp
+            conn.execute("UPDATE users SET plan=?, plan_expires_at=? WHERE id=?",
+                         (plan, new_exp, uid))
+        else:
+            conn.execute(
+                "UPDATE users SET plan=?, plan_expires_at=?, quota_period=?,"
+                " store_q_used=0, store_chat_used=0, store_anim_used=0 WHERE id=?",
+                (plan, new_exp, _quota_period(), uid))
+
+
+def quota_add_boost(uid: int, sku: Dict[str, Any]) -> None:
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "UPDATE users SET boost_q=boost_q+?, boost_chat=boost_chat+?,"
+            " boost_anim=boost_anim+? WHERE id=?",
+            (int(sku.get("q", 0)), int(sku.get("chat", 0)), int(sku.get("anim", 0)), uid))
 
 
 # 题目分两类。错题是本应用的主体，经典题是「好题收藏」——
@@ -3775,7 +4021,9 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/manifest.webmanifest", "/sw.js", "/pwa.js", "/offline.html",
                 "/pwa-icon-192.png", "/pwa-icon-512.png",
                 "/pwa-icon-maskable-512.png",
-                "/store-list-1366.png", "/store-detail-1366.png"}
+                "/store-list-1366.png", "/store-detail-1366.png",
+                # 测试/入口：访问一次 /store 就进入 Store 额度模式（主站 / 不碰）
+                "/store"}
 
 
 @app.middleware("http")
@@ -3913,6 +4161,19 @@ def _session_response(uid: int, extra: Optional[Dict[str, Any]] = None) -> JSONR
         max_age=SESSION_TTL, httponly=True, samesite="lax", path="/",
         secure=COOKIE_SECURE,
     )
+    return resp
+
+
+@app.get("/store", include_in_schema=False)
+def store_entry():
+    """
+    进入 Store 额度模式的测试/备用入口。
+    正式 Store 版直接走 store.goodgoodstudy.cc（Host 判定），不需要这个跳转；
+    本地或临时测试访问 /store 一次，就能拿到 gcl_store=1 的 cookie。
+    """
+    resp = RedirectResponse("/", status_code=302)
+    resp.set_cookie("gcl_store", "1", max_age=365 * 24 * 3600,
+                    httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return resp
 
 
@@ -4441,6 +4702,75 @@ def api_session():
             "user_id": uid,
             # 管理员重置过口令 → 前端必须弹一个不能关的改密码框
             "must_change_pw": bool(row["must_change_pw"]) if row else False}
+
+
+# ---------------------------- 路由：Store 额度 / 内购 -------------------------
+class StorePurchaseReq(BaseModel):
+    sku: str
+    token: str = ""
+
+
+class StoreSyncReq(BaseModel):
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@app.get("/api/quota")
+def api_quota(request: Request):
+    """Store 版查额度；主站返回 store_mode=false，前端什么都不显示。"""
+    uid = current_uid()
+    if not is_store_mode(request):
+        return {"store_mode": False}
+    return {"store_mode": True, "quota": quota_snapshot(uid)}
+
+
+@app.post("/api/store/purchase")
+def store_purchase(req: StorePurchaseReq, request: Request):
+    """
+    Store 内购到账。Digital Goods API 没有唯一交易号，这里以
+    listPurchases + 客户端回调为准，服务端记流水并授予权益。
+    正式上线前应在 Microsoft 侧增加服务端校验（见 STORE.md）。
+    """
+    if not is_store_mode(request):
+        raise HTTPException(404, "当前不是 Store 版")
+    sku = STORE_SKUS.get((req.sku or "").strip())
+    if not sku:
+        raise HTTPException(400, "未知商品")
+    if not (req.token or "").strip():
+        raise HTTPException(400, "缺少 Store 购买凭证")
+    uid = current_uid()
+    now = _now_s()
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO store_orders (user_id, sku, purchase_token, kind, status, created_at, raw)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (uid, req.sku, req.token[:500], sku["kind"], "granted", now, ""))
+    if sku["kind"] == "subscription":
+        quota_set_plan(uid, sku["plan"], int(sku.get("days", 31)))
+    else:
+        quota_add_boost(uid, sku)
+    return {"ok": True, "store_mode": True, "quota": quota_snapshot(uid)}
+
+
+@app.post("/api/store/sync")
+def store_sync(req: StoreSyncReq, request: Request):
+    """
+    客户端启动时把 listPurchases 的结果同步过来。
+    只恢复订阅；加量包已经在购买回调里入账，不能在这里重复加。
+    """
+    if not is_store_mode(request):
+        raise HTTPException(404, "当前不是 Store 版")
+    uid = current_uid()
+    seen: set = set()
+    for item in (req.items or []):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("itemId") or item.get("item_id") or "").strip()
+        sku = STORE_SKUS.get(item_id)
+        if not sku or sku["kind"] != "subscription" or item_id in seen:
+            continue
+        seen.add(item_id)
+        quota_set_plan(uid, sku["plan"], int(sku.get("days", 31)), extend=False)
+    return {"ok": True, "store_mode": True, "quota": quota_snapshot(uid)}
 
 
 # ---------------------------- 路由：站点图标 ---------------------------------
@@ -5615,11 +5945,26 @@ def _process_upload_job(job_id: str, image_path: str, subject: str) -> None:
 def _upload_worker() -> None:
     while True:
         job_id, path, subject, ctx = _UPLOAD_QUEUE.get()
+        receipt = None
+        uid = 0
         try:
             ctx.run(_process_upload_job, job_id, path, subject)
         except Exception as e:
             _job_update(job_id, status="error", error=f"{type(e).__name__}: {e}")
         finally:
+            # Store 版：任务没产出（失败/没识别到题）就把题目额度退回去。
+            # 成功了才真正扣；一页多题也只扣 1 次（按上传页计，不按拆出的题数）。
+            try:
+                with _UPLOAD_JOBS_LOCK:
+                    job = UPLOAD_JOBS.get(job_id) or {}
+                    if job.get("status") != "done":
+                        receipt = job.get("quota")
+                        job["quota"] = None
+                        uid = int(job.get("uid") or 0)
+                if receipt and uid:
+                    quota_refund(uid, receipt)
+            except Exception:
+                pass
             try:
                 os.unlink(path)
             except OSError:
@@ -5656,7 +6001,7 @@ def upload_job_status(job_id: str):
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
+async def upload(request: Request, file: UploadFile = File(...), subject: str = Form("数学")):
     """
     照片上传：只做校验、压缩、入队，立刻返回 job_id。
     AI 拆题/落库在后台队列里跑，前台不阻塞。
@@ -5669,6 +6014,15 @@ async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
     if len(raw) > 40 * 1024 * 1024:
         raise HTTPException(400, "图片过大（>40MB），请用手机默认相机压缩后再传")
 
+    uid = current_uid()
+    receipt = None
+    if is_store_mode(request):
+        receipt = quota_take(uid, "q")
+        if not receipt:
+            return JSONResponse(
+                {"detail": "题目额度已用完，请升级 Pro / Pro Max 或购买加量包",
+                 "quota_exhausted": "q"}, status_code=402)
+
     job_id = secrets.token_hex(8)
     job_path = os.path.join(tempfile.gettempdir(), f"gcl_upload_{job_id}.jpg")
     try:
@@ -5678,14 +6032,17 @@ async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
             os.unlink(job_path)
         except OSError:
             pass
+        if receipt:
+            quota_refund(uid, receipt)
         raise HTTPException(400, f"图片解析失败，请换一张 JPG/PNG 图片重试（{e}）")
 
     with _UPLOAD_JOBS_LOCK:
         UPLOAD_JOBS[job_id] = {
-            "id": job_id, "uid": current_uid(), "status": "queued",
+            "id": job_id, "uid": uid, "status": "queued",
             "message": "已收到，排队处理中…", "created_at": time.time(),
             "items": [], "split_count": 0, "clean_image_ok": False,
             "subject_fixed_from": None, "error": "", "progress": 0, "total": 0,
+            "quota": receipt,
         }
     _ensure_upload_worker()
     ctx = contextvars.copy_context()
@@ -5696,7 +6053,7 @@ async def upload(file: UploadFile = File(...), subject: str = Form("数学")):
 
 # ---------------------------- 路由：上传文档（PDF/Word/文本）--------------------
 @app.post("/api/upload_doc")
-async def upload_doc(file: UploadFile = File(...), subject: str = Form("数学")):
+async def upload_doc(request: Request, file: UploadFile = File(...), subject: str = Form("数学")):
     """
     文档上传：一份 PDF / Word / 文本 -> 拆成一道一道的题 -> 一题一条。
 
@@ -5718,6 +6075,8 @@ async def upload_doc(file: UploadFile = File(...), subject: str = Form("数学")
         raise HTTPException(503, "后端未配置 DEEPSEEK_API_KEY，无法识别题目")
 
     fname = file.filename or "未命名"
+    store_mode = is_store_mode(request)
+    doc_uid = current_uid()
 
     def gen():
         def ev(obj: Dict[str, Any]) -> str:
@@ -5747,14 +6106,28 @@ async def upload_doc(file: UploadFile = File(...), subject: str = Form("数学")
                 label = f"{suffix}第 {pi} 页" if multi else suffix
                 yield ev({"type": "page", "page": pi, "total": len(pages),
                           "message": f"正在分析第 {pi}/{len(pages)} 页…"})
+                # Store 版：文档按「页」扣题目额度，一页多题不额外扣。
+                page_receipt = None
+                if store_mode:
+                    page_receipt = quota_take(doc_uid, "q")
+                    if not page_receipt:
+                        yield ev({"type": "error",
+                                  "message": "题目额度已用完，请升级 Pro / Pro Max 或购买加量包",
+                                  "quota_exhausted": "q"})
+                        return
+                before_n = len(created)
                 try:
                     problems = call_split_page(page)
                 except Exception as e:
+                    if page_receipt:
+                        quota_refund(doc_uid, page_receipt)
                     failed.append({"page": pi, "reason": str(e)})
                     yield ev({"type": "page_error", "page": pi, "message": str(e)})
                     continue
 
                 if not problems:
+                    if page_receipt:
+                        quota_refund(doc_uid, page_receipt)
                     yield ev({"type": "page_empty", "page": pi})
                     continue
 
@@ -5785,6 +6158,10 @@ async def upload_doc(file: UploadFile = File(...), subject: str = Form("数学")
                     yield ev({"type": "item", "page": pi, "item": created[-1],
                               "count": len(created)})
 
+                # 这一页一道题都没入库（全是空壳/入库失败）：额度退回
+                if page_receipt and len(created) == before_n:
+                    quota_refund(doc_uid, page_receipt)
+
                 yield ev({"type": "page_done", "page": pi, "total": len(pages),
                           "found": len(created)})
 
@@ -5806,7 +6183,7 @@ async def upload_doc(file: UploadFile = File(...), subject: str = Form("数学")
 
 # ---------------------------- 路由：按需生成变式题 ---------------------------
 @app.post("/api/variant/{mid}")
-def make_variant(mid: int, force: bool = False):
+def make_variant(mid: int, request: Request, force: bool = False):
     """
     生成「同考点变式题」。已经有且非 force 就直接返回，不重复花钱。
     上传时不再预生成，所以老数据可能为空 —— 这是预期行为。
@@ -5821,9 +6198,16 @@ def make_variant(mid: int, force: bool = False):
     if it.get("variant_q") and not force:
         return {"ok": True, "cached": True, "variant_q": it["variant_q"], "variant_a": it["variant_a"]}
 
+    uid = current_uid()
+    receipt = None
+    if is_store_mode(request):
+        receipt = quota_take(uid, "chat")
+        if not receipt:
+            raise HTTPException(402, "AI 讲解额度已用完，请升级 Pro / Pro Max 或购买加量包")
     try:
         v = call_variant(it)
     except Exception as e:
+        quota_refund(uid, receipt)
         raise HTTPException(502, f"生成变式题失败：{e}")
     with closing(get_conn()) as conn, conn:
         conn.execute("UPDATE mistakes SET variant_q=?, variant_a=? WHERE id=?",
@@ -6265,15 +6649,22 @@ def _append_chat(mid: int, user_msg: str, reply: str,
 
 
 @app.post("/api/chat")
-def post_chat(req: ChatReq):
+def post_chat(req: ChatReq, request: Request):
     """非流式答疑（留给脚本 / curl；网页端走 /api/chat/stream 以获得逐字输出）。"""
     it, history, msg, mode = _load_chat_context(req)
+    uid = current_uid()
+    receipt = None
+    if is_store_mode(request):
+        receipt = quota_take(uid, "anim" if req.want_anim else "chat")
+        if not receipt:
+            raise HTTPException(402, "额度已用完，请升级 Pro / Pro Max 或购买加量包")
     search_info = search_material(msg) if SEARCH_ENABLED else {}
     material = search_info.get("digest", "")
     try:
         reply = call_tutor(it, history, msg, mode, "anim" if req.want_anim else "chat",
                            material)
     except Exception as e:
+        quota_refund(uid, receipt)
         raise HTTPException(502, f"AI 答疑失败：{e}")
 
     # 同样要把动画围栏剥出来，别把源码甩给调用方
@@ -6290,7 +6681,7 @@ def post_chat(req: ChatReq):
 
 
 @app.post("/api/chat/stream")
-def chat_stream(req: ChatReq):
+def chat_stream(req: ChatReq, request: Request):
     """
     流式答疑（SSE）。事件类型：
         reasoning  模型思考过程片段 —— 最先到达，把「干等 20 秒」变成「看得见的过程」
@@ -6302,7 +6693,25 @@ def chat_stream(req: ChatReq):
     # 动画档：不限制思考、时限放宽到 10 分钟（见 AI_PROFILES 的说明）
     profile = "anim" if req.want_anim else "chat"
 
+    uid = current_uid()
+    quota_receipt = None
+    if is_store_mode(request):
+        quota_receipt = quota_take(uid, "anim" if req.want_anim else "chat")
+        if not quota_receipt:
+            kind = "动画" if req.want_anim else "AI 讲解"
+            return JSONResponse(
+                {"detail": f"{kind}额度已用完，请升级 Pro / Pro Max 或购买加量包",
+                 "quota_exhausted": "anim" if req.want_anim else "chat"},
+                status_code=402)
+
     def gen():
+        quota_charged = bool(quota_receipt)
+
+        def refund_quota() -> None:
+            nonlocal quota_charged
+            if quota_charged:
+                quota_charged = False
+                quota_refund(uid, quota_receipt)
         acc: List[str] = []          # 累积正文
         rbuf: List[str] = []         # 思考缓冲
         cbuf: List[str] = []         # 正文缓冲
@@ -6406,6 +6815,7 @@ def chat_stream(req: ChatReq):
                         yield _sse({"type": "done", "messages": _chat_rows(req.id)})
                     else:
                         # 光思考没正文：问题的壳已经存了，这里给个诚实的交代
+                        refund_quota()
                         finalize(f"（{chunk['text']}，还没来得及写出内容。换个更具体的问法会快很多，"
                                  f"比如只问某一步、某一问。）")
                         yield _sse({"type": "error",
@@ -6415,6 +6825,8 @@ def chat_stream(req: ChatReq):
                 elif t == "error":
                     for e in drain(True):
                         yield e
+                    if not "".join(acc).strip():
+                        refund_quota()
                     finalize(f"（生成失败：{chunk['text']}）" if not "".join(acc).strip() else "")
                     yield _sse({"type": "error", "message": chunk["text"]})
                     return
@@ -6425,6 +6837,7 @@ def chat_stream(req: ChatReq):
                 yield e
             full = "".join(acc).strip()
             if not full:
+                refund_quota()
                 finalize("（模型这次没有返回内容，可以再问一次。）")
                 yield _sse({"type": "error", "message": "模型没有返回正文"})
                 return
@@ -6433,10 +6846,14 @@ def chat_stream(req: ChatReq):
         except GeneratorExit:
             # 服务端自己关停（重启/取消）时会走到这里。**用户断开不会走到** ——
             # 那种情况靠 save_partial() 的边生成边存兜住，见它的说明。
+            if not "".join(acc).strip():
+                refund_quota()
             save_partial(True)
             raise
         except Exception as e:
             # 兜底：任何没预料到的异常也别把已经生成的内容弄丢
+            if not "".join(acc).strip():
+                refund_quota()
             try:
                 finalize(f"（出错了：{type(e).__name__}）" if not "".join(acc).strip() else "")
             except Exception:

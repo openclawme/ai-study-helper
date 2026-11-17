@@ -227,6 +227,10 @@
         <div class="text-indigo-100/70">当前账号</div>
         <div class="font-bold">{{ me }}</div>
       </div>
+      <button v-if="me && storeMode" @click="openPaywall('')" :title="quotaText"
+              class="shrink-0 text-xs px-2.5 py-1.5 rounded-xl bg-amber-300/25 hover:bg-amber-300/40 transition">
+        额度
+      </button>
       <button v-if="me" @click="openPhone" title="绑定手机号，找回密码用"
               class="shrink-0 text-xs px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 transition">
         绑手机
@@ -986,6 +990,47 @@
       </section>
   </main>
 
+  <!-- ==================== Store 版付费墙 ==================== -->
+  <div v-if="payOpen"
+       class="fixed inset-0 z-[70] bg-slate-900/55 backdrop-blur-sm flex items-end sm:items-center justify-center sm:p-4"
+       @click.self="payOpen=false">
+    <div class="w-full sm:max-w-3xl bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl max-h-[92vh] overflow-y-auto">
+      <div class="p-5 flex items-start gap-3">
+        <div class="flex-1 min-w-0">
+          <h3 class="text-lg font-bold text-slate-800">升级会员</h3>
+          <p v-if="quota" class="text-xs text-slate-500 mt-1">当前剩余：{{ quotaText }}</p>
+          <p v-else class="text-xs text-slate-500 mt-1">免费额度用完后，开通会员继续使用 AI 功能。</p>
+        </div>
+        <button class="btn btn-ghost text-xs px-3 py-1.5" @click="payOpen=false">关闭</button>
+      </div>
+      <div class="px-5 pb-4 grid sm:grid-cols-3 gap-3">
+        <div v-for="p in payPlans" :key="p.sku"
+             class="rounded-2xl border p-4 flex flex-col"
+             :class="p.best ? 'border-indigo-400 ring-2 ring-indigo-100' : 'border-slate-200'">
+          <div class="flex items-center gap-2">
+            <span class="font-bold text-slate-800">{{ p.name }}</span>
+            <span v-if="p.best" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">推荐</span>
+          </div>
+          <div class="text-2xl font-black text-slate-900 mt-2">{{ priceFor(p) }}</div>
+          <ul class="mt-3 space-y-1 text-xs text-slate-600 flex-1">
+            <li v-for="f in p.features" :key="f">✓ {{ f }}</li>
+          </ul>
+          <button class="btn btn-primary w-full mt-4 text-xs py-2"
+                  :disabled="payBusy || !storeAvailable"
+                  @click="buySku(p.sku)">
+            {{ payBusy ? '处理中…' : (p.sku === 'gcl_boost' ? '购买加量包' : '开通 ' + p.name) }}
+          </button>
+        </div>
+      </div>
+      <div v-if="storeMsg" class="mx-5 mb-3 rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
+        {{ storeMsg }}
+      </div>
+      <p class="px-5 pb-5 text-[11px] leading-relaxed text-slate-400">
+        订阅由 Microsoft Store 管理，可随时在 Store 账户里取消；加量包不随会员到期清零。
+      </p>
+    </div>
+  </div>
+
   <!-- ==================== 改密码弹窗 ==================== -->
   <div v-if="showPw" class="fixed inset-0 z-[70] bg-slate-900/50 flex items-center justify-center p-4"
        @click.self="!mustChangePw && (showPw = false)">
@@ -1661,6 +1706,15 @@ const app = createApp({
       uploadPct: 0,
       uploadMsg: '',
       bgJobs: [],
+      /* Windows Store 版额度/内购。主站 storeMode 永远 false，不显示任何 UI。 */
+      storeMode: false,
+      quota: null,
+      payOpen: false,
+      payBusy: false,
+      payKind: '',
+      storeAvailable: false,
+      storeMsg: '',
+      storePrices: {},
       exporting: false,
       /* 归档科目由 AI 从图片识别（后端看 tag 前缀），认得不对可以在详情页改。
          上传前不再需要用户手选，所以这里只有一份可选列表给「改科目」用。 */
@@ -1802,6 +1856,23 @@ const app = createApp({
     suggestions() {
       if (!this.current) return this.chatMsgs.length ? this.generalFollowUps : this.generalAsks;
       return this.chatMsgs.length ? this.followUps : this.quickAsks;
+    },
+    /* Store 版额度摘要；主站永远不渲染（storeMode=false）。 */
+    quotaText() {
+      if (!this.quota || !this.quota.total) return '额度';
+      const t = this.quota.total;
+      return `题目 ${t.q} · 讲解 ${t.chat} · 动画 ${t.anim}`;
+    },
+    payPlans() {
+      return [
+        { sku: 'gcl_pro_monthly', name: 'Pro', fallback: '¥29.9/月',
+          features: ['200 道题 / 月', '200 条 AI 讲解 / 月', '10 个动画 / 月'] },
+        { sku: 'gcl_pro_max_monthly', name: 'Pro Max', fallback: '¥59.9/月',
+          features: ['500 道题 / 月', '500 条 AI 讲解 / 月', '25 个动画 / 月'],
+          best: true },
+        { sku: 'gcl_boost', name: '加量包', fallback: '¥12.9',
+          features: ['+100 道题', '+100 条 AI 讲解', '+5 个动画', '不随会员到期清零'] }
+      ];
     }
   },
 
@@ -1844,6 +1915,128 @@ const app = createApp({
         }).catch(() => {});
       }
       return r;
+    },
+
+    /* ---------------- Store 额度 / 内购 ---------------- */
+    async loadQuota() {
+      try {
+        const r = await fetch('/api/quota', { cache: 'no-store' });
+        if (!r.ok) return;
+        const d = await r.json();
+        this.storeMode = !!d.store_mode;
+        this.quota = d.store_mode ? (d.quota || null) : null;
+        // 首屏同步一次已购订阅；listPurchases 只返回有效订阅，不会重复加加量包。
+        if (this.storeMode && !this._storeSynced) {
+          this._storeSynced = true;
+          this.syncStorePurchases();
+        }
+      } catch (e) { /* 主站/离线：忽略 */ }
+    },
+
+    async syncStorePurchases() {
+      try {
+        if (!('getDigitalGoodsService' in window)) return;
+        const dg = await window.getDigitalGoodsService('https://store.microsoft.com/billing');
+        const purchases = await dg.listPurchases();
+        const items = (purchases || []).map(p => ({
+          itemId: p.itemId, purchaseToken: p.purchaseToken || ''
+        }));
+        if (!items.length) return;
+        const r = await fetch('/api/store/sync', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items })
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d.quota) this.quota = d.quota;
+        }
+      } catch (e) { /* 非 Store 环境：忽略 */ }
+    },
+
+    quotaGuard(kind) {
+      if (!this.storeMode) return true;   // 主站：保持原来的无限使用
+      const t = this.quota && this.quota.total;
+      if (!t) { this.loadQuota(); return true; }  // 额度还没拉到，交给服务端兜底
+      if ((t[kind] || 0) <= 0) {
+        this.openPaywall(kind);
+        return false;
+      }
+      return true;
+    },
+
+    openPaywall(kind) {
+      this.payKind = kind || '';
+      this.payOpen = true;
+      this.loadStoreProducts();
+    },
+
+    async loadStoreProducts() {
+      this.storeAvailable = false;
+      this.storeMsg = '';
+      if (!('getDigitalGoodsService' in window) || !window.PaymentRequest) {
+        this.storeMsg = '内购只在从 Microsoft Store 安装的版本里可用。请安装 Store 版后打开。';
+        return;
+      }
+      try {
+        const dg = await window.getDigitalGoodsService('https://store.microsoft.com/billing');
+        if (!dg) throw new Error('no service');
+        this._dg = dg;
+        const details = await dg.getDetails(this.payPlans.map(p => p.sku));
+        const map = {};
+        (details || []).forEach(x => { if (x && x.itemId) map[x.itemId] = x; });
+        this.storePrices = map;
+        this.storeAvailable = Object.keys(map).length > 0;
+        if (!this.storeAvailable) this.storeMsg = '商店商品还没配置好，请稍后再试。';
+      } catch (e) {
+        this.storeMsg = '当前不是 Microsoft Store 安装版，无法购买。请从 Microsoft Store 安装后使用。';
+      }
+    },
+
+    priceFor(plan) {
+      const d = this.storePrices[plan.sku];
+      if (d && d.price && d.price.currency) {
+        try {
+          return new Intl.NumberFormat(undefined, {
+            style: 'currency', currency: d.price.currency
+          }).format(d.price.value);
+        } catch (e) { /* 用兜底价 */ }
+      }
+      return plan.fallback;
+    },
+
+    async buySku(sku) {
+      if (this.payBusy) return;
+      if (!this.storeAvailable || !this._dg) { this.loadStoreProducts(); return; }
+      this.payBusy = true;
+      try {
+        const request = new PaymentRequest([{
+          supportedMethods: 'https://store.microsoft.com/billing',
+          data: { sku }
+        }]);
+        const resp = await request.show();
+        const token = (resp.details && (resp.details.token || resp.details.purchaseToken))
+          || (typeof resp.details === 'string' ? resp.details : '');
+        if (!token) throw new Error('没有拿到商店购买凭证');
+        const r = await fetch('/api/store/purchase', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sku, token })
+        });
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error((d && d.detail) || ('入账失败 HTTP ' + r.status));
+        try { await resp.complete('success'); } catch (e) {}
+        if (sku === 'gcl_boost') {
+          try { await this._dg.consume(token); } catch (e) {}
+        }
+        if (d.quota) this.quota = d.quota;
+        this.payOpen = false;
+        this.notify(sku === 'gcl_boost' ? '加量包已到账' : '会员已开通');
+        await this.loadList();
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;
+        this.notify('购买未完成：' + (e.message || e), 'error');
+      } finally {
+        this.payBusy = false;
+      }
     },
 
     async logout() {
@@ -2307,6 +2500,10 @@ const app = createApp({
             } else if (ev.type === 'page_error') {
               failures.push('第 ' + ev.page + ' 页：' + ev.message.replace(/\s+/g, ' ').slice(0, 60));
             } else if (ev.type === 'error') {
+              if (ev.quota_exhausted) {
+                await this.loadQuota();
+                this.openPaywall(ev.quota_exhausted);
+              }
               throw new Error(ev.message);
             } else if (ev.type === 'done') {
               ok = true;
@@ -2355,8 +2552,10 @@ const app = createApp({
 
       // 文档：**逐份**处理。一份卷子几分钟，同时塞几份会完全看不出进度。
       for (let i = 0; i < docs.length; i++) {
+        if (!this.quotaGuard('q')) return;
         const tag = docs.length > 1 ? `（第 ${i + 1}/${docs.length} 份）` : '';
         await this.uploadDocument(docs[i], tag);
+        this.loadQuota();
         if (this.authExpired) return;
       }
 
@@ -2373,6 +2572,7 @@ const app = createApp({
       this.uploading = true;
       try {
         for (let i = 0; i < n; i++) {
+          if (!this.quotaGuard('q')) return;
           const tag = n > 1 ? `第 ${i + 1}/${n} 张：` : '';
           this.uploadPct = 0;
           this.uploadMsg = tag + '正在压缩并提交…';
@@ -2384,6 +2584,11 @@ const app = createApp({
             submitted++;
           } catch (err) {
             if (this.authExpired) return;
+            if (err && err.status === 402) {
+              await this.loadQuota();
+              this.openPaywall('q');
+              return;
+            }
             failed.push((files[i].name || `第 ${i + 1} 张`) + '：' + err.message);
           }
         }
@@ -2395,6 +2600,7 @@ const app = createApp({
       if (submitted) {
         this.notify(`已提交 ${submitted} 张，后台处理中；你可以继续用，好了会自动出现`);
         this.pollBgJobs();
+        this.loadQuota();
       }
       if (failed.length) {
         this.notify('这些没传上去 —— ' + failed.join('；'), 'error');
@@ -2470,7 +2676,11 @@ const app = createApp({
           let data = null;
           try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
           if (xhr.status >= 200 && xhr.status < 300 && data && data.job_id) resolve(data);
-          else reject(new Error((data && (data.detail || data.message)) || ('HTTP ' + xhr.status)));
+          else {
+            const err = new Error((data && (data.detail || data.message)) || ('HTTP ' + xhr.status));
+            err.status = xhr.status;
+            reject(err);
+          }
         };
         xhr.onerror = () => reject(new Error('网络错误，请确认手机与电脑在同一 WiFi'));
         xhr.ontimeout = () => reject(new Error('请求超时（提交较慢，可稍后在列表中查看）'));
@@ -2737,11 +2947,13 @@ const app = createApp({
     /* 按需生成变式题。上传时不再预生成，所以老数据里可能是空的。 */
     async genVariant(it) {
       if (!it || this.variantLoading) return;
+      if (!this.quotaGuard('chat')) return;
       this.variantLoading = true;
       try {
         const r = this.guard(await fetch('/api/variant/' + it.id, { method: 'POST' }));
         let d = null;
         try { d = await r.json(); } catch (e) {}
+        if (r.status === 402) { await this.loadQuota(); this.openPaywall('chat'); }
         if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
         const patch = { variant_q: d.variant_q, variant_a: d.variant_a };
         const idx = this.items.findIndex(x => x.id === it.id);
@@ -2753,6 +2965,7 @@ const app = createApp({
         this.notify('生成失败：' + e.message, 'error');
       } finally {
         this.variantLoading = false;
+        this.loadQuota();
       }
     },
 
@@ -2844,6 +3057,7 @@ const app = createApp({
     async sendChat(preset, mode, wantAnim) {
       const text = (typeof preset === 'string' ? preset : this.chatInput).trim();
       if (!text || this.chatSending) return;
+      if (!this.quotaGuard(wantAnim ? 'anim' : 'chat')) return;
       // 点建议按钮时用它自带的 mode；手打的字按场景取默认值：
       //   错题答疑 → guide（先反问、只给一层提示，让孩子多一步主动选择，这是核心设计）
       //   自由问答 → full（学生问的是知识性问题，反问他没有意义）
@@ -2878,6 +3092,10 @@ const app = createApp({
           signal: this._chatAbort.signal
         });
         if (r.status === 401) { this.authExpired = true; location.href = '/login'; return; }
+        if (r.status === 402) {
+          await this.loadQuota();
+          this.openPaywall(wantAnim ? 'anim' : 'chat');
+        }
         if (!r.ok) {
           let msg = 'HTTP ' + r.status;
           try { const j = await r.json(); msg = j.detail || msg; } catch (e) {}
@@ -2957,6 +3175,7 @@ const app = createApp({
       } finally {
         this._chatAbort = null;
         this.chatSending = false;
+        this.loadQuota();
         this.$nextTick(() => this.scrollChat(true));
       }
     },
@@ -3125,6 +3344,7 @@ const app = createApp({
     this.loadHealth();
     this.loadList();
     this.loadStats();
+    this.loadQuota();
     // 一进来右栏（桌面端）就是自由问答窗口，历史得先拉回来，
     // 否则昨天聊到一半的问题今天打开是空的。
     this.loadChat(GENERAL_ID);

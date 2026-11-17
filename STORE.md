@@ -17,6 +17,42 @@
   - `static/store-list-1366.png`
   - `static/store-detail-1366.png`
 
+## Store 版额度（只影响 Store 域名）
+
+- 主站 `https://goodgoodstudy.cc` **不启用额度**，现有 Web 行为不变。
+- Store 版使用独立域名 `https://store.goodgoodstudy.cc`，代码按 Host 判定。
+- 本地测试：访问一次 `http://127.0.0.1:8000/store` 设置 `gcl_store=1` cookie。
+- 需要给 `store` 加一条 DNS A 记录指向线上服务器，并在 Caddy 里加：
+  ```
+  store.goodgoodstudy.cc {
+      reverse_proxy 127.0.0.1:8000
+      request_body { max_size 50MB }
+  }
+  ```
+
+额度：
+
+| | 免费 | Pro | Pro Max | 加量包 |
+|---|---:|---:|---:|---:|
+| 价格 | ¥0 | ¥29.9/月 | ¥59.9/月 | ¥12.9 |
+| 题目 | 5（终身） | 200/月 | 500/月 | +100 |
+| AI 讲解 | 20（终身） | 200/月 | 500/月 | +100 |
+| 动画 | 2（终身） | 10/月 | 25/月 | +5 |
+
+- 题目额度按“上传页”扣：一张照片/一页文档 = 1 次，一页多题不额外扣。
+- 会员额度每月重置；加量包不随会员到期清零。
+- 付费墙使用 Digital Goods API + Payment Request，只在 Microsoft Store 安装版里可用。
+
+Partner Center 的 `InAppOfferToken` 必须与代码里的 SKU 一致：
+
+- `gcl_pro_monthly`
+- `gcl_pro_max_monthly`
+- `gcl_boost`
+
+**安全说明**：Microsoft Store 的 Digital Goods API 不提供唯一交易号，当前服务端以
+客户端 `listPurchases` + 购买回调入账。正式收费前建议在 Microsoft 侧增加服务端校验，
+否则只能防普通用户，防不住刻意伪造请求。
+
 ## 上架前你需要准备
 
 1. **Microsoft Partner Center 开发者账号**
