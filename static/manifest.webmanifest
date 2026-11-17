@@ -46,5 +46,21 @@
         }
       ]
     }
+  ],
+  "screenshots": [
+    {
+      "src": "/store-list-1366.png",
+      "sizes": "1366x768",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "错题列表与 AI 问答"
+    },
+    {
+      "src": "/store-detail-1366.png",
+      "sizes": "1366x768",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "原图与纯净题对照、AI 讲解"
+    }
   ]
 }

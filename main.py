@@ -3774,7 +3774,8 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 # 否则浏览器在登录前拿不到它们，商店和「安装应用」都会失败。
                 "/manifest.webmanifest", "/sw.js", "/pwa.js", "/offline.html",
                 "/pwa-icon-192.png", "/pwa-icon-512.png",
-                "/pwa-icon-maskable-512.png"}
+                "/pwa-icon-maskable-512.png",
+                "/store-list-1366.png", "/store-detail-1366.png"}
 
 
 @app.middleware("http")
@@ -4490,6 +4491,11 @@ _PWA_FILES = {
                           {"Cache-Control": "public, max-age=604800"}),
     "/pwa-icon-maskable-512.png": ("pwa-icon-maskable-512.png", "image/png",
                                    {"Cache-Control": "public, max-age=604800"}),
+    # 商店/安装界面用的演示截图（演示账号 + 假题，不含真实学生数据）
+    "/store-list-1366.png": ("store-list-1366.png", "image/png",
+                             {"Cache-Control": "public, max-age=604800"}),
+    "/store-detail-1366.png": ("store-detail-1366.png", "image/png",
+                               {"Cache-Control": "public, max-age=604800"}),
 }
 
 
@@ -4500,6 +4506,8 @@ _PWA_FILES = {
 @app.get("/pwa-icon-192.png", include_in_schema=False)
 @app.get("/pwa-icon-512.png", include_in_schema=False)
 @app.get("/pwa-icon-maskable-512.png", include_in_schema=False)
+@app.get("/store-list-1366.png", include_in_schema=False)
+@app.get("/store-detail-1366.png", include_in_schema=False)
 def pwa_file(request: Request):
     name, media, headers = _PWA_FILES[request.url.path]
     path = os.path.join(STATIC_DIR, name)
