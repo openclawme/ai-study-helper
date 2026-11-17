@@ -228,7 +228,7 @@
         <div class="font-bold">{{ me }}</div>
       </div>
       <button v-if="me && storeMode" @click="openPaywall('')" :title="quotaText"
-              class="shrink-0 text-xs px-2.5 py-1.5 rounded-xl bg-amber-300/25 hover:bg-amber-300/40 transition">
+              class="hidden sm:inline-flex shrink-0 items-center text-xs px-2.5 py-1.5 rounded-xl bg-amber-300/25 hover:bg-amber-300/40 transition">
         额度
       </button>
       <button v-if="me" @click="openPhone" title="绑定手机号，找回密码用"
