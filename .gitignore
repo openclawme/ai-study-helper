@@ -23,6 +23,8 @@ static/clean/
 static/anim/
 # 列表缩略图：同样是孩子作业的衍生图片，绝不能提交
 static/thumb/
+# Windows 安装包是构建产物（约 8MB），不进 git；下载路由从磁盘读
+static/storepkg/
 
 # 全部错题记录，以及迁移前的备份
 mistakes.db

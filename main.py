@@ -182,6 +182,8 @@ THUMB_DIR = os.path.join(STATIC_DIR, "thumb")
 THUMB_EDGE = 240        # 缩略图最长边。卡片显示 56px，两倍屏也只要 112px，240 足够清晰
 DB_PATH = os.path.join(BASE_DIR, "mistakes.db")
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
+# Store 安装包（构建产物，不进 git；下载路由用）
+STORE_PACKAGE_PATH = os.path.join(STATIC_DIR, "storepkg", "windows-package.zip")
 
 SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "历史", "道德与法治"]
 
@@ -4042,7 +4044,8 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/manifest.webmanifest", "/sw.js", "/pwa.js", "/offline.html",
                 "/pwa-icon-192.png", "/pwa-icon-512.png",
                 "/pwa-icon-maskable-512.png",
-                "/store-list-1366.png", "/store-detail-1366.png"}
+                "/store-list-1366.png", "/store-detail-1366.png",
+                "/download/windows-package.zip"}
 
 
 @app.middleware("http")
@@ -4833,6 +4836,16 @@ _PWA_FILES = {
     "/store-detail-1366.png": ("store-detail-1366.png", "image/png",
                                {"Cache-Control": "public, max-age=604800"}),
 }
+
+
+@app.get("/download/windows-package.zip", include_in_schema=False)
+def download_windows_package():
+    """下载 Windows Store 测试/提交包（构建产物，不含用户数据）。"""
+    if not os.path.exists(STORE_PACKAGE_PATH):
+        raise HTTPException(404, "安装包还没生成")
+    return FileResponse(STORE_PACKAGE_PATH, media_type="application/zip",
+                        filename="我的AI学习助手-windows.zip",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/manifest.webmanifest", include_in_schema=False)
