@@ -2875,10 +2875,36 @@ LOGIN_PAGE = """<!DOCTYPE html>
   .steps b{display:block;margin-bottom:2px;font-size:13px;font-weight:700}
   .steps span{font-size:11.5px;color:rgba(255,255,255,.66)}
 
-  /* ── 右边：表单 ──────────────────────────────────────────────── */
-  .panel{flex:0 0 44%;display:flex;align-items:center;justify-content:center;
+  /* ── 右边：表单 + 广告位 ──────────────────────────────────────── */
+  .panel{flex:0 0 44%;display:flex;flex-direction:column;align-items:center;justify-content:center;
          padding:40px 28px;background:#fff}
   .card{width:100%;max-width:392px}
+
+  /* 登录页广告位：介绍功能、吸引注册。固定高度，换素材不跳版。
+     以后要投外部广告，直接把 .promo-slide 的内容换掉即可。 */
+  .promo{width:100%;max-width:392px;margin-top:18px;border-radius:16px;overflow:hidden;
+         background:linear-gradient(135deg,#eef2ff 0%,#f8fafc 58%,#faf5ff 100%);
+         border:1px solid #e2e8f0;position:relative;
+         box-shadow:0 8px 24px rgba(79,70,229,.08)}
+  .promo::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;
+                 background:linear-gradient(90deg,#4f46e5,#7c3aed,#db2777)}
+  .promo-track{position:relative;height:158px}
+  .promo-slide{position:absolute;inset:0;padding:18px 18px 16px;opacity:0;
+               transform:translateY(5px);transition:opacity .35s ease,transform .35s ease;
+               pointer-events:none}
+  .promo-slide.on{opacity:1;transform:none;pointer-events:auto}
+  .promo-badge{display:inline-flex;align-items:center;gap:4px;margin-bottom:7px;
+               padding:3px 8px;border-radius:999px;background:#e0e7ff;color:#4338ca;
+               font-size:10.5px;font-weight:800;letter-spacing:.2px}
+  .promo h3{margin:0 0 5px;font-size:15.5px;line-height:1.4;color:#0f172a;font-weight:800}
+  .promo p{margin:0;font-size:12.2px;line-height:1.7;color:#64748b}
+  .promo-cta{display:inline-block;margin-top:9px;color:#4f46e5;font-size:12.2px;
+             font-weight:800;text-decoration:none}
+  .promo-cta:hover{text-decoration:underline}
+  .promo-dots{position:absolute;right:12px;bottom:10px;display:flex;gap:5px;z-index:2}
+  .promo-dot{width:6px;height:6px;padding:0;border:0;border-radius:50%;
+             background:#cbd5e1;cursor:pointer;transition:.2s}
+  .promo-dot.on{width:15px;border-radius:3px;background:#4f46e5}
   h1{margin:0 0 6px;font-size:25px;color:#0f172a;letter-spacing:.3px}
   p.sub{margin:0 0 24px;color:#94a3b8;font-size:12.5px}
   label{display:block;font-size:13px;color:#475569;font-weight:600;margin-bottom:6px}
@@ -2923,6 +2949,12 @@ LOGIN_PAGE = """<!DOCTYPE html>
     .panel{display:block;padding:0 20px 44px;background:transparent}
     .card{max-width:420px;margin:0 auto;padding:26px 22px;background:#fff;border-radius:18px;
           box-shadow:0 18px 50px rgba(0,0,0,.28)}
+    .promo{max-width:420px;margin:16px auto 0;box-shadow:0 10px 30px rgba(15,23,42,.16)}
+    .promo-track{height:164px}
+  }
+  /* 矮屏桌面：表单 + 广告位可能超过一屏，允许面板内部滚动 */
+  @media (min-width:881px) and (max-height:800px){
+    .panel{justify-content:flex-start;overflow-y:auto;padding-top:26px;padding-bottom:26px}
   }
   @media (max-width:380px){ .card{padding:22px 18px} }
 </style></head><body>
@@ -3037,6 +3069,36 @@ LOGIN_PAGE = """<!DOCTYPE html>
     每个账号只看到自己的题目、照片和对话。<br>还没有账号？点上面的「注册」。
   </div>
     </form>
+
+    <!-- 登录页广告位：介绍软件功能，吸引注册/登录。
+         以后接外部广告时，直接替换这三个 .promo-slide 的内容即可。 -->
+    <section class="promo" aria-label="产品功能介绍">
+      <div class="promo-track" id="promoTrack">
+        <article class="promo-slide on">
+          <span class="promo-badge">免费试用 5 道题</span>
+          <h3>拍一张照，题目自动整理</h3>
+          <p>多张一起传；自动拆题、去红笔、保留原图。错题和经典题都能收。</p>
+          <a class="promo-cta" href="#u">登录 / 注册后开始 →</a>
+        </article>
+        <article class="promo-slide">
+          <span class="promo-badge">先问后答</span>
+          <h3>AI 不直接给答案，讲到你真懂</h3>
+          <p>一步一步拆开讲，卡在哪就问哪；还能生成动画演示和同类变式题。</p>
+          <a class="promo-cta" href="#u">免费试用 →</a>
+        </article>
+        <article class="promo-slide">
+          <span class="promo-badge">到期自动提醒</span>
+          <h3>练到会，而不是存进去就忘</h3>
+          <p>按 1/3/7/16/35 天安排复习；一键导出 A4 重做卷，纸上再走一遍。</p>
+          <a class="promo-cta" href="#u">开始整理我的错题 →</a>
+        </article>
+      </div>
+      <div class="promo-dots" id="promoDots" aria-hidden="true">
+        <button type="button" class="promo-dot on" data-i="0" aria-label="第 1 条"></button>
+        <button type="button" class="promo-dot" data-i="1" aria-label="第 2 条"></button>
+        <button type="button" class="promo-dot" data-i="2" aria-label="第 3 条"></button>
+      </div>
+    </section>
   </main>
 </div>
 <script>
@@ -3258,6 +3320,28 @@ LOGIN_PAGE = """<!DOCTYPE html>
     b.disabled = false;
     if (mode === savedMode) b.textContent = btnText(mode);
   });
+
+  /* 登录页广告位轮播：固定高度，6 秒切换；点圆点可手动切。
+     不用外部库，避免登录页多一次网络请求。 */
+  (function(){
+    var slides = document.querySelectorAll('.promo-slide');
+    var dots = document.querySelectorAll('.promo-dot');
+    var idx = 0, timer = null;
+    if (!slides.length) return;
+    function show(n){
+      idx = (n + slides.length) % slides.length;
+      slides.forEach(function(s, k){ s.classList.toggle('on', k === idx); });
+      dots.forEach(function(d, k){ d.classList.toggle('on', k === idx); });
+    }
+    function restart(){
+      clearInterval(timer);
+      timer = setInterval(function(){ show(idx + 1); }, 6000);
+    }
+    dots.forEach(function(d){
+      d.addEventListener('click', function(){ show(parseInt(this.dataset.i, 10) || 0); restart(); });
+    });
+    restart();
+  })();
 
   setMode('login');
 </script></body></html>"""
