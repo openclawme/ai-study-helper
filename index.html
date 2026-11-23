@@ -1068,6 +1068,57 @@
           <span v-if="pwBusy" class="spin">⏳</span><span>确定修改</span>
         </button>
         <p class="text-[11px] text-slate-400 text-center">改完当前登录不会掉，其它设备要重新登录。</p>
+        <div class="pt-2 border-t border-slate-100 flex items-center justify-center gap-3 text-[11.5px]">
+          <a href="/privacy" target="_blank" rel="noopener"
+             class="text-slate-400 hover:text-indigo-600">隐私政策</a>
+          <span class="text-slate-200">|</span>
+          <button v-if="!mustChangePw" type="button" @click="openDelete"
+                  class="text-rose-500 hover:text-rose-600 font-semibold">注销账号</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 注销账号弹窗 ==================== -->
+  <div v-if="showDelete" class="fixed inset-0 z-[80] bg-slate-900/60 flex items-center justify-center p-4"
+       @click.self="showDelete=false">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+      <div class="flex items-center gap-2 px-5 py-3.5 border-b border-slate-100">
+        <svg class="w-4 h-4 text-rose-500" aria-hidden="true"><use href="#i-alert"/></svg>
+        <h3 class="font-bold text-slate-800 flex-1">注销账号</h3>
+        <button @click="showDelete=false" class="text-slate-400 p-1 hover:text-slate-600" aria-label="关闭">
+          <svg class="w-5 h-5" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <div class="p-5 space-y-3">
+        <div class="text-[12.5px] leading-relaxed rounded-xl px-3.5 py-3 bg-rose-50 border border-rose-200 text-rose-800">
+          <b>这会永久删除你的账号、全部错题、照片、对话和动画，无法恢复。</b><br>
+          如果你有 Microsoft Store 订阅，请先在
+          <a href="https://account.microsoft.com/services" target="_blank" rel="noopener"
+             class="underline font-semibold">account.microsoft.com</a> 取消订阅，否则可能继续扣费。
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 mb-1.5">输入你的用户名确认</label>
+          <input v-model="delUser" type="text" autocomplete="off"
+                 :placeholder="me"
+                 class="w-full px-3 py-2 text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-rose-400 outline-none">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 mb-1.5">当前密码</label>
+          <input v-model="delPw" type="password" autocomplete="current-password"
+                 @keydown.enter="deleteAccount"
+                 class="w-full px-3 py-2 text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:border-rose-400 outline-none">
+        </div>
+        <div v-if="delErr" class="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2">
+          {{ delErr }}
+        </div>
+        <div class="flex gap-2 pt-1">
+          <button type="button" class="btn btn-ghost flex-1 py-2.5 text-sm" @click="showDelete=false">取消</button>
+          <button type="button" class="btn btn-danger flex-1 py-2.5 text-sm"
+                  :disabled="delBusy || !delUser.trim() || !delPw" @click="deleteAccount">
+            {{ delBusy ? '正在删除…' : '永久删除' }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -1733,6 +1784,7 @@ const app = createApp({
       stats: { total: 0, by_subject: {} },
       me: '',            // 当前登录的用户名，顶栏显示用
       showPw: false, pwOld: '', pwNew: '', pwBusy: false, mustChangePw: false,
+      showDelete: false, delUser: '', delPw: '', delBusy: false, delErr: '',
       showPhone: false, bindPhone: '', bindCode: '', bindBusy: false, bindSent: false,
       bindPhoneMasked: '', bindTtl: 5, bindWait: 0, bindErr: '', bindOk: '',
       showUploadHelp: false,
@@ -2058,6 +2110,38 @@ const app = createApp({
 
     /* ---------------- 数据加载 ---------------- */
     openPw() { this.showPw = true; this.pwOld = ''; this.pwNew = ''; },
+
+    openDelete() {
+      this.showPw = false;
+      this.showDelete = true;
+      this.delUser = '';
+      this.delPw = '';
+      this.delErr = '';
+    },
+
+    async deleteAccount() {
+      if (this.delBusy) return;
+      if (!this.delUser.trim() || !this.delPw) {
+        this.delErr = '请填写用户名和密码';
+        return;
+      }
+      this.delBusy = true;
+      this.delErr = '';
+      try {
+        const r = await fetch('/api/account/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: this.delUser.trim(), password: this.delPw })
+        });
+        let d = null; try { d = await r.json(); } catch (e) {}
+        if (r.status === 401) { this.authExpired = true; location.href = '/login'; return; }
+        if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        location.href = '/login?deleted=1';
+      } catch (e) {
+        this.delErr = e.message || '注销失败，请稍后再试';
+      } finally {
+        this.delBusy = false;
+      }
+    },
 
     async changePw() {
       if (this.pwBusy || !this.pwOld || !this.pwNew) return;

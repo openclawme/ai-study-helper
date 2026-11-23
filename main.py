@@ -184,6 +184,9 @@ DB_PATH = os.path.join(BASE_DIR, "mistakes.db")
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 # Store 安装包（构建产物，不进 git；下载路由用）
 STORE_PACKAGE_PATH = os.path.join(STATIC_DIR, "storepkg", "windows-package.zip")
+# 隐私政策联系渠道；可用环境变量替换成邮箱（mailto:...）或支持页面
+PRIVACY_CONTACT = os.getenv("PRIVACY_CONTACT", "https://github.com/openclawme/ai-study-helper/issues").strip()
+PRIVACY_PAGE_FILE = os.path.join(STATIC_DIR, "privacy.html")
 
 SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "历史", "道德与法治"]
 
@@ -2174,7 +2177,7 @@ ADMIN_TTL = 12 * 3600                 # 12 小时。比用户的 14 天短得多
 START_TS = time.time()                # 进程启动时刻，后台用来算运行时长
 # 被重置过口令的账号，只能碰这三个接口 —— 改密码、看会话、登出。
 # 别的全拦住，直到他把临时口令换成自己的。
-MUST_CHANGE_ALLOW = {"/api/password", "/api/session", "/api/logout"}
+MUST_CHANGE_ALLOW = {"/api/password", "/api/session", "/api/logout", "/api/account/delete"}
 
 ADMIN_PAGE_FILE = os.path.join(BASE_DIR, "admin.html")
 # 管理员在后台改过口令之后，哈希存这儿。
@@ -3066,7 +3069,9 @@ LOGIN_PAGE = """<!DOCTYPE html>
   <button type="submit" id="b">进入</button>
   <div class="err" id="e"></div>
   <div class="tip" id="tip">
-    每个账号只看到自己的题目、照片和对话。<br>还没有账号？点上面的「注册」。
+    每个账号只看到自己的题目、照片和对话。<br>还没有账号？点上面的「注册」。<br>
+    <a href="/privacy" target="_blank" rel="noopener"
+       style="color:#6366f1;text-decoration:none">隐私政策</a>
   </div>
     </form>
 
@@ -3342,6 +3347,12 @@ LOGIN_PAGE = """<!DOCTYPE html>
     });
     restart();
   })();
+
+  if (location.search.indexOf('deleted=1') >= 0) {
+    sub.textContent = '账号已注销，数据已删除';
+    tip.innerHTML = '感谢使用。想重新开始，点上面的「注册」创建新账号。<br>'
+      + '<a href="/privacy" target="_blank" rel="noopener" style="color:#6366f1;text-decoration:none">隐私政策</a>';
+  }
 
   setMode('login');
 </script></body></html>"""
@@ -4129,7 +4140,7 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/pwa-icon-192.png", "/pwa-icon-512.png",
                 "/pwa-icon-maskable-512.png",
                 "/store-list-1366.png", "/store-detail-1366.png",
-                "/download/windows-package.zip"}
+                "/download/windows-package.zip", "/privacy"}
 
 
 @app.middleware("http")
@@ -4797,6 +4808,104 @@ def api_session():
             "must_change_pw": bool(row["must_change_pw"]) if row else False}
 
 
+# ---------------------------- 路由：注销自己的账号 ---------------------------
+class DeleteAccountReq(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+def _delete_own_account(uid: int, username: str) -> Dict[str, Any]:
+    """
+    彻底删除一个账号：DB 行 + 照片/缩略图/动画文件。
+    和后台删号共用同一套文件清单逻辑，但**允许删最后一个账号**——
+    用户主动注销时不能因为“这是最后一个账号”把他永远困住。
+    """
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT id, username, phone FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "账号不存在")
+        mrows = conn.execute(
+            "SELECT id, orig_path, clean_path FROM mistakes WHERE user_id=?", (uid,)).fetchall()
+        mids = [int(r["id"]) for r in mrows]
+
+        paths: List[str] = []
+        for r in mrows:
+            for rel in (r["orig_path"], r["clean_path"]):
+                p = _safe_static_path(rel)
+                if p:
+                    paths.append(p)
+            paths.append(thumb_path(int(r["id"])))
+        try:
+            anim_names = os.listdir(ANIM_DIR)
+        except OSError:
+            anim_names = []
+        for mid in mids:
+            if mid == GENERAL_CHAT_ID:
+                continue
+            pre = f"anim_m{mid}_"
+            paths += [os.path.join(ANIM_DIR, fn) for fn in anim_names if fn.startswith(pre)]
+        for a in conn.execute(
+                "SELECT anim_url FROM chats WHERE user_id=? AND anim_url<>''", (uid,)):
+            name = (a["anim_url"] or "").rsplit("/", 1)[-1]
+            if ANIM_NAME_RE.match(name):
+                paths.append(os.path.join(ANIM_DIR, name))
+        paths = sorted(set(paths))
+
+        n_mis = len(mids)
+        n_chat = conn.execute("SELECT COUNT(*) FROM chats WHERE user_id=?",
+                              (uid,)).fetchone()[0]
+        phone = row["phone"] or ""
+
+        with closing(get_conn()) as c2, c2:
+            c2.execute("DELETE FROM chats WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM llm_usage WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM store_orders WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM mistakes WHERE user_id=?", (uid,))
+            c2.execute("DELETE FROM users WHERE id=?", (uid,))
+            c2.execute("DELETE FROM signups WHERE username=?", (username,))
+            if phone:
+                c2.execute("DELETE FROM sms_codes WHERE phone=?", (phone,))
+
+    freed = gone = 0
+    errors: List[Dict[str, str]] = []
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                sz = os.path.getsize(p)
+                os.remove(p)
+                freed += sz
+                gone += 1
+        except OSError as e:
+            errors.append({"path": os.path.relpath(p, BASE_DIR),
+                           "error": f"{type(e).__name__}: {e}"})
+    return {"mistakes": n_mis, "chats": n_chat, "files": gone,
+            "bytes": freed, "file_errors": errors}
+
+
+@app.post("/api/account/delete")
+def api_delete_account(req: DeleteAccountReq):
+    """
+    用户自助注销。必须同时验证用户名和密码，防手滑。
+    注意：Microsoft Store 订阅是微软账户层面的，注销这里不会自动取消；
+    前端会提示用户先去 account.microsoft.com 取消订阅。
+    """
+    uid = current_uid()
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT username, pw_hash FROM users WHERE id=?", (uid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "账号不存在")
+    if (req.username or "").strip().lower() != row["username"].lower():
+        raise HTTPException(400, "输入的用户名不匹配")
+    if not verify_password(req.password or "", row["pw_hash"]):
+        time.sleep(0.4)
+        raise HTTPException(400, "密码不正确")
+    result = _delete_own_account(uid, row["username"])
+    resp = JSONResponse({"ok": True, "deleted": result,
+                         "note": "Microsoft Store 订阅需在 account.microsoft.com 单独取消"})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+
 # ---------------------------- 路由：Store 额度 / 内购 -------------------------
 class StorePurchaseReq(BaseModel):
     sku: str
@@ -4930,6 +5039,18 @@ def download_windows_package():
     return FileResponse(STORE_PACKAGE_PATH, media_type="application/zip",
                         filename="我的AI学习助手-windows.zip",
                         headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/privacy", include_in_schema=False)
+def privacy_page():
+    """公开隐私政策页。联系渠道可用 PRIVACY_CONTACT 环境变量替换。"""
+    if not os.path.exists(PRIVACY_PAGE_FILE):
+        raise HTTPException(404, "隐私政策页面缺失")
+    with open(PRIVACY_PAGE_FILE, "r", encoding="utf-8") as f:
+        page = f.read()
+    contact = html.escape(PRIVACY_CONTACT or "")
+    page = page.replace("{{PRIVACY_CONTACT}}", contact)
+    return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/manifest.webmanifest", include_in_schema=False)
