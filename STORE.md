@@ -86,7 +86,7 @@ add-on 的 **Product ID / In-app offer token**（开发者填的字符串）。�
    - `Package/Properties/PublisherDisplayName`
 4. **隐私政策 URL** 和 **支持 URL/邮箱**
    - 已上线：`https://goodgoodstudy.cc/privacy`
-   - 联系渠道默认 GitHub Issues，可用环境变量 `PRIVACY_CONTACT` 换成邮箱（`mailto:...`）或支持页
+   - 联系邮箱已设置为 `openclawmail@qq.com`（环境变量 `PRIVACY_CONTACT`）
 5. **年龄分级问卷**
    - 应用面向初三学生，含未成年人照片/对话，需如实填写数据收集项。
 6. **商店文案/关键词/截图**
@@ -129,7 +129,6 @@ add-on 的 **Product ID / In-app offer token**（开发者填的字符串）。�
 ## 还需要你提供
 
 - Partner Center 上传两个包并创建私有飞行测试；
-- 隐私政策的公开联系渠道（现在默认 GitHub Issues，建议换成专用邮箱）；
 - 商店文案、年龄分级、全球市场定价。
 
 用户自助注销和 `/privacy` 页面已经完成，不需要再重复实现。

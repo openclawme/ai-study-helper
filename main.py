@@ -5048,8 +5048,15 @@ def privacy_page():
         raise HTTPException(404, "隐私政策页面缺失")
     with open(PRIVACY_PAGE_FILE, "r", encoding="utf-8") as f:
         page = f.read()
-    contact = html.escape(PRIVACY_CONTACT or "")
-    page = page.replace("{{PRIVACY_CONTACT}}", contact)
+    contact = (PRIVACY_CONTACT or "").strip()
+    if contact.startswith("mailto:"):
+        contact_href, contact_text = contact, contact[7:]
+    elif "@" in contact and "://" not in contact:
+        contact_href, contact_text = "mailto:" + contact, contact
+    else:
+        contact_href = contact_text = contact
+    page = page.replace("{{PRIVACY_CONTACT_HREF}}", html.escape(contact_href))
+    page = page.replace("{{PRIVACY_CONTACT_TEXT}}", html.escape(contact_text))
     return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
 
