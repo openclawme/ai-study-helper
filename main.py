@@ -4140,7 +4140,9 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/register", "/api/register/verify",
                 "/pwa-icon-192.png", "/pwa-icon-512.png",
                 "/pwa-icon-maskable-512.png",
                 "/store-list-1366.png", "/store-detail-1366.png",
-                "/download/windows-package.zip", "/privacy"}
+                "/download/windows-package.zip", "/privacy",
+                "/download/poster-50x80.jpg", "/download/poster-50x80-150dpi.jpg",
+                "/download/poster-50x80.pdf"}
 
 
 @app.middleware("http")
@@ -5090,6 +5092,11 @@ def pwa_file(request: Request):
 PAPER_DIR = os.environ.get("PAPER_DIR") or os.path.join(
     os.path.dirname(BASE_DIR), "paper")
 PAPER_FILE = os.path.join(PAPER_DIR, "论文.html")
+# 第42届市赛海报（50×80cm，公开下载；文件名按比赛要求）
+POSTER50_NAME = "南山区+高晨朗+写作业全对，考试就现原形？——帮手还是替身"
+POSTER50_JPG = os.path.join(PAPER_DIR, POSTER50_NAME + ".jpg")
+POSTER50_JPG_150 = os.path.join(PAPER_DIR, POSTER50_NAME + "-150dpi.jpg")
+POSTER50_PDF = os.path.join(PAPER_DIR, "展板50x80.pdf")
 PAPER_VERSIONS = os.path.join(PAPER_DIR, "versions")
 PAPER_MANIFEST = os.path.join(PAPER_VERSIONS, "manifest.json")
 
@@ -5130,6 +5137,26 @@ def admin_page():
         headers={"Cache-Control": "no-store, must-revalidate",
                  "X-Robots-Tag": "noindex, nofollow"},
     )
+
+
+@app.get("/download/poster-50x80.jpg", include_in_schema=False)
+@app.get("/download/poster-50x80-150dpi.jpg", include_in_schema=False)
+@app.get("/download/poster-50x80.pdf", include_in_schema=False)
+def download_poster50(request: Request):
+    """市赛海报 50×80cm 下载：300 DPI / 150 DPI JPG / PDF。"""
+    mapping = {
+        "/download/poster-50x80.jpg": (POSTER50_JPG, "image/jpeg",
+                                       POSTER50_NAME + ".jpg"),
+        "/download/poster-50x80-150dpi.jpg": (POSTER50_JPG_150, "image/jpeg",
+                                              POSTER50_NAME + "-150dpi.jpg"),
+        "/download/poster-50x80.pdf": (POSTER50_PDF, "application/pdf",
+                                       "展板50x80.pdf"),
+    }
+    path, media, filename = mapping[request.url.path]
+    if not os.path.exists(path):
+        raise HTTPException(404, "海报还没生成")
+    return FileResponse(path, media_type=media, filename=filename,
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/paper", include_in_schema=False)
